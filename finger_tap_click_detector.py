@@ -68,9 +68,11 @@ def resolve_tap_params(hardness: float | None = None,
     """把 0~1 的用户友好参数解析为具体阈值。
 
     hardness (0~1): 越大=需要弯得越狠才触发（小幅度弯曲彻底无视）
-      0 = 最松：ENTER=0.72, MIN_DROP=0.10
-      0.5= 默认适中：ENTER=0.76, MIN_DROP=0.18
-      1 = 最严：ENTER=0.80, MIN_DROP=0.26（必须至少比基线低26%）
+      ✨ 用户本轮明确：ENTER_BEND_RATIO「整体平移 -0.10」（所有档位同时降 0.10，H0~H1 间距 0.08 不变）
+         目的：让点击判定的初始弯曲度整体增大 10%，避免"手指自然放松状态下有一点弯曲就被误判为点击"
+      0 = 最松：ENTER=0.62 (旧 0.72 减 0.10), MIN_DROP=0.10  → 必须至少弯 38%
+      0.5= 适中：ENTER=0.66 (旧 0.76 减 0.10), MIN_DROP=0.18  → 至少弯 34%
+      1 = 最严：ENTER=0.70 (旧 0.80 减 0.10), MIN_DROP=0.26  → 至少弯 30%（间距 0.08 与旧设计一致）
     speed (0~1): 越大=响应越快（识别更灵敏、触发更快、更短的短按时间窗更宽容）
       0 = 最稳：ALPHA=0.55, MIN_HOLD=2, TAP_MAX=14, STABLE=0.020
       0.5= 默认快：ALPHA=0.77, MIN_HOLD=1, TAP_MAX=21, STABLE=0.0125
@@ -81,9 +83,10 @@ def resolve_tap_params(hardness: float | None = None,
     hardness = 0.0 if hardness < 0.0 else (1.0 if hardness > 1.0 else float(hardness))
     speed    = 0.0 if speed    < 0.0 else (1.0 if speed    > 1.0 else float(speed))
 
-    enter = 0.72 + hardness * 0.08           # 0.72 ~ 0.80
-    drop  = 0.10 + hardness * 0.16           # 0.10 ~ 0.26
-    # EXIT = ENTER + 0.06 形成滞回，但封顶 0.92 避免永远回不去
+    # ✨ ENTER_BEND_RATIO：整体平移 -0.10（0.62 ~ 0.70），间距 0.08 保持不变（= 旧 0.72~0.80 线性下移 0.10）
+    enter = 0.62 + hardness * 0.08           # 0.62 ~ 0.70
+    drop  = 0.10 + hardness * 0.16           # 0.10 ~ 0.26（门槛B相对降幅，用户未指定改动，保持旧公式不变）
+    # EXIT = ENTER + 0.06 形成滞回，ENTER 整体下移 EXIT 同步下移（更早识别回弹）
     exit_r = min(0.92, enter + 0.06)
 
     alpha       = 0.55 + speed * 0.40        # 0.55 ~ 0.95

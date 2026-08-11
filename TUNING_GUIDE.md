@@ -9,10 +9,10 @@
 
 | # | 场景 | 命令 | 适合谁 |
 |---|------|------|--------|
-| A | **新人入门（稳优先）** | `py -3.10 main.py --use-tasks --anchor palm --cursor-mode smooth --roi-scale 0.85 --tap-hardness 0.70 --tap-speed 0.65` | 第一次用，容易误触，希望鼠标稳、动作不容易错触发 |
-| B | **极致跟手（指哪打哪）** | `py -3.10 main.py --use-tasks --anchor palm --cursor-mode absolute --roi-scale 0.80 --tap-hardness 0.75 --tap-speed 0.90` | 进阶用户：要求光标跟手、不漂不滞后、掌心→屏幕绝对坐标 |
-| C | **办公连点 + 拖拽（默认推荐）** ✨ | `py -3.10 main.py --use-tasks --anchor palm --cursor-mode smooth --roi-scale 0.85 --tap-hardness 0.70 --tap-speed 0.80` | 日常办公：单击/双击/长按拖拽都要用，需要平衡 |
-| D | **大屏 / 手小 / 离摄像头远** | `py -3.10 main.py --use-tasks --anchor palm --cursor-mode absolute --roi-scale 0.55 --tap-hardness 0.80 --tap-speed 0.70` | 摄像头距离远，手掌在画面中央只能覆盖屏幕中央 50% 区域的情况 |
+| A | **新人入门（稳优先）** | `py -3.10 main.py --use-tasks --anchor palm --cursor-mode smooth --roi-scale 0.85 --tap-hardness 0.70 --tap-speed 0.65` | 第一次用，容易误触，**ENTER 整体平移 -0.10 + H=0.7 → 需弯 32%**，自然放松的弯曲不会触发 |
+| B | **极致跟手（指哪打哪）** | `py -3.10 main.py --use-tasks --anchor palm --cursor-mode absolute --roi-scale 0.80 --tap-hardness 0.75 --tap-speed 0.90` | 进阶用户：光标跟手、掌心绝对坐标，H=0.75 → 需弯 32%，响应快速 |
+| C | **办公连点 + 拖拽（默认推荐）** ✨ | `py -3.10 main.py --use-tasks --anchor palm --cursor-mode smooth --roi-scale 0.85 --tap-hardness 0.70 --tap-speed 0.80` | 日常办公：H=0.7 弯 32% 过滤自然放松弯，响应 S=0.80 快 |
+| D | **大屏 / 手小 / 离摄像头远** | `py -3.10 main.py --use-tasks --anchor palm --cursor-mode absolute --roi-scale 0.55 --tap-hardness 0.80 --tap-speed 0.70` | 摄像头距离远，H=0.8 → 需弯 31.6%≈32%，弯幅门槛一致 |
 
 **注意**：所有启动命令均以 `py -3.10` 启动（本项目 MediaPipe 仅兼容 3.10），3.13 会报 `ModuleNotFoundError: mediapipe`。
 
@@ -37,7 +37,7 @@
 ### 2.3 食指点击（Tap/Long）两个新手友好参数 ✨（第三章讲内部映射）
 | 参数 | 默认 | 取值 | 作用 | 常见调节建议 | 源码位置 |
 |------|------|------|------|-------------|----------|
-| `--tap-hardness` | `0.70` ✨=你要求的"小幅度不触发" | 浮点数 `0.00 ~ 1.00`（硬约束） | **点击需要弯多狠**：值越大→**必须弯得越深 + 相对降幅越大**才能触发点击，**小幅度食指颤动会彻底无视**。 | 小幅度误触就调到 `0.85` 甚至 `1.0`；刻意弯到底还没反应就降到 `0.50`。 | [main.py L226-L229](file:///d:/TraeProj/HandDetecter/main.py#L226-L229) / [L237-L238](file:///d:/TraeProj/HandDetecter/main.py#L237-L238)（范围夹取） |
+| `--tap-hardness` | `0.70` ✨=你要求的"小幅度不触发" | 浮点数 `0.00 ~ 1.00`（硬约束） | **点击需要弯多狠**：值越大→**必须弯得越深 + 相对降幅越大**才能触发点击。✨本轮明确调整：**ENTER_BEND_RATIO 整体平移 -0.10（所有档位同时降 0.10，H0~H1 间距 0.08 不变）**，默认 H=0.7 需弯 32% 才能触发，避免"手指自然放松的一点点弯曲就被误判为点击"。 | 自然弯曲仍误触就把 H 调到 `0.85` 甚至 `1.0`；刻意弯到底还没反应就降到 `0.50`。 | [main.py L226-L229](file:///d:/TraeProj/HandDetecter/main.py#L226-L229) / [L237-L238](file:///d:/TraeProj/HandDetecter/main.py#L237-L238)（范围夹取） |
 | `--tap-speed` | `0.80` ✨=你要求的"更敏感更快" | 浮点数 `0.00 ~ 1.00`（硬约束） | **点击识别响应速度**：值越大→bend 平滑α 更高（更灵敏）、弯曲确认帧更少、短按优先级时间窗更宽容（更不容易误转长按）。 | 单点总被识别成长按就调 `1.0`；太灵敏抖动乱触发就降 `0.50`。 | [main.py L230-L233](file:///d:/TraeProj/HandDetecter/main.py#L230-L233) / [L239-L240](file:///d:/TraeProj/HandDetecter/main.py#L239-L240)（范围夹取） |
 
 ---
@@ -49,11 +49,13 @@
 > 构造注入 main.py：[FingerTapClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)](file:///d:/TraeProj/HandDetecter/main.py#L270)
 
 ### 3.1 `--tap-hardness`（弯曲幅度门槛）→ 3 个"严格度"阈值
-| 内部阈值 | 含义 | H=0.00（最松） | H=0.70（默认推荐=小幅度无视） | H=1.00（最严=必须弯到底） |
+> ✨**用户本轮明确调整**：ENTER_BEND_RATIO **整体平移 -0.10**（=旧 0.72~0.80 整个区间线性下移 0.10，H0~H1 间距 0.08 保持不变）。目的：让"点击判定的初始弯曲度"整体增大 10%，**避免手指自然放松状态下有一点点弯曲就被误判为点击**。MIN_BEND_DROP / EXIT 滞回差 0.06 均保持旧设计不变。
+
+| 内部阈值 | 含义 | H=0.00（最松=旧 0.72 减 0.10） | H=0.70（默认推荐=自然弯曲不触发） | H=1.00（最严=旧 0.80 减 0.10） |
 |---------|------|---------|--------------------------|----------|
-| **ENTER_BEND_RATIO** | 弯入线（弯到此线以下=开始算"在弯曲"），实际 enter_t = 基线 × ENTER_BEND_RATIO；**越小越严（必须弯更低）** | 0.72 → 弯 28% | **0.776≈0.78 → 必须弯下去 22%** ✨小幅度（<22%的弯曲）完全不进入弯曲状态 | 0.80 → 必须弯 20% |
-| **MIN_BEND_DROP** | 相对近期伸直高值的**最低降幅**（第二道硬门槛：`(max_recent - bend) / max_recent` 必须 > 此值）；**越大越严** | 0.10 → 降 10% | **0.212≈0.21 → 必须相对高值弯下去 21%** ✨双重保险：哪怕 enter_t 过了但降幅不够也不触发 | 0.26 → 降 26% |
-| **EXIT_BEND_RATIO** | 伸直线（回弹到此线以上=释放/单击完成），与 ENTER 形成滞回区间，避免来回抖动；实际 exit_t = 基线 × EXIT | ENTER + 0.06 = 0.78 | ENTER + 0.06 = **0.836≈0.84** | ENTER + 0.06 = 0.86（封顶 0.92） |
+| **ENTER_BEND_RATIO** | 弯入线（弯到此线以下=开始算"在弯曲"），实际 enter_t = 基线 × ENTER_BEND_RATIO；**越小越严（必须弯更低）** | **0.62 → 必须至少弯下去 38%** ✨整体下移 0.10 | **0.62 + 0.7×0.08 = 0.676≈0.68 → 必须弯下去 32%** ✨自然放松状态通常只有 15%~20% 弯曲度，永远达不到这个门槛 → 彻底杜绝误判 | 0.70 → 必须弯 30%（旧 0.80 下移 0.10，间距仍=0.08） |
+| **MIN_BEND_DROP** | 相对近期伸直高值的**最低降幅**（第二道硬门槛：`(max_recent - bend) / max_recent` 必须 > 此值）；**越大越严** | 0.10 → 降 10% | **0.212≈0.21 → 必须相对高值弯下去 21%** ✨双重保险：哪怕 enter_t 过了但降幅不够也不触发 | 0.26 → 降 26%（用户未改，公式不变） |
+| **EXIT_BEND_RATIO** | 伸直线（回弹到此线以上=释放/单击完成），与 ENTER 形成滞回区间，避免来回抖动；实际 exit_t = 基线 × EXIT | ENTER + 0.06 = **0.68** ✨ENTER 下移 EXIT 同步下移，更早识别回弹释放 | ENTER + 0.06 = **0.736≈0.74** ✨回弹阈值也整体下移 0.10，单击响应更快 | ENTER + 0.06 = 0.76（滞回差 0.06 保持，封顶 0.92） |
 
 ### 3.2 `--tap-speed`（响应速度）→ 5 个"响应性/稳定性"参数
 | 内部阈值 | 含义 | S=0.00（最稳最慢） | S=0.80（默认推荐=敏感快速） | S=1.00（极速响应） |
@@ -77,7 +79,7 @@
 ### 4.1 食指点击类问题
 | 你遇到的现象 | 根因 | 推荐改法 |
 |-------------|------|---------|
-| 🟠 小幅度食指轻微颤动，就误触发了"单击" | hardness 太低 → ENTER/DROP 两道门槛都太松 | `↑ --tap-hardness`：默认 0.70 → 先试 `0.85`，仍有问题拉满 `1.0` |
+| 🟠 小幅度食指轻微颤动，就误触发了"单击" | hardness 太低 → ENTER/DROP 两道门槛都太松 | `↑ --tap-hardness`：默认 0.70 → 先试 `0.85`，仍有问题拉满 `1.0`；✨本轮已整体平移-0.10，默认H=0.7需弯32%，自然放松（15%~20%）已经不会触发了 |
 | 🟠 刻意弯到底了还是完全没反应，右上角状态一直是"伸直待机" | hardness 太高 / speed 太低 → 永远达不到 DROP 门槛或 MIN_HOLD 太慢 | `↓ --tap-hardness` 0.70→`0.50`，同时 `↑ --tap-speed` 到 `0.9` |
 | 🔴 单点经常被识别为**长按拖拽**，经过其他按钮时就误点了 | ① TAP_MAX 时间窗太短，用户动作慢了一点就超；② EXIT 检测慢（α 太低）导致回弹 3~5 帧后才满足 exit_t | `↑ --tap-speed` 到 **0.90~1.0**（TAP_MAX 从 25→28，α 变快回弹立刻感知）；如果仍有问题再 `↑ --tap-hardness` 0.05~0.1（把弯幅门槛抬一点，慢弯过程不会被计入） |
 | 🟠 连点第二下按不出来（点了两次只响应 1 次） | COOLDOWN 冷却太长，或者 TAP_MAX 窗太短第二次弯曲被第一次冷却挡掉 | `↑ --tap-speed` 先到 `0.9`；若仍不行，**改代码** [finger_tap_click_detector.py L58](file:///d:/TraeProj/HandDetecter/finger_tap_click_detector.py#L58) 的 `COOLDOWN_FRAMES = 4 → 2` |
