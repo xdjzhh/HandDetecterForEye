@@ -152,6 +152,25 @@ class FingerTapClickDetector:
         self.last_tap_time = None
         self.last_long_time = None
 
+    # ---------------------- 重置：双手出现时调用，清空所有 bend/状态记忆，防误触 ----------------------
+    def reset(self) -> None:
+        """把状态机所有内部变量恢复为刚 __init__ 的初始值（双手手势场景避免弯曲积累→回单手就误点）。"""
+        self.state = _S.IDLE
+        self.event_this_frame = E.NONE
+        self._smoothed_bend = None
+        self._prev_smoothed_bend = None
+        self._baseline = None
+        self._max_recent_bend = None
+        self._bend_hold_frames = 0
+        self._bend_total_frames = 0
+        self._stable_frames = 0
+        self._cooldown_frames = 0
+        # 计数器保留（让 UI 统计不丢），若想清空可自行注释放开：
+        # self.tap_count = 0
+        # self.long_count = 0
+        # self.last_tap_time = None
+        # self.last_long_time = None
+
     # 便捷属性（返回用户友好的 hardness/speed 百分比，供 UI 展示）
     @property
     def hardness_pct(self) -> int:

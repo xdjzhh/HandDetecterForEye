@@ -68,9 +68,10 @@ def recognize_gesture(lms):
 
     # 3. 距离手势：PINCH 捏合（最高优先级，距离判定）
     pinch_r = _pinch_distance(lms, palm_width)
-    # 条件：捏合紧 (< 0.28) 且 食指中指都有一定弯曲避免张开时误触发
-    # 或者 捏合非常紧 (<0.18) 时无附加条件
-    if pinch_r < 0.18 or (pinch_r < 0.28 and not (index_ext and middle_ext)):
+    # ✨ 用户反馈"捏合太严格无法触发"：阈值同步放松 原 0.18/0.28 → 现 0.25/0.40
+    # 条件：捏合中等 (<0.40) 且 食指中指都有一定弯曲避免张开时误触发
+    # 或者 捏合比较紧 (<0.25) 时无附加条件（轻捏就能被识别成 PINCH）
+    if pinch_r < 0.25 or (pinch_r < 0.40 and not (index_ext and middle_ext)):
         ratios = {
             "palm_w": round(palm_width, 4),
             "thumb_r": round(thumb_raw, 3),
