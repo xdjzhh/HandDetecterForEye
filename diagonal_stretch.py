@@ -77,6 +77,48 @@ SetForegroundWindow_API = user32.SetForegroundWindow
 SetForegroundWindow_API.argtypes = [wintypes.HWND]
 SetForegroundWindow_API.restype  = wintypes.BOOL
 
+# ✨✨ 解决 WPS/Word/Chrome 命中子控件(标签页)问题的核心API：把命中点的 HWND 一直追溯到"顶层所有者窗口"=应用主窗口
+#   GetAncestor(hwnd, GA_ROOTOWNER=3) = 跳过所有子控件/子对话框，一直追溯到"拥有者"窗口（这就是应用主窗口，绝对不会是标签页/工具栏/菜单栏子控件）
+#   GetAncestor(GA_ROOT=2) = 爬到顶层父窗口（作为 GA_ROOTOWNER 的兜底）
+GetAncestor = user32.GetAncestor
+GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+GetAncestor.restype  = wintypes.HWND
+GA_PARENT     = 1
+GA_ROOT       = 2
+GA_ROOTOWNER  = 3   # ✨ 主要用这个：追溯到"顶层所有者窗口"=应用主窗口
+
+# ✨ 校验 HWND 是否为"可移动顶层"（不是子控件 = 不是标签页）：GetWindowLongPtr 取样式
+#   64 位/32 位 Windows 都用 GetWindowLongPtrW（Win9x 以上都支持，比 GetWindowLong 安全）
+# ✨ 兼容性补丁（经验 866818/1293388）：
+#   旧版 Python / 32 位 Python 的 ctypes.wintypes 缺少 ULONG_PTR / LONG_PTR 这两个"指针长度整数"类型 → 手动补上，避免 AttributeError
+if not hasattr(wintypes, 'ULONG_PTR') or not hasattr(wintypes, 'LONG_PTR'):
+    import ctypes as _ct_local
+    _ptr_size = _ct_local.sizeof(_ct_local.c_void_p)  # 64 位=8 / 32 位=4
+    if _ptr_size == 8:
+        # 64 位 Windows：LPTR = 64 位 longlong
+        if not hasattr(wintypes, 'ULONG_PTR'):
+            wintypes.ULONG_PTR = _ct_local.c_ulonglong
+        if not hasattr(wintypes, 'LONG_PTR'):
+            wintypes.LONG_PTR  = _ct_local.c_longlong
+    else:
+        # 32 位 Windows：LPTR = 32 位 long
+        if not hasattr(wintypes, 'ULONG_PTR'):
+            wintypes.ULONG_PTR = _ct_local.c_ulong
+        if not hasattr(wintypes, 'LONG_PTR'):
+            wintypes.LONG_PTR  = _ct_local.c_long
+try:
+    GetWindowLongPtrW = user32.GetWindowLongPtrW
+except Exception:
+    GetWindowLongPtrW = user32.GetWindowLongW   # 32 位系统兜底
+GetWindowLongPtrW.argtypes = [wintypes.HWND, wintypes.INT]
+GetWindowLongPtrW.restype  = wintypes.ULONG_PTR  # 64 位上是 64 位值（此时 ULONG_PTR 已通过上面补丁存在）
+GWL_STYLE = -16   # 窗口样式偏移（GWL_EXSTYLE=-20 暂时不用）
+# 关键样式位：
+WS_CHILD    = 0x40000000   # 带这个 = 子控件/标签页/工具栏 → 必须排除（绝对不能直接移动子控件！）
+WS_CAPTION  = 0x00C00000   # 带这个 = 有标题栏（标题栏窗口 = 正常可拖动的顶层主窗口；WPS/Word/Chrome 的主窗口必然带）
+WS_POPUP    = 0x80000000   # 带这个 = 弹窗样式（某些系统弹窗/右键菜单/对话框也可能带；兜底允许）
+WS_OVERLAPPED = 0x00000000 # 默认普通顶层窗口样式
+
 
 # ============================================================
 # 状态常量
@@ -291,6 +333,60 @@ class DiagonalStretchManager:
             return True
         except Exception:
             return False
+
+    # ------------------------------------------------------------
+    # ✨✨ 关键静态辅助：把「命中点取得的 HWND」强制升级为「应用顶层主窗口」
+    #   解决 WPS/Word/Chrome 等多标签页应用：
+    #     掌心落在 标签栏/工具栏/菜单栏/地址栏 → WindowFromPoint 返回「子控件 HWND（标签页本身）」
+    #     → 如果直接 SetWindowPos 移动子控件 → 完全没用（用户要的是整个应用窗口移动）
+    #   处理步骤：
+    #     ① 用 GetAncestor(hwnd_hit, GA_ROOTOWNER) → 跳到"顶层所有者窗口"=应用主窗口（MSDN明确：跳过所有子控件/子对话框）
+    #     ② 若结果为空 → 兜底用 GetAncestor(GA_ROOT) 爬到最顶层父窗口
+    #     ③ 最终强校验：必须「不带 WS_CHILD（=不是子控件）」并且「带 WS_CAPTION 或 WS_POPUP（=有标题栏的正常窗口）」
+    #     ④ 不通过强校验 → 返回 0 交给上层兜底（用前台窗口），绝不返回子控件给移动/缩放用
+    # ------------------------------------------------------------
+    @staticmethod
+    def _promote_hit_hwnd_to_top_level(hwnd_hit: int) -> int:
+        try:
+            hwnd_hit = int(hwnd_hit or 0)
+            if hwnd_hit == 0:
+                return 0
+            # ① 主路：GA_ROOTOWNER → 顶层所有者（=应用主窗口，最标准）
+            hwnd_top = int(GetAncestor(wintypes.HWND(hwnd_hit), wintypes.UINT(GA_ROOTOWNER)) or 0)
+            if hwnd_top == 0:
+                # ② 兜底：GA_ROOT → 顶层父
+                hwnd_top = int(GetAncestor(wintypes.HWND(hwnd_hit), wintypes.UINT(GA_ROOT)) or 0)
+            if hwnd_top == 0:
+                # 再兜底：原始命中点自己也可能是顶层（比如单窗口小应用）
+                hwnd_top = hwnd_hit
+
+            # ③ 强校验：是否为"可移动顶层窗口"（非子控件 + 有标题栏/或弹窗样式）
+            try:
+                style = int(GetWindowLongPtrW(wintypes.HWND(hwnd_top), wintypes.INT(GWL_STYLE)) or 0)
+            except Exception:
+                style = 0
+            # 只要带 WS_CHILD → 绝对不是顶层主窗口，返回 0（避免移动子控件）
+            if (style & WS_CHILD) != 0:
+                return 0
+            # 必须带 WS_CAPTION（标题栏窗口）或 WS_POPUP（弹窗）→ 才算可移动的顶层窗口
+            has_caption_or_popup = ((style & WS_CAPTION) != 0) or ((style & WS_POPUP) != 0)
+            if not has_caption_or_popup:
+                # 极少数顶层窗口可能是无标题（全屏应用/全屏播放）→ 兜底允许只要不带 WS_CHILD 也算（避免误判合法窗口）
+                if hwnd_top == hwnd_hit:
+                    return hwnd_top   # 是命中窗口自己且非 WS_CHILD → 允许
+                return 0
+
+            # 必须是可交互的可见窗口（再拿一次窗口矩形校验）
+            rc = RECT()
+            ok = bool(GetWindowRect(wintypes.HWND(hwnd_top), ctypes.byref(rc)))
+            if not ok or (rc.right - rc.left) < 80 or (rc.bottom - rc.top) < 60:
+                # 极小的不可见/残留 HWND → 直接丢弃
+                return 0
+
+            return int(hwnd_top)
+        except Exception:
+            # 任意异常 → 安全返回 0（交给上层用前台窗口兜底）
+            return 0
 
     # ------------------------------------------------------------
     # 静态辅助：单手捏合判定 → 🔥 用户新方案：除「五指张开(OPEN)」外，其他所有姿态都视作捏合手势
@@ -746,17 +842,27 @@ class DiagonalStretchManager:
             if self._move_confirm >= 3:   # ✨ 单手/双手出现=必然要动作，确认帧少
                 # ① 取主手掌心屏幕坐标 → 找该点下的窗口
                 hwnd = 0
+                hwnd_hit = 0
                 if main_screen is not None:
                     try:
                         pt = wintypes.POINT()
                         pt.x = wintypes.LONG(int(round(float(main_screen[0]))))
                         pt.y = wintypes.LONG(int(round(float(main_screen[1]))))
-                        hwnd = int(WindowFromPoint(pt) or 0)
+                        hwnd_hit = int(WindowFromPoint(pt) or 0)
+                        # ✨✨ 核心修复（WPS/Word/Chrome 标签页问题）：把命中点 HWND 强制升级为「应用顶层主窗口」
+                        #    GA_ROOTOWNER → 跳过所有子控件(标签栏/工具栏/菜单栏) → 最终必然得到：带标题栏的整个应用主窗口
+                        hwnd = DiagonalStretchManager._promote_hit_hwnd_to_top_level(hwnd_hit)
                     except Exception:
                         hwnd = 0
-                # 找不到就兜底=当前前台窗口
+                        hwnd_hit = 0
+                # 找不到（命中点下的HWND升级失败=不合法子窗口）就兜底=当前前台窗口，并且前台窗口也要强制升级一次（防万一）
                 if hwnd == 0:
-                    hwnd = int(GetForegroundWindow() or 0)
+                    try:
+                        fg = int(GetForegroundWindow() or 0)
+                        fg_top = DiagonalStretchManager._promote_hit_hwnd_to_top_level(fg)   # 前台也强制升级为顶层（确保前台也不是子控件）
+                        hwnd = int(fg_top or fg or 0)
+                    except Exception:
+                        hwnd = 0
                 # ② 拿窗口矩形
                 rc = RECT()
                 ok = bool(GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rc)))
