@@ -12,13 +12,14 @@ import pyautogui
   ② 静止方差锁        — 近 8 帧位移协方差 < 阈值 → 
   ③ 1€ Filter         — 速度自适应 α（移动慢=超平滑，移动快=超跟手）
   ④ Sigmoid 响应曲线  — 大动灵敏、小动不动
-  ⑤ 手势模式切换      — POINT=悬停(最大平滑+大死区) / OPEN=浏览 / FIST=拖拽(无死区)
+  ⑤ 手势模式切换      — POINT=悬停(最大平滑+大死区) / OPEN=浏览
+                        ✨ 用户要求：FIST=取消所有指令/无指令（不再用于拖拽，也不触发任何动作）
                         TAP/PINCH/PEACE 前 → 锁定位置 3 帧，防止点击瞬间抖动漂移
 
 同时保留：
   - 手势防抖 HOLD_FRAMES
-  - 边缘死区 EDGE_MARGIN
-  - 握拳拖拽状态机
+  - 边缘死区（通过 ROI_SCALE 实现的可调节中心裁剪）
+  - 点击稳定：食指 Tap-Click（仅手指屈伸，不依赖手掌整体运动）
 """
 
 # ---------------- 防抖参数 ----------------
@@ -43,7 +44,7 @@ LOCK_WINDOW = 8
 #  不同模式下的锁死阈值 (px^2)，越大=越容易锁死=越稳
 LOCK_THRESH_HOVER  = 0.80       # POINT 悬停：极稳（0.8px²≈0.9px单维抖动就锁）
 LOCK_THRESH_BROWSE = 3.0        # OPEN 浏览：中等
-LOCK_THRESH_DRAG   = 99999.0    # FIST 拖拽：不锁死（拖拽需要连续跟手）
+LOCK_THRESH_DRAG   = 99999.0    # （保留兼容定义，但 FIST 不再用于拖拽）
 # 3) 1€ Filter 核心参数（不同模式下 fc_min / beta 组合）
 #    fc_min = 最小截止频率(Hz)，越小→慢动时越平滑
 #    beta   = 速度自适应强度，越大→快动时越跟手
@@ -51,7 +52,8 @@ MODE_PARAMS = {
     # 手势名    (fc_min_Hz, beta,  deadzone_px, response_k)
     "POINT":  (0.30,  0.0040, 2.8, 3.0),   # 悬停：最强平滑+最大死区+柔响应
     "OPEN":   (0.80,  0.0100, 1.2, 1.6),   # 浏览：平衡
-    "FIST":   (1.50,  0.0250, 0.0, 1.2),   # 拖拽：最跟手+零死区+更线性
+    # ✨ 用户要求：FIST = 取消所有指令（不再用于拖拽），因此参数用 OTHER 中性（实际 FIST 分支不触发任何动作，参数只是占位避免 KeyError）
+    "FIST":   (1.00,  0.0150, 1.5, 1.4),
     "OTHER":  (1.00,  0.0150, 1.5, 1.4),   # 兜底：同浏览略强
     "PEACE":  (1.20,  0.0150, 1.0, 1.4),   # 点击前手势（中等）
     "PINCH":  (1.20,  0.0150, 1.0, 1.4),   # 同上
@@ -411,7 +413,8 @@ class ARSmoother:
         lock_thresh = {
             "POINT": LOCK_THRESH_HOVER,
             "OPEN":  LOCK_THRESH_BROWSE,
-            "FIST":  LOCK_THRESH_DRAG,
+            # ✨ 用户要求：FIST = 取消所有指令/无指令 → 不再用 DRAG=99999（不锁死），改为 BROWSE=3.0 中性（实际上 FIST 分支不触发任何动作，这里只是占位避免 KeyError）
+            "FIST":  LOCK_THRESH_BROWSE,
         }.get(gesture if gesture else "OTHER", LOCK_THRESH_BROWSE)
 
         locked_now = False
@@ -537,7 +540,10 @@ class MouseController:
         if gesture != self._last_gesture:
             self._last_gesture = gesture
             self._hold_frames = 0
-            if not self._drag_active:
+            # ✨ 用户要求：FIST = 取消所有指令/无指令。手势切换到FIST时：
+            #   - 不做任何 moveTo（哪怕 drag 没激活）
+            #   - 仅保留：若正在拖拽 → 稍后在 FIST 分支释放（这里先不 move，避免手势切换瞬间跳一下鼠标）
+            if gesture != "FIST" and not self._drag_active:
                 pyautogui.moveTo(ix, iy)
             return
         self._hold_frames += 1
@@ -551,32 +557,37 @@ class MouseController:
             return
 
         # 未满 HOLD_FRAMES 的点击类手势 → 仅移动
-        if self._hold_frames < HOLD_FRAMES:
+        # ✨ 用户要求：FIST = 无指令 → 哪怕未满 HOLD_FRAMES（前 3 帧）也不移动（避免握拳时鼠标还漂一下）
+        if self._hold_frames < HOLD_FRAMES and gesture != "FIST":
             pyautogui.moveTo(ix, iy)
             return
 
-        # 4. 点击类手势：触发前先冻结位置
+        # 4. 点击类手势：✨ 用户要求「PINCH/PEACE/ROCK/THUMB 全部置空 = 不做任何操作」→ 不再冻结位置，不触发任何 click/rightClick/doubleClick
         if gesture in ("PEACE", "PINCH", "ROCK", "THUMB"):
-            self._smoother.freeze_for_click()
+            # self._smoother.freeze_for_click()   # 置空=不点击，所以也不需要冻结光标
+            pass
 
         if gesture == "PEACE":
-            pyautogui.click(ix, iy, button="left")
-            self._consume_gesture()
+            # ✨ 用户要求置空：不做任何操作（原行为=单击左键 → 已废弃）
+            pass
         elif gesture == "PINCH":
-            pyautogui.click(ix, iy, button="left")
-            self._consume_gesture()
+            # ✨ 用户要求置空：不做任何操作（原行为=单击左键 → 已废弃）
+            pass
         elif gesture == "ROCK":
-            pyautogui.click(ix, iy, button="right")
-            self._consume_gesture()
+            # ✨ 用户要求置空：不做任何操作（原行为=单击右键 → 已废弃）
+            pass
         elif gesture == "THUMB":
-            pyautogui.doubleClick(ix, iy)
-            self._consume_gesture()
+            # ✨ 用户要求置空：不做任何操作（原行为=双击左键 → 已废弃）
+            pass
         elif gesture == "FIST":
-            # 握拳 → 拖拽 (按下 + 移动)
-            if not self._drag_active:
-                pyautogui.mouseDown(ix, iy)
-                self._drag_active = True
-            pyautogui.moveTo(ix, iy)
+            # ✨ 用户要求：FIST = 取消所有指令 / 无指令
+            #   ① 若当前正在拖拽（可能是之前 Tap-Click 长按进入的拖拽）→ 立刻释放 mouseUp，取消正在进行的任何拖拽
+            if self._drag_active:
+                pyautogui.mouseUp()
+                self._drag_active = False
+            #   ② 不做 moveTo（握拳=鼠标不能动），不做任何点击/按下，完全空
+            #   ③ HOLD_FRAMES 满足进入也不触发任何事 = 纯空指令=取消/无操作
+            pass
         # 兜底：其它未映射的新手势也移动一下
         else:
             pyautogui.moveTo(ix, iy)

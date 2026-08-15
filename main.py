@@ -31,13 +31,8 @@ HAND_COLORS = {"Left": (255, 100, 0), "Right": (0, 140, 255)}
 FINGER_NAMES_CN = ["拇", "食", "中", "无", "小"]
 
 # 双手组合手势：(左手手势, 右手手势) -> 提示文字
-# 可配合 pyautogui.hotkey(...) 触发真实快捷键
-COMBOS = [
-    (("OPEN",  "OPEN"),  "双手张开 -> 放大窗口 (示例)"),
-    (("FIST",  "FIST"),  "双手握拳 -> 最小化窗口 (示例)"),
-    (("POINT", "POINT"), "双指指向 -> 屏幕截图 (示例)"),
-    (("PEACE", "PEACE"), "双手V字 -> 播放/暂停媒体 (示例)"),
-]
+# ✨ 用户要求：双手组合 COMBOS 指令全部置空 = 不做任何操作，不画提示，不绑定快捷键
+COMBOS = []
 
 
 def _draw_finger_state(frame, ext_tuple, ratios, origin, color):
@@ -346,10 +341,24 @@ def main():
                     or stretch.state != _DS.IDLE                                # (B) 已进入 ARMED/SCALING 拉伸状态机（即便中间有一只手暂丢，继续保持禁点击直到退出SCALING）
                     or is_pure_two_hand_mode                                    # (C) 纯双手拉伸模式（优先级最高，所有事件都禁）
                 )
-                stretch_click_gestures = ("PEACE", "PINCH", "ROCK", "THUMB", "FIST")   # 这些会触发单击/右键/双击/拖拽
+                stretch_click_gestures = ("PEACE", "PINCH", "ROCK", "THUMB")   # 这些会触发单击/右键/双击/拖拽（FIST 已改为「无指令」，无需在此列）
                 safe_gesture = gesture
                 if disable_click_for_stretch and gesture in stretch_click_gestures:
                     # ✨ 拉伸场景下所有会触发点击的手势 → 降级为 POINT（只移动光标不触发任何点击/拖拽）
+                    safe_gesture = "POINT"
+                # ✨✨ 握拳接近态抑制（经验 356682/过渡态串扰屏蔽 核心）：
+                #     🔴 用户反馈「握拳时还有最大化窗口(=双击标题栏) + 点击 → 不是双击冲突，是 OPEN→FIST 过渡态串扰」：
+                #        当手从 OPEN(张开) → FIST(握拳) 的 20~30 帧过渡过程中：
+                #          ① 四指已经弯曲了（ext_tuple 弯曲数≥4 = 只有 ≤1 根手指伸直）
+                #          ② 但 gesture_recognizer 还没累积到 FIST 的判定，中间帧很容易误判：
+                #                - THUMB(拇指向上,四指弯=握拳过渡态最容易判这个) → 双击左键 = 恰好光标在标题栏=最大化窗口
+                #                - ROCK(拇指+小指伸,其他三指弯) → 右键单击
+                #                - PEACE/PINCH → 左键单击
+                #       🔥 所以不看手势名，**直接看手型几何**：只要 ext_tuple 弯曲数 ≥ 4（4 指或 5 指弯=形态已接近握拳）
+                #          → 即便手势分类返回 PEACE/PINCH/ROCK/THUMB（点击类），也强制降级为 POINT = 0 触发任何点击/双击
+                bent_count_this = sum(1 for x in ext if not x)   # ext = (thumb, index, middle, ring, pinky)，True=伸直 False=弯曲
+                near_fist_this_hand = (bent_count_this >= 4)
+                if near_fist_this_hand and gesture in stretch_click_gestures:
                     safe_gesture = "POINT"
                 # ✨缩放过程中临时禁用右手鼠标移动，避免跟缩放手势冲突；🔥 纯双手拉伸模式直接不发任何单手事件
                 # ✨ 新增：block_mouse_move_for_stretch（含「单手五指张开移动窗口」场景命中）→ 也完全禁 mouse.handle（避免鼠标跟手漂 vs SetCursorPos锁中心 竞争）
@@ -390,6 +399,18 @@ def main():
             right_pinch_global = bool(right_gesture_global is not None and right_gesture_global != "OPEN")
             left_open_global   = bool(left_gesture_global  == "OPEN")
             right_open_global  = bool(right_gesture_global == "OPEN")
+            # ✨ 用户要求：FIST(握拳) = 取消所有指令/无指令
+            #   🔴 握拳 = 五指全部弯曲（包括食指），但「Tap-Click Detector（食指弯曲=点击/长按）」是独立于手势分类的路径
+            #      → 只要有任何一只手出现 FIST（握拳） → 立刻 reset 点击检测器，彻底禁止食指点击事件
+            #      否则「握拳时食指弯曲」会被 Tap-Click 当成「长期弯曲 → LONG_DOWN = 长按左键」= 用户看到的「握拳有长点击=冲突」
+            any_fist_global = bool(left_gesture_global == "FIST" or right_gesture_global == "FIST")
+            # ✨✨ 握拳接近态全局抑制(经验 356682)：
+            #    针对路径 B(食指 Tap-Click Detector) → 只要任一手「形态上接近握拳（弯曲数≥4）」，不管手势名是不是 FIST，
+            #    在 OPEN→FIST 的过渡中途就立刻 reset 点击检测器（比 any_fist_global 早 10~20 帧生效=0 延迟抑制），
+            #    避免「过渡过程中食指已经弯曲」被 Tap-Click 累积成「弯曲稳定 → TAP / LONG_DOWN = 误点击 / 误长按」。
+            left_near_fist_global  = bool(("Left"  in hand_results) and sum(1 for x in hand_results["Left"][1]  if not x) >= 4)
+            right_near_fist_global = bool(("Right" in hand_results) and sum(1 for x in hand_results["Right"][1] if not x) >= 4)
+            any_near_fist_global   = left_near_fist_global or right_near_fist_global
             # ✨ 单手场景判断：恰好存在一只手 + 那只手 OPEN → 也触发「单手五指张开=移动窗口」
             single_hand_exists = bool(("Left" in hand_results) ^ ("Right" in hand_results))  # 异或=恰好一只
             single_open_global = bool(single_hand_exists and ((left_open_global and ("Left" in hand_results)) or (right_open_global and ("Right" in hand_results))))
@@ -399,6 +420,8 @@ def main():
             two_hand_any_active   = bool(pure_two_hand_stretch or pure_two_hand_move)
             # 🔴 移动/缩放任一状态机处于非IDLE/任一模式门控命中 → 禁用一切点击（避免手指弯曲误触）
             # ✨ 新增：single_open_global → 单手五指张开=移动窗口，也禁一切点击+禁鼠标移动（光标锁窗口中心=不跟手漂）
+            # ✨ 新增：any_fist_global → 任意手握拳也禁点击（解决握拳食指弯曲被误判为长按=「长点击」的冲突）
+            # ✨ 新增：any_near_fist_global → 任一手「握拳接近态(4指弯=形态已近握拳)」→ 0 延迟禁一切点击（解决 OPEN→FIST 过渡态误判 THUMB 双击=最大化窗口 / PEACE 单击=误点 问题）
             disable_click_for_stretch_global = (
                 both_hands_global                             # (A) 双手出现（双手场景下，「非OPEN即捏合」规则才生效）
                 or single_open_global                         # (A') 恰好单手出现，且那只手是五指张开（移动窗口指令 → 禁点击）
@@ -406,8 +429,11 @@ def main():
                 or stretch._move_state != _DMS.IDLE          # (B2) MOVE 状态机已激活（移动窗口中）
                 or pure_two_hand_stretch                     # (C1) 纯双手拉伸模式（优先级最高，禁用一切）
                 or pure_two_hand_move                        # (C2) 纯双手移动模式（五指张开=移动窗口，禁用点击，防误触）
+                or any_fist_global                           # (D)  🔴 任意手握拳 = 取消一切点击/长按（避免握拳食指弯曲误触长按）
+                or any_near_fist_global                      # (E)  🔴 任一手「握拳接近态(4指弯)」→ 0 延迟禁点击（解决过渡态误判双击/单击=最大化窗口）
             )
             # 🔴 move_enabled_false_when_stretch：命中时 mouse.handle 不做鼠标移动 → 防止 移动窗口 时，鼠标还在被手掌移动牵着跑（会和SetCursorPos锁中心竞争）
+            # ✨ 握拳时也顺便 block_mouse_move（= 握拳 0 鼠标移动 0 点击 完全空=取消）
             block_mouse_move_for_stretch = disable_click_for_stretch_global
 
             # ========= ✨ 食指 Tap-Click（仅动手指，手掌不动）：仅追踪右手 =========
