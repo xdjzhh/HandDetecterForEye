@@ -65,10 +65,22 @@ CLICK_FREEZE_FRAMES = 3
 
 # cursor 模式
 CURSOR_MODE_SMOOTH   = "smooth"    # 当前 AR 5 层平滑（悬停稳、但有滞后）
-CURSOR_MODE_ABSOLUTE = "absolute"  # ✨ 掌心绝对坐标直接跳（像触摸屏指哪打哪，仅 3 帧中值杀尖峰 + freeze 防点击漂移）
+CURSOR_MODE_ABSOLUTE = "absolute"  # ✨ 掌心绝对坐标直接跳（像触摸屏指哪打哪，方案A 3层流水线：中值杀尖峰 + Sigmoid微移阻尼 + 静止方差锁）
 
 # absolute 模式下为了避免 MediaPipe 1~2 帧偶发尖峰跳到屏幕角落，保留一个轻量的 3 帧中值
 ABS_MEDIAN_WINDOW = 3
+
+# ✨✨ 方案 A 新增：absolute 模式「大范围跟手 + 小范围不晃」的 3 层流水线参数（只作用在 absolute 模式，不影响 smooth）
+#   Layer 2 Sigmoid：微移阻尼增益（响应曲线拐点，k 越大=拐点越陡=越严格压制小抖动）
+#     调参语义：ABS_SIGMOID_K = 0.35  → 位移 <3px 增益≈0.2（5倍阻尼）；>20px 增益→1.0（完全不衰减=跟手）
+#     不想要 Sigmoid（嫌麻烦）→ 设 0.0 即可直接关闭这一层
+ABS_SIGMOID_K     = 0.35
+ABS_SIGMOID_MIN_G = 0.20  # 最小增益（Δ→0 时的阻尼）；0.20 = 5 倍阻尼（1px抖→0.2px输出）
+#   Layer 3 静止方差锁：连续 N 帧内，掌心样本方差 σ² < threshold² → 硬锁死光标到一个点（钉住=完全不漂移）
+#     调参语义：ABS_LOCK_WINDOW=10 帧 / ABS_LOCK_THRESH=2.5 px
+#       → 连续 10 帧中（30fps≈333ms）每帧抖动都 < ±2.5px → 锁定；锁定后 只要出现 1 帧 > 4px 立刻解锁（响应真实动作）
+ABS_LOCK_WINDOW   = 10   # 连续多少帧进入锁死判定（太短锁不住太长反应慢）
+ABS_LOCK_THRESH   = 2.5  # 静止判定阈值（像素）：方差 σ < 这个值就视为「手没动=纯噪声」
 
 # pyautogui 安全设置
 pyautogui.FAILSAFE = False
@@ -159,18 +171,24 @@ class ARSmoother:
         self._lock_buf_x:   deque[float] = deque(maxlen=LOCK_WINDOW)
         self._lock_buf_y:   deque[float] = deque(maxlen=LOCK_WINDOW)
         self._euro = _TwoEuroFilter2D(fc_min=DEFAULT_PARAMS[0], beta=DEFAULT_PARAMS[1])
-        # 锁死时光标位置
+        # 锁死时光标位置（smooth 模式 Layer 2）
         self._locked_x: float | None = None
         self._locked_y: float | None = None
         self._last_params = DEFAULT_PARAMS
+        # 点击前冻结（两种模式都生效）
         self._freeze_x: float | None = None
         self._freeze_y: float | None = None
         self._freeze_left = 0
         self._last_out_x = None
         self._last_out_y = None
-        # absolute 模式的轻量中值缓冲（仅杀尖峰，不做平滑/滞后）
+        # absolute 模式 Layer 1：3 帧中值杀尖峰
         self._abs_buf_x: deque[float] = deque(maxlen=ABS_MEDIAN_WINDOW)
         self._abs_buf_y: deque[float] = deque(maxlen=ABS_MEDIAN_WINDOW)
+        # ✨✨ absolute 模式 Layer 3：静止方差锁（样本缓冲 + 锁位置）
+        self._abs_lock_buf_x: deque[float] = deque(maxlen=ABS_LOCK_WINDOW)
+        self._abs_lock_buf_y: deque[float] = deque(maxlen=ABS_LOCK_WINDOW)
+        self._abs_locked_x: float | None = None   # 当前被锁死的固定光标 X（None=未锁）
+        self._abs_locked_y: float | None = None   # 当前被锁死的固定光标 Y（None=未锁）
 
     # ---------- 外部：模式切换 ----------
     def set_mode(self, mode: str):
@@ -203,7 +221,8 @@ class ARSmoother:
     def reset(self):
         for b in (self._median_buf_x, self._median_buf_y,
                   self._lock_buf_x,   self._lock_buf_y,
-                  self._abs_buf_x,    self._abs_buf_y):
+                  self._abs_buf_x,    self._abs_buf_y,
+                  self._abs_lock_buf_x, self._abs_lock_buf_y):
             b.clear()
         self._euro.reset()
         self._locked_x = None
@@ -213,12 +232,15 @@ class ARSmoother:
         self._freeze_left = 0
         self._freeze_x = None
         self._freeze_y = None
+        # ✨✨ absolute 模式 Layer 3 锁状态清空
+        self._abs_locked_x = None
+        self._abs_locked_y = None
 
     # ---------- 内部工具 ----------
     @staticmethod
     def _sigmoid_gain(delta_px: float, response_k: float) -> float:
         """
-        Sigmoid 非线性响应（第 4 层）：
+        Sigmoid 非线性响应（第 4 层 / smooth 模式用）：
           delta_px 很小（<3px微抖）→ 增益≈0.2  阻尼抖动
           delta_px 很大（>20px真实移动）→ 增益→1.0  不衰减、保证跟手
         response_k 越小 → 拐点越靠近 0（更严的抖动抑制）
@@ -229,13 +251,35 @@ class ARSmoother:
         # scale to ~0.22..1.0 之间，避免过小增益导致不动
         return 0.22 + 0.78 * s
 
+    @staticmethod
+    def _abs_sigmoid_gain(delta_px: float) -> float:
+        """✨ 方案 A：absolute 模式 Layer 2 专用 Sigmoid 增益（用 ABS_* 参数，拐点/最小增益可独立调）"""
+        if ABS_SIGMOID_K <= 1e-6:
+            return 1.0
+        # ✨ 用户要求：sigmoid 增益压缩「增大到 5px」
+        #   目标：Δ ≤ 5px 全部都落在「接近最小增益 0.20」的位置 → 阻尼 ≥ 3.3 倍以上
+        #   计算方法（确保 5px 处真正在 Sigmoid 贴底区= inflection - (2/K) ≈ 5）：
+        #     K=0.35 → 2/K ≈ 5.71 → inflection ≈ 5 + 5.71 ≈ 11.0
+        #   最终 INFLECTION_PX = 11.0：
+        #     Δ=1px → 增益≈0.22（几乎贴底）
+        #     Δ=3px → 增益≈0.25
+        #     Δ=5px → 增益≈0.29（=刚好在 5px 压缩边界，3.4 倍阻尼）
+        #     Δ=11px→ 增益≈0.60（拐点中点）
+        #     Δ=20px→ 增益≈0.98（完全不衰减，大范围跟手）
+        INFLECTION_PX = 11.0
+        s = 1.0 / (1.0 + np.exp(-ABS_SIGMOID_K * (float(delta_px) - INFLECTION_PX)))
+        min_g = float(max(0.0, min(1.0, ABS_SIGMOID_MIN_G)))
+        amp = 1.0 - min_g
+        # 输出 ∈ [min_g, 1.0]；默认 min_g=0.20 → [0.20, 1.0]
+        return float(min_g + amp * s)
+
     # ---------- 主入口：5 层流水线 ----------
     def filter(self, raw_x: float, raw_y: float, gesture: str | None = None):
         """输入=归一化坐标映射后的「屏幕像素原始值」，输出=AR平滑后屏幕像素。
 
         两种模式：
           - CURSOR_MODE_SMOOTH: 完整 5 层 AR 悬停流水线（方差锁/1€/Sigmoid 等）
-          - CURSOR_MODE_ABSOLUTE: 直接跳掌心绝对坐标，仅 3 帧中值杀尖峰 + freeze 防点击漂移
+          - CURSOR_MODE_ABSOLUTE: 方案 A 3 层流水线 → 大范围跟手（指哪打哪）+ 小范围不晃（微移阻尼+静止锁）
         """
         # 点击前冻结（两种模式都生效：点击瞬间锁死避免漂移）
         if self._freeze_left > 0:
@@ -245,15 +289,98 @@ class ARSmoother:
             self._last_out_y = fy
             return fx, fy
 
-        # ✨ absolute 模式：掌心 → 屏幕，指哪打哪（仅留 3 帧中值杀 MediaPipe 尖峰）
+        # ============================================================
+        # ✨✨ CURSOR_MODE_ABSOLUTE（方案 A 3 层流水线：大范围跟手 + 小范围不晃）
+        # ============================================================
         if self._mode == CURSOR_MODE_ABSOLUTE:
+            # ============================================================
+            # Layer 1：3 帧中值（杀 MediaPipe 1~2 帧偶发尖峰，和原逻辑一致）
+            #   作用：过滤 ±30px 的 1 帧"飞点"（比如手掌瞬间识别错位跳到角落）
+            # ============================================================
             self._abs_buf_x.append(float(raw_x))
             self._abs_buf_y.append(float(raw_y))
-            ax = float(np.median(self._abs_buf_x)) if len(self._abs_buf_x) >= ABS_MEDIAN_WINDOW else float(raw_x)
-            ay = float(np.median(self._abs_buf_y)) if len(self._abs_buf_y) >= ABS_MEDIAN_WINDOW else float(raw_y)
-            self._last_out_x = ax
-            self._last_out_y = ay
-            return ax, ay
+            if len(self._abs_buf_x) >= ABS_MEDIAN_WINDOW and len(self._abs_buf_y) >= ABS_MEDIAN_WINDOW:
+                ax = float(np.median(self._abs_buf_x))
+                ay = float(np.median(self._abs_buf_y))
+            else:
+                ax = float(raw_x)
+                ay = float(raw_y)
+
+            # ============================================================
+            # Layer 2：Sigmoid 非线性微移增益压缩（抑制小抖动，但大位移完全不衰减=跟手）
+            #   ✨ 用户要求「sigmoid 增益压缩增大到 5px」：压缩生效边界=5px（Δ≤5px 全压）
+            #   原理：用「Layer1 输出 - 上一帧输出」计算位移 Δ；套 Sigmoid 得增益 g(Δ)（拐点=11px）：
+            #     Δ ≤ 5px  → g ∈ [0.22, 0.29]          → 阻尼 ≥ 3.4 倍（5px 内微抖 1px→0.22px 输出,完全不晃）
+            #     Δ = 11px → g ≈ 0.60                  → 拐点, ~1.7 倍阻尼（微调场景略稳）
+            #     Δ > 20px → g → 1.0                   → 0 衰减（大范围移动=和以前的absolute一样跟手）
+            #   关键：绝对位置不做 EMA/1€（这两种引入相位滞后=大范围拖尾），只对「这一帧和上一帧的差值」按增益缩放
+            #         → 大范围仍然是绝对指哪打哪，不会有滞后
+            # ============================================================
+            if self._last_out_x is None or self._last_out_y is None:
+                # 第一帧：没有上一帧，直接用 Layer1 输出（避免除以 0 / 跳变）
+                sx, sy = float(ax), float(ay)
+            else:
+                dx = float(ax) - float(self._last_out_x)
+                dy = float(ay) - float(self._last_out_y)
+                delta_px = float(np.sqrt(dx * dx + dy * dy))
+                if ABS_SIGMOID_K <= 1e-6:
+                    # 参数设为 0 → 关闭 Layer2
+                    g = 1.0
+                else:
+                    g = float(self._abs_sigmoid_gain(delta_px))
+                sx = float(self._last_out_x) + dx * g
+                sy = float(self._last_out_y) + dy * g
+
+            # ============================================================
+            # Layer 3：静止方差锁（对准小按钮的核心杀招 → 光标"钉住"完全不动）
+            #   判定：连续 ABS_LOCK_WINDOW=10 帧的 Layer2 输出，在 X/Y 两个方向上 σ（标准差）< ABS_LOCK_THRESH=2.5px
+            #         → 视为「手掌完全没动 = MediaPipe 纯噪声抖动」→ 硬锁死到这 10 帧的均值点（之后直接输出锁点，不再随噪声漂）
+            #   解锁：已锁死的情况下，这一帧 Layer2 输出与锁点的距离 > UNLOCK=4.0px（说明手真的动了）→ 立刻解锁
+            # ============================================================
+            UNLOCK_DIST = float(ABS_LOCK_THRESH) * 1.6   # 解锁阈值 = 锁定阈值的 1.6 倍，避免锁/解临界反复切换
+            self._abs_lock_buf_x.append(float(sx))
+            self._abs_lock_buf_y.append(float(sy))
+
+            buf_full = len(self._abs_lock_buf_x) >= ABS_LOCK_WINDOW and len(self._abs_lock_buf_y) >= ABS_LOCK_WINDOW
+            # ① 已在锁死状态 → 先检查是否需要解锁
+            if self._abs_locked_x is not None and self._abs_locked_y is not None:
+                dist_to_lock = float(np.sqrt(
+                    (float(sx) - float(self._abs_locked_x)) ** 2 +
+                    (float(sy) - float(self._abs_locked_y)) ** 2
+                ))
+                if dist_to_lock <= UNLOCK_DIST:
+                    # 仍然在锁点附近 → 继续锁死，输出固定点
+                    lx, ly = float(self._abs_locked_x), float(self._abs_locked_y)
+                    self._last_out_x = lx
+                    self._last_out_y = ly
+                    return lx, ly
+                else:
+                    # 手真的动了 → 解锁；清空锁缓冲（下一轮再满 10 帧才重新锁）
+                    self._abs_locked_x = None
+                    self._abs_locked_y = None
+                    self._abs_lock_buf_x.clear()
+                    self._abs_lock_buf_y.clear()
+                    self._abs_lock_buf_x.append(float(sx))
+                    self._abs_lock_buf_y.append(float(sy))
+                    buf_full = False  # 刚清空 → 缓冲不满，不做锁判定
+            # ② 未锁死 → 尝试满足「缓冲满 + 方差 < 阈值」→ 进入锁死
+            if buf_full and self._abs_locked_x is None:
+                std_x = float(np.std(self._abs_lock_buf_x))
+                std_y = float(np.std(self._abs_lock_buf_y))
+                if std_x < ABS_LOCK_THRESH and std_y < ABS_LOCK_THRESH:
+                    # 满足静止条件 → 锁死到均值位置
+                    lock_x = float(np.mean(self._abs_lock_buf_x))
+                    lock_y = float(np.mean(self._abs_lock_buf_y))
+                    self._abs_locked_x = lock_x
+                    self._abs_locked_y = lock_y
+                    # 锁死首帧：直接返回锁点
+                    self._last_out_x = lock_x
+                    self._last_out_y = lock_y
+                    return lock_x, lock_y
+            # ③ 正常（不满足锁死条件）→ 输出 Layer2 结果
+            self._last_out_x = float(sx)
+            self._last_out_y = float(sy)
+            return float(sx), float(sy)
 
         # ========= CURSOR_MODE_SMOOTH（原 5 层流水线）=========
         if gesture:
