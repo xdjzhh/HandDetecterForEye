@@ -193,6 +193,12 @@ class StretchInfo:
 # 主类：双手对角拉伸 → 窗口缩放状态机
 # ============================================================
 class DiagonalStretchManager:
+    # ✨✨ 稳定性常数（防止 ACTIVE 时单帧抖动导致"指令中断/重新识别"）：
+    #   LOST_MAX=4 帧 ≈ 30fps 下 133ms；既能覆盖 MediaPipe 偶发漏检 / OPEN-PINCH 单帧抖动，又能保证手势真正消失时及时退出
+    SCALE_LOST_MAX: int = 4   # SCALE_ACTIVE 下，连续多少帧不满足条件才真正退出到 IDLE（原：0 帧 → 一不满足立刻退）
+    MOVE_LOST_MAX:  int = 4   # MOVE_ACTIVE 下，连续多少帧不满足条件才真正退出到 IDLE
+    OPEN_STABLE_N:  int = 2   # OPEN/PINCH 手势判定的"稳定滞回帧"：连续 2 帧结果一致才切换，防单帧抖动
+
     def __init__(self, *,
                  min_hold_frames: int = 8,
                  min_diag_px: float = 120.0,  # ✨ 原 220 太严，降到 120（两手靠得稍近也能进入拉伸确认帧）
@@ -253,6 +259,60 @@ class DiagonalStretchManager:
         self._confirm: int = 0
         self._left_pinch_prev: bool = False   # 上一帧左手是否处于捏合（用于滞回 hold 判定）
         self._right_pinch_prev: bool = False  # 上一帧右手是否处于捏合
+
+        # ✨✨ 2026-08-13 新增：状态机抖动克星（解决用户「移动窗口到一半突然重新识别」）
+        self._scale_lost_frames: int = 0   # SCALE_ACTIVE 下：连续多少帧不满足条件（没检测到双手/距离太短/手势不对）
+        self._move_lost_frames:  int = 0   # MOVE_ACTIVE 下：连续多少帧不满足条件
+        # OPEN 手势判定的"稳定滞回缓存"：tag(手) → (稳定bool值, 连续相同计数)；连续 ≥ OPEN_STABLE_N=2 帧才切换 → 防单帧OPEN/PINCH抖动导致ACTIVE频繁退出
+        self._open_stable: dict[str, tuple[bool, int]] = {}
+
+    # ------------------------------------------------------------
+    # ✨ 判定稳定滞回助手：对「手势 OPEN/PINCH」这类连续判定做"连续 N 帧一致才切换输出" → 彻底防单帧抖动
+    #   tag: 区分不同手/来源（"L"=左手 / "R"=右手 / "S"=单手）
+    #   raw: 这一帧的原始判定结果（True/False）
+    #   return: 经过稳定化后的最终判定结果（不会一帧就变，必须连续 OPEN_STABLE_N 帧相同才切换）
+    # ------------------------------------------------------------
+    def _stabilize_bool(self, tag: str, raw: bool) -> bool:
+        try:
+            N = int(max(1, DiagonalStretchManager.OPEN_STABLE_N))
+            cur, cnt = self._open_stable.get(tag, (bool(raw), 0))
+            if bool(raw) == bool(cur):
+                cnt = int(cnt) + 1
+                self._open_stable[tag] = (bool(cur), int(cnt))
+                return bool(cur)
+            # 不一样：开始攒新结果
+            if int(cnt) >= 1:   # 上一个结果至少连续过 1 帧 → 现在要切，开始计数
+                new_cnt = 1
+            else:
+                new_cnt = 1
+            self._open_stable[tag] = (bool(raw), int(new_cnt))
+            # 只有连续 ≥ N 帧相同才切换
+            if int(new_cnt) >= N:
+                return bool(raw)
+            # 不够 N 帧 → 仍然保持旧输出（不切换！这就是防抖的关键）
+            return bool(cur)
+        except Exception:
+            # 任意异常 → 直接返回原始结果（保证不会因为稳定器崩导致手势不可用）
+            return bool(raw)
+
+    # ------------------------------------------------------------
+    # ✨ 工具：ACTIV→LOST 容忍帧检测（MOVE/SCALE 共用逻辑）
+    #   作用：当 状态机=ACTIVE 且"当前帧条件不满足"时，不立刻reset，先记 lost 帧；达到 MAX 才真的 reset
+    #   返回：True=已经被容忍（不要reset继续保持ACTIVE）；False=忍无可忍必须reset
+    # ------------------------------------------------------------
+    def _try_tolerate_lost_scale(self) -> bool:
+        """SCALE_ACTIVE 用：返回 True=已容忍，保持 ACTIVE（不要 reset）"""
+        self._scale_lost_frames = int(self._scale_lost_frames) + 1
+        if int(self._scale_lost_frames) < int(DiagonalStretchManager.SCALE_LOST_MAX):
+            return True
+        return False
+
+    def _try_tolerate_lost_move(self) -> bool:
+        """MOVE_ACTIVE 用：返回 True=已容忍，保持 ACTIVE（不要 reset）"""
+        self._move_lost_frames = int(self._move_lost_frames) + 1
+        if int(self._move_lost_frames) < int(DiagonalStretchManager.MOVE_LOST_MAX):
+            return True
+        return False
 
     # ------------------------------------------------------------
     # 静态辅助：两向量夹角（度），0°~180°；返回 inf 表示向量无效（0向量）
@@ -395,9 +455,13 @@ class DiagonalStretchManager:
     #   带滞回：上一帧已捏合 = 用 hold 阈值判断"是否仍捏合"（原逻辑保留，但判定主逻辑已改为 OPEN/非OPEN）
     # ------------------------------------------------------------
     @staticmethod
-    def _hand_pinch(lms, enter_thresh: float, hold_thresh: float, was_pinching: bool) -> Tuple[bool, float]:
+    def _hand_pinch(lms, enter_thresh: float, hold_thresh: float, was_pinching: bool, force_open: bool | None = None) -> Tuple[bool, float]:
         # ① 主判定：用户新方案 → 只要不是「张开手掌(OPEN)」= 其他都视为捏合手势
-        is_open = DiagonalStretchManager._is_open_palm(lms)
+        #   ✨ 如果传入了 force_open（外部已稳定化后的 OPEN 判定）→ 直接用它，保证 pinch 和 open 的结果 100% 一致，不会出现"open稳定/pinch抖动"的错位
+        if force_open is None:
+            is_open = DiagonalStretchManager._is_open_palm(lms)
+        else:
+            is_open = bool(force_open)
         pinch_by_rule = bool(not is_open)
         # ② 仍计算原 TIP4-TIP8 距离比值（仅用于 UI 显示，便于用户观察）
         try:
@@ -502,11 +566,33 @@ class DiagonalStretchManager:
                 both_hands_ready = False
                 single_ready = False
 
-        # ---------- 都缺 → 直接回 IDLE（SCALE 和 MOVE 两个状态机都重置） ----------
+        # ---------- 都缺（双手没检测到 + 单手也没检测到） → ✨ ACTIVE 时先 LOST 容忍 8 帧，超了再真退 IDLE ----------
         if (not both_hands_ready) and (not single_ready):
-            info.ui_pinch_active = False   # 🔴 缺一只手时 UI 明确关连线
-            info.ui_move_active  = False
             info.hands_mode = "DUAL"
+            scale_keep = False
+            move_keep  = False
+            # ① SCALE_ACTIVE：先容忍（8 帧内回来就能无缝续上）
+            if self.state == _S.SCALING:
+                scale_keep = bool(self._try_tolerate_lost_scale())
+            # ② MOVE_ACTIVE：先容忍
+            if self._move_state == _MS.MOVE_ACTIVE:
+                move_keep = bool(self._try_tolerate_lost_move())
+            # 两边都在 ACTIVE+容忍中 → 不 reset，保持状态（UI/快照/锚点都保留，等手回来）
+            if scale_keep or move_keep:
+                info.ui_pinch_active = bool(self.state == _S.SCALING)   # 继续按原状态画 UI
+                info.ui_move_active  = bool(self._move_state == _MS.MOVE_ACTIVE)
+                info.need_frame_redraw = bool(self.state == _S.SCALING)
+                info.move_need_frame_redraw = bool(self._move_state == _MS.MOVE_ACTIVE)
+                info.state = str(self.state)
+                info.move_state = str(self._move_state)
+                info.mode = (_MODE.MOVE if (self._move_state == _MS.MOVE_ACTIVE) else _MODE.SCALE)
+                # 🔴 容忍期内：不做任何实际窗口移动/缩放（等手重新出现再续上原来的偏移量）
+                info.scale_delta = 0.0
+                info.move_delta_xy = (0.0, 0.0)
+                return info
+            # 超容忍或不在 ACTIVE → 回 IDLE（原逻辑）
+            info.ui_pinch_active = False
+            info.ui_move_active  = False
             self._reset_to_idle()
             self._reset_move_to_idle()
             info.need_frame_redraw = False
@@ -520,12 +606,28 @@ class DiagonalStretchManager:
         # 🔀 分支 A：恰好一只手 + 这只手 OPEN → SINGLE MOVE（单手张开移动窗口）
         # ============================================================
         if single_ready and not both_hands_ready:
-            s_open = bool(DiagonalStretchManager._is_open_palm(single_lms))
+            s_open_raw = bool(DiagonalStretchManager._is_open_palm(single_lms))
+            s_open = bool(self._stabilize_bool("S", s_open_raw))   # ✨ OPEN/PINCH 稳定化（连续 2 帧一致才切换）
             # ✅ 单手 OPEN → 进入 MOVE（SINGLE）模式；其他单手姿态（非OPEN=捏合/POINT/握拳）→ 都不触发 SINGLE MOVE（让单手控鼠点击正常工作）
             if not s_open:
+                info.hands_mode = "SINGLE"
+                # ✨ 关键：如果当前已是 MOVE_ACTIVE → 先容忍（等 8 帧再退），避免"单帧 OPEN/PINCH 抖一下就中断移动"
+                if self._move_state == _MS.MOVE_ACTIVE:
+                    move_keep = bool(self._try_tolerate_lost_move())
+                    if move_keep:
+                        info.ui_move_active = True
+                        info.ui_pinch_active = False
+                        info.mode = _MODE.MOVE
+                        info.move_need_frame_redraw = True
+                        info.need_frame_redraw = False
+                        info.move_state = str(self._move_state)
+                        info.state = _S.IDLE
+                        info.move_delta_xy = (0.0, 0.0)   # 容忍期：不动窗口（等手势回来再继续原来的偏移）
+                        info.move_confirm_frames = 3
+                        return info
+                # 不在 MOVE_ACTIVE（或容忍超时）→ 回 IDLE（让正常单手控鼠）
                 info.ui_pinch_active = False
                 info.ui_move_active  = False
-                info.hands_mode = "SINGLE"
                 # 这只手虽然单手存在但不是OPEN → SCALE/MOVE状态机都IDLE，让main.py走正常单手控鼠
                 self._reset_to_idle()
                 self._reset_move_to_idle()
@@ -536,6 +638,8 @@ class DiagonalStretchManager:
                 info.mode = _MODE.SCALE
                 return info
             # ===== SINGLE + OPEN = SINGLE MOVE 进入状态机 =====
+            # ✨ 手势重新满足了（回来了/稳定住了）→ 清 move lost 计数（后面会正常更新窗口位置，无缝继续原来的偏移）
+            self._move_lost_frames = 0
             info.mode = _MODE.MOVE
             info.hands_mode = "SINGLE"
             info.ui_move_active = True   # 🔴 单手+OPEN立刻显示MOVE UI（和双手MOVE同样的预判定体验）
@@ -564,18 +668,21 @@ class DiagonalStretchManager:
         rx, ry = float(right_px_xy[0]), float(right_px_xy[1])
 
         # ---------- 双手每只手的 OPEN/捏合 判定 ----------
-        left_open  = bool(DiagonalStretchManager._is_open_palm(left_lms))
-        right_open = bool(DiagonalStretchManager._is_open_palm(right_lms))
+        # ✨✨ OPEN/PINCH 稳定化：连续 2 帧一致才切换输出（_stabilize_bool），从源头消除单帧抖动导致 ACTIVE 误退出
+        left_open_raw  = bool(DiagonalStretchManager._is_open_palm(left_lms))
+        right_open_raw = bool(DiagonalStretchManager._is_open_palm(right_lms))
+        left_open  = bool(self._stabilize_bool("L", left_open_raw))
+        right_open = bool(self._stabilize_bool("R", right_open_raw))
 
-        # ---------- SCALE 模式：双手捏合判定（非OPEN=捏合） ----------
-        left_pinch,  left_r  = self._hand_pinch(left_lms,  self._pinch_enter, self._pinch_hold, self._left_pinch_prev)
-        right_pinch, right_r = self._hand_pinch(right_lms, self._pinch_enter, self._pinch_hold, self._right_pinch_prev)
+        # ---------- SCALE 模式：双手捏合判定（非OPEN=捏合） ✨ 传 force_open=稳定后的left_open/right_open → 保证 pinch/open 结果 100% 一致 ----------
+        left_pinch,  left_r  = self._hand_pinch(left_lms,  self._pinch_enter, self._pinch_hold, self._left_pinch_prev,  force_open=left_open)
+        right_pinch, right_r = self._hand_pinch(right_lms, self._pinch_enter, self._pinch_hold, self._right_pinch_prev, force_open=right_open)
         self._left_pinch_prev  = left_pinch
         self._right_pinch_prev = right_pinch
         info.left_pinch_r  = float(left_r)
         info.right_pinch_r = float(right_r)
 
-        # ---------- � 两个 UI 门控 + 模式互斥（先写 UI flag，保证画面立刻显示，再按互斥模式进入对应状态机） ----------
+        # ---------- 两个 UI 门控 + 模式互斥（先写 UI flag，保证画面立刻显示，再按互斥模式进入对应状态机） ----------
         #   MOVE=双手都 OPEN（五指张开）；SCALE=双手都非OPEN（都捏合）
         #   其他混杂情况（一只开一只闭）→ 两个 UI 都关，状态机都回 IDLE
         both_open  = bool(left_open  and right_open)
@@ -585,7 +692,26 @@ class DiagonalStretchManager:
         info.ui_pinch_active = both_pinched and not both_open   # 避免两者同时 True（理论上互斥）
 
         if not (both_open or both_pinched):
-            # 一只张开一只捏合 → 混杂姿态，两个状态机都回 IDLE
+            # 一只张开一只捏合 → 混杂姿态
+            # ✨✨ ACTIVE 时先容忍（8 帧）：避免某只手 OPEN/PINCH 单帧抖了一下就立刻中断缩放/移动
+            scale_keep = False
+            move_keep  = False
+            if self.state == _S.SCALING:
+                scale_keep = bool(self._try_tolerate_lost_scale())
+            if self._move_state == _MS.MOVE_ACTIVE:
+                move_keep = bool(self._try_tolerate_lost_move())
+            if scale_keep or move_keep:
+                info.ui_pinch_active = bool(self.state == _S.SCALING)
+                info.ui_move_active  = bool(self._move_state == _MS.MOVE_ACTIVE)
+                info.need_frame_redraw = bool(self.state == _S.SCALING)
+                info.move_need_frame_redraw = bool(self._move_state == _MS.MOVE_ACTIVE)
+                info.state = str(self.state)
+                info.move_state = str(self._move_state)
+                info.mode = (_MODE.MOVE if (self._move_state == _MS.MOVE_ACTIVE) else _MODE.SCALE)
+                info.scale_delta = 0.0
+                info.move_delta_xy = (0.0, 0.0)
+                return info
+            # 容忍超时/不在 ACTIVE → 回 IDLE（原逻辑）
             self._reset_to_idle()
             self._reset_move_to_idle()
             info.need_frame_redraw = False
@@ -599,6 +725,9 @@ class DiagonalStretchManager:
         # 🔀 模式互斥分支一：双手五指张开(BOTH_OPEN) → 移动窗口 MOVE 状态机（DUAL 双手模式）
         # ============================================================
         if both_open:
+            # ✨ 手势稳定匹配了 → 清 lost 计数（之前的容忍期作废，全新无缝继续）
+            self._move_lost_frames = 0
+            self._scale_lost_frames = 0
             info.mode = _MODE.MOVE
             info.hands_mode = "DUAL"
             info.need_frame_redraw = False  # SCALE 分支 UI 关
@@ -617,6 +746,9 @@ class DiagonalStretchManager:
         # ============================================================
         # 🔀 模式互斥分支二：双手都非OPEN(都捏合) → 拉伸缩放 SCALE 状态机（原逻辑）
         # ============================================================
+        # ✨ 手势稳定匹配了 → 清 scale lost 计数（之前容忍期作废，无缝续上原来的比例/锚点）
+        self._scale_lost_frames = 0
+        self._move_lost_frames = 0
         info.mode = _MODE.SCALE
         info.move_need_frame_redraw = False
         self._reset_move_to_idle()   # 互斥：走 SCALE 时 MOVE 状态机必须 IDLE
@@ -630,6 +762,16 @@ class DiagonalStretchManager:
 
         # ---------- 条件 2：两「捏合锚点」距离 ≥ min_diag_px（保留原门槛：两手凑太近不算"准备拉伸"） ----------
         if d1 < self.min_diag_px:
+            # ✨ SCALING ACTIVE 时先容忍：手瞬时靠近（抖动）→ 先等 8 帧，不立刻退（避免一帧就近了就中断缩放）
+            if self.state == _S.SCALING:
+                keep = bool(self._try_tolerate_lost_scale())
+                if keep:
+                    info.ui_pinch_active = True
+                    info.need_frame_redraw = True
+                    info.state = str(self.state)
+                    info.scale_delta = 0.0
+                    return info
+            # 容忍超时或非 ACTIVE → 回 IDLE
             self._reset_to_idle()
             info.need_frame_redraw = False
             return info
@@ -966,6 +1108,7 @@ class DiagonalStretchManager:
         self._move_top0 = 0.0
         self._move_w0 = 0.0
         self._move_h0 = 0.0
+        self._move_lost_frames = 0   # ✨ 重置时清 lost 计数
 
     # ---------- 工具：回到 IDLE（清所有快照 + 恢复 min_hold_frames 默认值 + 清空捏合滞回状态 + 清空拉伸模式） ----------
     def _reset_to_idle(self):
@@ -987,3 +1130,5 @@ class DiagonalStretchManager:
         self._w0 = self._h0 = 0.0
         self._smooth_ratio = None
         self._last_ratio = 1.0
+        self._scale_lost_frames = 0   # ✨ 重置时清 lost 计数
+        self._open_stable.clear()      # ✨ 重置时清 OPEN 稳定缓存（下一轮从头开始攒）
