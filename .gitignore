@@ -1,0 +1,38 @@
+# ============== Python 字节码/缓存 ==============
+# ✨ 用户要求：忽略 __pycache__ 目录下所有内容
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# 分发/打包产物
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# 虚拟环境（我们项目使用 .venv）
+.venv/
+venv/
+env/
+ENV/
+
+# 本地 IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 日志
+*.log
+logs/
+
+# 系统文件（Windows）
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 系统文件（macOS）
+.DS_Store
