@@ -240,7 +240,7 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("无法打开摄像头，请检查设备/权限")
     # 降低分辨率可提升 FPS（按需调整）
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     # ---- 组件：根据参数选择 SOLUTIONS / TASKS_LOCAL_MODEL ----
