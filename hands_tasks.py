@@ -181,6 +181,8 @@ def parse_args(argv=None):
                         help="光标移动策略：smooth / absolute")
     parser.add_argument("--roi-scale", type=float, default=0.70,
                         help="画面→屏幕映射中心区域大小(0.30~1.00)")
+    parser.add_argument("--roi-offset-y", type=float, default=0.5,
+                        help="ROI正方形在画面高度的上下位置（-1.0=贴顶, 0.0=居中, +0.5=偏下默认, +1.0=贴底）")
     parser.add_argument("--tap-hardness", type=float, default=0.70,
                         help="点击弯曲幅度门槛 0.00~1.00")
     parser.add_argument("--tap-speed", type=float, default=0.80,
@@ -195,6 +197,8 @@ def clamp_args(args):
     """硬约束 args 数值范围（原地修改）。"""
     if args.roi_scale < 0.30: args.roi_scale = 0.30
     if args.roi_scale > 1.00: args.roi_scale = 1.00
+    if args.roi_offset_y < -1.0: args.roi_offset_y = -1.0
+    if args.roi_offset_y > +1.0: args.roi_offset_y = +1.0
     if args.tap_hardness < 0.0: args.tap_hardness = 0.0
     if args.tap_hardness > 1.0: args.tap_hardness = 1.0
     if args.tap_speed    < 0.0: args.tap_speed    = 0.0
@@ -231,7 +235,8 @@ def init_models(args):
         mode_label = "[MODE: 默认 Solutions]  mediapipe 内置模型"
         mode_color = (180, 255, 120)
 
-    mouse = MouseController(alpha=0.25, cursor_mode=args.cursor_mode, roi_scale=args.roi_scale)
+    mouse = MouseController(alpha=0.25, cursor_mode=args.cursor_mode, roi_scale=args.roi_scale,
+                            roi_offset_y=args.roi_offset_y)
     tap_detector = FingerTapClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)
     stretch = DiagonalStretchManager()
 
@@ -309,13 +314,21 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     # 🔥 速度 & 稳定性优化状态（EMA / Majority Vote / 自适应跳帧）
     # ================================================================
     # (1) landmarks EMA 平滑：每只手 21×3(x,y,z) 个点做指数滑动平均
-    #     α=0.4 → 兼顾跟手+稳定（越小越平滑，越大越跟手）
-    _EMA_ALPHA = 0.45
+    #     ✅ 2026-08-20 调参：α 从 0.45 → 0.85
+    #       之前 α=0.45（55% 历史权重）→ 手掌/食指图标严重拖尾，用户抱怨"手已经移了10cm，图标还在后面追"。
+    #       现在 α=0.85（15% 历史权重）→ 跟手优先（几乎 1:1 跟随），把"平滑去噪"工作留给 mouse_controller 内部的
+    #       「中值杀尖峰 + Sigmoid 微移阻尼 + 静止方差锁」3 层流水线处理（那边只针对鼠标坐标，不影响UI绘制）。
+    #       另外：掌心一次性位移 > _EMA_RESET_TOL（归一化）时，直接清空该手 EMA 缓存，强制硬跟手（彻底消除拖尾）。
+    _EMA_ALPHA = 0.85
+    _EMA_RESET_TOL = 0.015                 # 掌心单帧归一化位移超过此值 → 清 EMA 缓存（≈1280×720下≈10像素）
     _ema_landmarks: dict[str, list] = {}   # key = Left/Right, value = 21 个 [x,y,z] 列表
     _ema_miss_count: dict[str, int] = {}   # 连续丢失计数，超过阈值清空 EMA
 
-    # (2) 手势标签 majority-vote 去抖：最近 5 帧投票取众数
-    _MV_WINDOW = 5
+    # (2) 手势标签 majority-vote 去抖：最近 N 帧投票取众数
+    #     ✅ 2026-08-20 调参：窗口从 5 → 3
+    #       之前 5 帧会让手势切换滞后 ~133ms（30fps），和EMA拖尾叠加后用户感觉"我手明明是OPEN，拉伸连线3秒才出来"。
+    #       3 帧折中：单帧噪声（比如半帧弯曲误判）仍能被 2/3 多数票杀掉，但响应延迟从 133ms → 66ms。
+    _MV_WINDOW = 3
     _mv_history: dict[str, list] = {}      # key = Left/Right, value = list[str] (gesture names)
     _mv_final: dict[str, str] = {}
 
@@ -324,8 +337,11 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     #     → 下一帧**跳过推理**，直接复用上次结果 + EMA 预测延续
     #   · 好处：推理频率接近减半，FPS 明显提升；代价：延迟 +1 帧（16~20ms，人眼无感）
     #   · 任何手丢失 / 手势切换 / 掌心大跳 → 立即退出跳帧模式
-    _SKIP_MIN_STABLE = 6
-    _SKIP_PX_TOL = 0.012                    # 归一化位移：0.012 ≈ 1280×720 下短边720 → ≈ 8.6 像素
+    #     ✅ 2026-08-20 调参（解决拖尾的第三个因素）：
+    #       SKIP_MIN_STABLE 6 → 12（之前连续6帧就跳=400ms就开始跳，手一动还在继续跳→放大拖尾；现在12帧=800ms才触发，更保守）
+    #       SKIP_PX_TOL 0.012 → 0.006（约 4.3 像素，之前 8.6 像素=手抖算稳定也跳→实际慢动作时跳帧+EMA双重拖尾；现在只有真正完全不动才跳）
+    _SKIP_MIN_STABLE = 12
+    _SKIP_PX_TOL = 0.006                    # 归一化位移：0.006 ≈ 1280×720 下短边720 → ≈ 4.3 像素（真正静止才认定为稳定）
     _skip_stable_cnt = 0                    # 连续稳定帧计数
     _skip_last_hands_data = None            # 上次的 hands_data（深拷贝后备用）
     _skip_last_palms: dict[str, tuple] = {} # 上次掌心（归一化）：判断是否稳定
@@ -411,6 +427,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
 
+            # 把摄像头实际宽高通知 MouseController：_norm_to_screen 才能和预览绿框 100% 对齐
+            mouse.set_frame_size(w, h)
+
             # ================================================================
             # 🔥 自适应跳帧：稳定时隔帧跳过推理 → 推理 FPS 翻倍
             # ================================================================
@@ -445,7 +464,22 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _lab = _hand["label"]
                 _cur_labels_in_frame.add(_lab)
                 _cur_arr = [[float(_p.x), float(_p.y), float(_p.z)] for _p in _hand["landmarks"]]
+
+                # ✅ 掌心大位移硬重置（彻底消除快速移动时的EMA拖尾）：
+                #   先计算当前掌心（关键点0 + 关键点9 的中点，和 cursor anchor 完全一致）
+                #   如果这一帧掌心相对上一帧跳了 > _EMA_RESET_TOL（≈10px归一化），说明是真实快速移动，
+                #   直接丢掉历史EMA（不拖尾巴），强制用当前值（然后下一帧再从这个点开始EMA）。
+                _cx0_cur = 0.5 * (_cur_arr[0][0] + _cur_arr[9][0])
+                _cy0_cur = 0.5 * (_cur_arr[0][1] + _cur_arr[9][1])
+                _reset_this_hand = False
                 if _lab in _ema_landmarks:
+                    _last_arr = _ema_landmarks[_lab]
+                    _cx0_prev = 0.5 * (_last_arr[0][0] + _last_arr[9][0])
+                    _cy0_prev = 0.5 * (_last_arr[0][1] + _last_arr[9][1])
+                    if abs(_cx0_cur - _cx0_prev) > _EMA_RESET_TOL or abs(_cy0_cur - _cy0_prev) > _EMA_RESET_TOL:
+                        _reset_this_hand = True
+
+                if _lab in _ema_landmarks and not _reset_this_hand:
                     _last_arr = _ema_landmarks[_lab]
                     _smoothed = [
                         [_EMA_ALPHA * _cur_arr[i][0] + (1 - _EMA_ALPHA) * _last_arr[i][0],
@@ -454,6 +488,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         for i in range(21)
                     ]
                 else:
+                    # 首次出现 / 丢失后重新出现 / 掌心大位移硬重置 → 用当前原数值（不拖历史尾巴）
+                    if _reset_this_hand and _lab in _ema_landmarks:
+                        pass  # 马上会用 _cur_arr 覆盖掉
                     _smoothed = _cur_arr
                 _ema_landmarks[_lab] = _smoothed
                 _ema_miss_count[_lab] = 0
@@ -994,12 +1031,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         font_scale=0.6, color=mode_color, thickness=2)
             put_text_cn(frame, f"🖱️{mode_text} | 锚点: {anchor_text} | 映射ROI: {roi_pct}%  🟢=光标  🟠=食指TIP",
                         (w - 640, 6), font_scale=0.6, color=(0, 230, 80), thickness=2)
-            # ---------- ROI 矩形 ----------
-            margin_px = int(round((1.0 - args.roi_scale) * 0.5 * min(w, h)))
-            x1 = margin_px
-            y1 = margin_px
-            x2 = w - margin_px
-            y2 = h - margin_px
+            # ---------- ROI 矩形（与 MouseController._norm_to_screen 100% 对齐：统一调 compute_roi_bbox_px）----------
+            x1, y1, x2, y2 = MouseController.compute_roi_bbox_px(w, h, args.roi_scale, args.roi_offset_y)
             _dash_len = 12
             _gap = 8
             _step = _dash_len + _gap

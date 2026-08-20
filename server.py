@@ -70,7 +70,7 @@ if os.path.exists(CONFIG_PATH):
         print(f"[server.py] 读取 config.json server_argv 失败，用默认：{e}")
 _args = HT.parse_args(_server_argv)
 HT.clamp_args(_args)
-print(f"[server.py] 参数解析 ok: use_tasks={_args.use_tasks} roi={_args.roi_scale} "
+print(f"[server.py] 参数解析 ok: use_tasks={_args.use_tasks} roi={_args.roi_scale} roi_offset_y={_args.roi_offset_y} "
       f"anchor={_args.anchor} cursor_mode={_args.cursor_mode} "
       f"hardness={_args.tap_hardness} speed={_args.tap_speed}")
 

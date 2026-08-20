@@ -35,6 +35,21 @@ HOLD_FRAMES = 4
 DEFAULT_ROI_SCALE = 0.70   # ✨ 原 0.85 再往内收缩：中心 70% 映射全屏，每边留白 15%（掌心活动区更小=更不易跑出镜头边缘，避免无法识别到掌心/整只手）
 ROI_SCALE_MIN = 0.30
 ROI_SCALE_MAX = 1.00
+# ✨ ROI 垂直偏移（新增 2026-08-20）
+#   ⚠️ 只改 Y 方向位置，X 方向宽度和 Y 方向高度 100% 保持 roi_scale 原尺寸不变（严禁擅自改成正方形！）
+#   语义：roi_offset_y ∈ [-1.0, +1.0]，控制「长方形 ROI 区域」在画面高度方向的位置：
+#     长方形尺寸（原逻辑完全保留）：
+#       宽 = frame_w - (1-roi_scale)*min(frame_w, frame_h)
+#       高 = roi_scale * min(frame_w, frame_h)
+#       水平方向：永远左右对称 margin=(1-roi_scale)*0.5*min(w,h)（和你之前版本一模一样）
+#     偏移：
+#       -1.0  → ROI 贴画面顶（margin_y_top=0，手指可能超顶）
+#        0.0  → ROI 垂直居中（老默认）
+#       +0.5  → ROI 往下偏（**新默认**，画面顶部多留 50% 可分配 Y margin 给向上伸展的食指/中指，避免顶部手指超出摄像头上边界）
+#       +1.0  → ROI 贴画面底
+DEFAULT_ROI_OFFSET_Y = 0.5
+ROI_OFFSET_Y_MIN = -1.0
+ROI_OFFSET_Y_MAX = +1.0
 
 # ---------------- AR Smoother 5 层参数 ----------------
 # 1) 滑动中值窗口
@@ -79,10 +94,14 @@ ABS_MEDIAN_WINDOW = 3
 ABS_SIGMOID_K     = 0.35
 ABS_SIGMOID_MIN_G = 0.20  # 最小增益（Δ→0 时的阻尼）；0.20 = 5 倍阻尼（1px抖→0.2px输出）
 #   Layer 3 静止方差锁：连续 N 帧内，掌心样本方差 σ² < threshold² → 硬锁死光标到一个点（钉住=完全不漂移）
-#     调参语义：ABS_LOCK_WINDOW=10 帧 / ABS_LOCK_THRESH=2.5 px
-#       → 连续 10 帧中（30fps≈333ms）每帧抖动都 < ±2.5px → 锁定；锁定后 只要出现 1 帧 > 4px 立刻解锁（响应真实动作）
-ABS_LOCK_WINDOW   = 10   # 连续多少帧进入锁死判定（太短锁不住太长反应慢）
-ABS_LOCK_THRESH   = 2.5  # 静止判定阈值（像素）：方差 σ < 这个值就视为「手没动=纯噪声」
+#     ✅ 2026-08-20 调参（修复「掌心标识动了但鼠标不动」的核心bug）：
+#       旧：LOCK_WINDOW=10 / THRESH=2.5 / UNLOCK=4.0px(单点)
+#       新：LOCK_WINDOW=6 → 锁得更快解锁也更快；THRESH=3.5 → 不容易被轻微噪声误锁；
+#           ⭐ 新增「累计位移趋势解锁」：即使单点每帧都 < UNLOCK（=缓慢移动），
+#              只要最近 LOCK_WIN 帧相对锁点的累计（sum|dx|+sum|dy|）> 2.0×UNLOCK → 立即解锁，
+#              彻底解决"手慢慢移了30px，鼠标还钉死在原地"的问题。
+ABS_LOCK_WINDOW   = 6    # 连续多少帧进入锁死判定（之前10=330ms太长，6≈200ms是折中）
+ABS_LOCK_THRESH   = 3.5  # 静止判定阈值（像素）：之前2.5太严，轻微噪声就锁死；3.5更中性
 
 # pyautogui 安全设置
 pyautogui.FAILSAFE = False
@@ -335,11 +354,14 @@ class ARSmoother:
 
             # ============================================================
             # Layer 3：静止方差锁（对准小按钮的核心杀招 → 光标"钉住"完全不动）
-            #   判定：连续 ABS_LOCK_WINDOW=10 帧的 Layer2 输出，在 X/Y 两个方向上 σ（标准差）< ABS_LOCK_THRESH=2.5px
-            #         → 视为「手掌完全没动 = MediaPipe 纯噪声抖动」→ 硬锁死到这 10 帧的均值点（之后直接输出锁点，不再随噪声漂）
-            #   解锁：已锁死的情况下，这一帧 Layer2 输出与锁点的距离 > UNLOCK=4.0px（说明手真的动了）→ 立刻解锁
+            #   判定：连续 ABS_LOCK_WINDOW=6 帧的 Layer2 输出，在 X/Y 两个方向上 σ（标准差）< ABS_LOCK_THRESH=3.5px
+            #         → 视为「手掌完全没动 = MediaPipe 纯噪声抖动」→ 硬锁死到这 6 帧的均值点（之后直接输出锁点，不再随噪声漂）
+            #   解锁：已锁死的情况下，满足 **任一** 条件立即解锁：
+            #         ① 当前帧 Layer2 输出与锁点距离 > UNLOCK=5.6px（单点跳变，明显真实动作）
+            #         ② ⭐ 累计位移趋势解锁：最近一帧缓冲内所有点相对锁点的（|dx|+|dy|）累计 > 2.0×UNLOCK
+            #            → 解决「缓慢移动：每帧位移<5.6px，解不开锁，掌心图标动了但鼠标不动」的核心bug
             # ============================================================
-            UNLOCK_DIST = float(ABS_LOCK_THRESH) * 1.6   # 解锁阈值 = 锁定阈值的 1.6 倍，避免锁/解临界反复切换
+            UNLOCK_DIST = float(ABS_LOCK_THRESH) * 1.6   # 解锁阈值 = 锁定阈值的 1.6 倍 = 5.6px
             self._abs_lock_buf_x.append(float(sx))
             self._abs_lock_buf_y.append(float(sy))
 
@@ -350,14 +372,23 @@ class ARSmoother:
                     (float(sx) - float(self._abs_locked_x)) ** 2 +
                     (float(sy) - float(self._abs_locked_y)) ** 2
                 ))
-                if dist_to_lock <= UNLOCK_DIST:
-                    # 仍然在锁点附近 → 继续锁死，输出固定点
+                # 条件②：累计位移趋势解锁（最近缓冲内所有点的|dx|+|dy|之和）
+                cum_disp = 0.0
+                try:
+                    for xi, yi in zip(self._abs_lock_buf_x, self._abs_lock_buf_y):
+                        cum_disp += abs(float(xi) - float(self._abs_locked_x)) + abs(float(yi) - float(self._abs_locked_y))
+                except Exception:
+                    cum_disp = 0.0
+                unlock_trend = cum_disp > (2.0 * UNLOCK_DIST)
+
+                if dist_to_lock <= UNLOCK_DIST and not unlock_trend:
+                    # 仍然在锁点附近 + 累计也没动 → 继续锁死，输出固定点
                     lx, ly = float(self._abs_locked_x), float(self._abs_locked_y)
                     self._last_out_x = lx
                     self._last_out_y = ly
                     return lx, ly
                 else:
-                    # 手真的动了 → 解锁；清空锁缓冲（下一轮再满 10 帧才重新锁）
+                    # 真实动作（单点跳变 OR 缓慢移动累计量到了）→ 解锁；清空锁缓冲（下一轮再满 6 帧才重新锁）
                     self._abs_locked_x = None
                     self._abs_locked_y = None
                     self._abs_lock_buf_x.clear()
@@ -459,7 +490,8 @@ class ARSmoother:
 # ============================================================================
 class MouseController:
     def __init__(self, screen_size=None, cursor_mode: str = CURSOR_MODE_SMOOTH,
-                 roi_scale: float = DEFAULT_ROI_SCALE, **_ignored):
+                 roi_scale: float = DEFAULT_ROI_SCALE,
+                 roi_offset_y: float = DEFAULT_ROI_OFFSET_Y, **_ignored):
         if screen_size is None:
             self.sw, self.sh = pyautogui.size()
         else:
@@ -469,6 +501,16 @@ class MouseController:
         if roi_scale < ROI_SCALE_MIN: roi_scale = ROI_SCALE_MIN
         if roi_scale > ROI_SCALE_MAX: roi_scale = ROI_SCALE_MAX
         self._roi_scale = roi_scale
+        # ROI 垂直偏移：⚠️ 只改Y方向位置，X宽和Y高与原roi_scale定义完全一致（长方形，不是正方形）
+        roi_offset_y = float(roi_offset_y)
+        if roi_offset_y < ROI_OFFSET_Y_MIN: roi_offset_y = ROI_OFFSET_Y_MIN
+        if roi_offset_y > ROI_OFFSET_Y_MAX: roi_offset_y = ROI_OFFSET_Y_MAX
+        self._roi_offset_y = roi_offset_y
+        # 摄像头画面尺寸（默认 None = 未知 → _norm_to_screen 退化为"兼容旧模式"）；
+        # 由主循环 hands_tasks / main.py 在第一次拿到 frame 时调用 set_frame_size 填入。
+        # 只有填入后，_norm_to_screen 的坐标映射才和 compute_roi_bbox_px 绘制的绿框 100% 精确对齐。
+        self._cam_frame_w: int | None = None
+        self._cam_frame_h: int | None = None
         # AR 悬停 5 层平滑器（支持 smooth / absolute 两种 cursor 策略）
         self._smoother = ARSmoother(mode=cursor_mode)
         # 防抖状态
@@ -489,6 +531,47 @@ class MouseController:
     def roi_scale(self) -> float:
         return self._roi_scale
 
+    def set_roi_offset_y(self, roi_offset_y: float):
+        """动态调整长方形 ROI 的上下位置（-1.0 贴顶, 0 居中, +1.0 贴底）；X宽/Y高尺寸完全不变。"""
+        roi_offset_y = float(roi_offset_y)
+        if roi_offset_y < ROI_OFFSET_Y_MIN: roi_offset_y = ROI_OFFSET_Y_MIN
+        if roi_offset_y > ROI_OFFSET_Y_MAX: roi_offset_y = ROI_OFFSET_Y_MAX
+        self._roi_offset_y = roi_offset_y
+
+    @property
+    def roi_offset_y(self) -> float:
+        return self._roi_offset_y
+
+    def set_frame_size(self, frame_w: int, frame_h: int):
+        """主循环在拿到第一帧后调用，让 _norm_to_screen 计算的坐标与预览绿框 100% 对齐。"""
+        self._cam_frame_w = int(max(1, frame_w))
+        self._cam_frame_h = int(max(1, frame_h))
+
+    @staticmethod
+    def compute_roi_bbox_px(frame_w: int, frame_h: int, roi_scale: float, roi_offset_y: float = 0.0):
+        """✨ 统一工具：计算 ROI 矩形在画面中的像素坐标 (x1,y1,x2,y2)。
+        供预览绘制、diagonal_stretch 等所有 UI 代码共用（保证与 _norm_to_screen 的映射范围完全一致）。
+
+        ⚠️ 严格遵循用户原逻辑，只做最小增量：
+          1. X 方向：100% 保留原 margin 计算方式（左右对称 margin=(1-rs)*0.5*min(fw,fh)）
+              → 宽度 = fw - 2*margin，**绝不改成正方形**！
+          2. Y 方向：高度仍 = rs*min(fw,fh)（和原来完全一样，高度不变）
+              → 仅通过 roi_offset_y 把"可用 Y margin"在 顶/底 之间重新分配
+              → 顶 margin = (h - roi_h) * (0.5 + 0.5*oy)，实现整体上下移动。
+        """
+        fw = float(max(1, int(frame_w))); fh = float(max(1, int(frame_h)))
+        rs = float(max(ROI_SCALE_MIN, min(ROI_SCALE_MAX, float(roi_scale))))
+        oy = float(max(ROI_OFFSET_Y_MIN, min(ROI_OFFSET_Y_MAX, float(roi_offset_y))))
+        m = (1.0 - rs) * 0.5 * min(fw, fh)       # 原逻辑：X方向margin（左右各 m）
+        x1 = m
+        x2 = fw - m
+        roi_h_px = rs * min(fw, fh)              # Y方向高度：原逻辑，绝对不变
+        avail_y_margin = fh - roi_h_px           # 可分配给顶部/底部的总 Y margin（=原 2*m 当画面正方形时）
+        top_margin_px = avail_y_margin * (0.5 + 0.5 * oy)  # oy=-1→全给底（顶=0）；oy=0→各一半（居中）；oy=+1→全给顶
+        y1 = top_margin_px
+        y2 = y1 + roi_h_px
+        return (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)))
+
     def set_cursor_mode(self, mode: str):
         """切换光标策略：smooth（AR悬停5层）/ absolute（掌心绝对坐标直接跳）"""
         self._smoother.set_mode(mode)
@@ -504,18 +587,47 @@ class MouseController:
     def _norm_to_screen(self, norm_x: float, norm_y: float):
         """landmark 归一化坐标 -> 屏幕像素。
 
-        映射规则（用户可调参数 roi_scale）：
-          设 roi = 0.85：
-            画面中心 85% 的 [0.075, 0.925] × [0.075, 0.925] 区域 映射 屏幕 (0,0) ~ (W,H)
-            掌心超出 ROI 区域（画面四周 7.5% 每边）会被 clamp 到屏幕边缘，但：
-             ✨ 这 7.5% 正好提供"手指还能自由伸展但掌心已到屏幕边缘"的活动空间，
-             彻底解决原 EDGE_MARGIN 机制下「掌心一碰边缘就锁死、手指仍在画面但动了无效」问题。
+        映射规则（用户可调参数 roi_scale + roi_offset_y）——⚠️ 只改 Y 位置，尺寸 100% 保留原逻辑：
+          设 fw=1280 fh=720 roi_scale=0.70 roi_offset_y=0.5：
+            m=(1-0.7)*0.5*720=108px
+            x1=108 x2=1280-108=1172 → 宽度=1064px（**完全不变**，和你原来的版本一模一样）
+            roi_h=0.7*720=504px（高度也完全不变）
+            avail_y_margin=720-504=216px
+            y1=216*(0.5+0.25)=162 y2=162+504=666 → 顶边从原 108px 下移到 162px（多 54px 顶部空间给手指伸展）
+          ROI 内部坐标 0..1 → 线性映射屏幕 (0,0) ~ (sw,sh)。
         """
-        r = self._roi_scale
-        margin = (1.0 - r) * 0.5   # 四周留白 = (1-r)/2
-        denom = max(r, 1e-6)
-        x = (float(norm_x) - margin) / denom
-        y = (float(norm_y) - margin) / denom
+        r = float(self._roi_scale)
+        oy = float(self._roi_offset_y)
+        nx = float(norm_x); ny = float(norm_y)
+
+        # ===== 精确模式（已调用 set_frame_size，和 compute_roi_bbox_px 100% 对齐）=====
+        if self._cam_frame_w is not None and self._cam_frame_h is not None:
+            fw = float(self._cam_frame_w); fh = float(self._cam_frame_h)
+            m = (1.0 - r) * 0.5 * min(fw, fh)        # 原逻辑 X 方向 margin（左右对称）
+            x1_px = m
+            x2_px = fw - m
+            roi_w_px = max(x2_px - x1_px, 1e-6)      # ROI 宽度（长方形，**绝对不再是正方形**！）
+            roi_h_px = r * min(fw, fh)               # ROI 高度：原逻辑不变
+            avail_y_margin = fh - roi_h_px
+            y1_px = avail_y_margin * (0.5 + 0.5 * oy)
+            roi_h_px = max(roi_h_px, 1e-6)
+            u = (nx * fw - x1_px) / roi_w_px
+            v = (ny * fh - y1_px) / roi_h_px
+            u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
+            v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+            return u * self.sw, v * self.sh
+
+        # ===== 兼容模式（未设置 frame_size，保留原 margin 近似算法，比例不变）=====
+        margin = (1.0 - r) * 0.5
+        # Y 方向的 margin 重新分配：顶=margin*(1-oy)？实际用可用 Y margin 的按比例分配和精确模式语义对齐
+        #   在未知 fw/fh 比例时折中用 margin_norm 近似：总 Y margin_norm = 1 - r（对应居中时上下各 margin）
+        #   顶 margin_norm = (1 - r) * (0.5 + 0.5*oy)
+        avail_y_norm = 1.0 - r
+        margin_y_top_norm = avail_y_norm * (0.5 + 0.5 * oy)
+        denom_x = max(1.0 - 2.0 * margin, 1e-6)   # ROI 在 X 方向的归一化宽度 = 1-2margin
+        denom_y = max(r, 1e-6)                    # ROI 在 Y 方向的归一化高度 = r（原逻辑）
+        x = (nx - margin) / denom_x
+        y = (ny - margin_y_top_norm) / denom_y
         x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
         y = 0.0 if y < 0.0 else (1.0 if y > 1.0 else y)
         return x * self.sw, y * self.sh

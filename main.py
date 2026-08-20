@@ -217,6 +217,10 @@ def main():
         "--roi-scale", type=float, default=0.70,
         help="画面→屏幕映射中心区域大小(0.30~1.00)：越小=越大范围给手指伸展(避免掌心锁死时手指不可见); 1.0=全屏映射; 默认0.70=中心70%映射,每边预留15%手活动空间",
     )
+    parser.add_argument(
+        "--roi-offset-y", type=float, default=0.5,
+        help="ROI正方形在画面高度的上下位置（-1.0=贴顶, 0.0=居中, +0.5=偏下默认, +1.0=贴底）。默认下移避免顶部手指超出摄像头范围。",
+    )
     # ✨ 点击调参：两个用户友好 0~1 参数（不用手改 8 个内部阈值）
     parser.add_argument(
         "--tap-hardness", type=float, default=0.70,
@@ -227,9 +231,11 @@ def main():
         help="点击识别响应速度 0.00~1.00：越大=越快触发（默认 0.80=响应敏感且仍有防抖）",
     )
     args = parser.parse_args()
-    # roi_scale 硬约束
+    # roi_scale / roi_offset_y 硬约束
     if args.roi_scale < 0.30: args.roi_scale = 0.30
     if args.roi_scale > 1.00: args.roi_scale = 1.00
+    if args.roi_offset_y < -1.0: args.roi_offset_y = -1.0
+    if args.roi_offset_y > +1.0: args.roi_offset_y = +1.0
     if args.tap_hardness < 0.0: args.tap_hardness = 0.0
     if args.tap_hardness > 1.0: args.tap_hardness = 1.0
     if args.tap_speed    < 0.0: args.tap_speed    = 0.0
@@ -262,7 +268,8 @@ def main():
         detector = HandDetector(**detector_kwargs)
         mode_label = "[MODE: 默认 Solutions]  mediapipe 内置模型"
         mode_color = (180, 255, 120)  # 青绿色
-    mouse = MouseController(alpha=0.25, cursor_mode=args.cursor_mode, roi_scale=args.roi_scale)
+    mouse = MouseController(alpha=0.25, cursor_mode=args.cursor_mode, roi_scale=args.roi_scale,
+                            roi_offset_y=args.roi_offset_y)
     tap_detector = FingerTapClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)
     stretch = DiagonalStretchManager()  # 双手对角拉伸 → 选中前台窗口 放大缩小
 
@@ -290,6 +297,7 @@ def main():
             # ========= 单点镜像（唯一位置）=========
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
+            mouse.set_frame_size(w, h)
 
             # ========= 双手检测 =========
             hands_data, frame = detector.detect(frame)
@@ -840,11 +848,7 @@ def main():
             put_text_cn(frame, f"🖱️{mode_text} | 锚点: {anchor_text} | 映射ROI: {roi_pct}%  🟢=光标  🟠=食指TIP",
                         (w - 640, 6), font_scale=0.6, color=(0, 230, 80), thickness=2)
             # ========= 绘制：ROI 矩形边框（把"画面中心X%映射全屏"可视化，用户一眼能看到允许掌心活动的区域）=========
-            margin_px = int(round((1.0 - args.roi_scale) * 0.5 * min(w, h)))
-            x1 = margin_px
-            y1 = margin_px
-            x2 = w - margin_px
-            y2 = h - margin_px
+            x1, y1, x2, y2 = MouseController.compute_roi_bbox_px(w, h, args.roi_scale, args.roi_offset_y)
             # 虚线绿色边框：内部=可映射到屏幕的掌心活动区域；外部=手指预留伸展空间
             _dash_len = 12
             _gap = 8
