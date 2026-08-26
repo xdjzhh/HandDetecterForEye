@@ -739,25 +739,13 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 both_hands_global
                 or pure_two_hand_stretch
                 or pure_two_hand_move
-                # ⚠️ 2026-08-26 第二次紧急修复（bratio/DI 仍恒0根因）：
-                #   删除 any_fist_global / any_near_fist_global 两条件：
-                #     这两条件存在计数/阈值 bug，用户五指张开（ext=(1,1,1,1,1)/gesture=OPEN）
-                #     仍被判 any_near_fist ≥4=True → disable_click=True → 每帧 reset detector → bratio 恒0/DI恒0。
-                #   临时先移除让点击功能先通，下一轮单独调拳头识别的阈值/方向（仅保留 pure_* 明确双手手势条件足够防误触）。
+                # ⚠️ 2026-08-26 两次修复（点击完全失效根因最终版）：
+                #   V1 删除 stretch.state/_move_state != IDLE：单手移动时 move_state 恒非IDLE=正常行为，不能禁点击
+                #   V2 删除 any_fist_global / any_near_fist_global：
+                #        near_fist_bend_count 统计「弯曲指节数≥4」会误判 POINT/OTHER 手势(仅食指伸=其他4指弯=0)
+                #        → ext=(0,1,0,0,0) → count=4/5 → any_nfist=True → 每帧reset detector → bratio恒0/DI恒0
+                #   仅保留纯双手语义手势条件(both_hands/pure_stretch/pure_move)：拉伸场景禁点击100%覆盖，单手点击通畅✅
             )
-            # ⭐ DEBUG 取证（bratio 仍恒0用）：仅 TOP 25% 条带命中 + 每 10 帧打 1 行 gesture/ext/5 条件真值，
-            #     下一轮用户贴此段即可定位 near_fist 为什么误判五指张开。
-            try:
-                _db_cnt = getattr(run_loop, '_tap_debug_cnt', -1)
-                _db_cnt = 0 if _db_cnt < 0 else (_db_cnt + 1)
-                setattr(run_loop, '_tap_debug_cnt', _db_cnt)
-                if "Left" in hand_results and _db_cnt % 10 == 0:
-                    _lg, _lext, _, _ = hand_results["Left"]
-                    _near = sum(1 for x in _lext if not x)
-                    print(f"[TAP-DISABLE-DBG] frame={_db_cnt:>4} Left: gesture={_lg:5} ext={_lext} | near_fist_bend_count={_near}/5 >=4? {_near>=4} | both={bool(both_hands_global)} 2h_str={bool(pure_two_hand_stretch)} 2h_mv={bool(pure_two_hand_move)} any_fist={bool(any_fist_global)} any_nfist={bool(any_near_fist_global)} → DISABLE_CLICK={bool(disable_click_for_stretch_global)}",
-                          flush=True)
-            except Exception:
-                pass
             block_mouse_move_for_stretch = disable_click_for_stretch_global
 
             # ======================================================================
@@ -1007,72 +995,10 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             ay = float(ny) * float(h); ax = float(nx) * float(w)
                             in_band = (ay >= band_y_top - 2.0) and (ay <= band_y_bot + 2.0)
                             anchor_info = f"{_lbl}: anchor({ax:5.1f},{ay:5.1f}) inTopBand={'Y' if in_band else 'N'} | {anchor_info}"
-                    print(f"[HEARTBEAT-TAPLOG] frame={_log_cnt:>4} labels={labels} safe_rect_y=[{band_y_top:5.1f}~{band_y_bot:5.1f}~{ry2:5.1f}] | {anchor_info}",
-                          file=_sys.stdout, flush=True)
-                # ---------- (2) 详细 tap log（仅用户右手=label"Left" 且 进条带 且 每2帧 1 次）----------
-                _do_log = False
-                anchor_y_px = band_y_top = band_y_bot = 0.0
-                rx1 = ry1 = rx2 = ry2 = 0.0
-                if "Left" in hand_results:
-                    nx, ny = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
-                    rx1, ry1, rx2, ry2 = MouseController.compute_roi_bbox_px(
-                        w, h, args.roi_scale, args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
-                    rx1 = float(rx1); ry1 = float(ry1); rx2 = float(rx2); ry2 = float(ry2)
-                    anchor_x_px = float(nx) * float(w)
-                    anchor_y_px = float(ny) * float(h)
-                    TOP_BAND_FACT = 0.25
-                    band_y_top = ry1
-                    band_y_bot = ry1 + TOP_BAND_FACT * max(1.0, ry2 - ry1)
-                    in_x = (anchor_x_px >= rx1 - 6.0) and (anchor_x_px <= rx2 + 6.0)
-                    in_y = (anchor_y_px >= band_y_top - 4.0) and (anchor_y_px <= band_y_bot + 4.0)
-                    # 从 tap 段前置缓存直接读取（100% 同一信号源）
-                    _c_in_tb = bool(getattr(run_loop, '_cached_in_top_band', False))
-                    _c_palm_ok = getattr(run_loop, '_cached_palm_stable_actual', None)
-                    _c_pip_chg = float(getattr(run_loop, '_cached_pip_chg', 0.0))
-                    _c_dip_chg = float(getattr(run_loop, '_cached_dip_chg', 0.0))
-                    _ps_str = ("Y" if _c_palm_ok else "N") if _c_palm_ok is not None else "?"
-                    if in_x and in_y and (_log_cnt % 2 == 0):
-                        _do_log = True
-                if _do_log:
-                    p0a = np.array([lms[0].x, lms[0].y], dtype=np.float64)
-                    p5a = np.array([lms[5].x, lms[5].y], dtype=np.float64)
-                    p6a = np.array([lms[6].x, lms[6].y], dtype=np.float64)
-                    p7a = np.array([lms[7].x, lms[7].y], dtype=np.float64)
-                    p8a = np.array([lms[8].x, lms[8].y], dtype=np.float64)
-                    p17 = np.array([lms[17].x, lms[17].y], dtype=np.float64)
-                    a_pip = _three_point_angle(p5a, p6a, p7a)
-                    a_mcp = _three_point_angle(p0a, p5a, p6a)
-                    a_dip = _three_point_angle(p6a, p7a, p8a)
-                    dist_raw = float(np.linalg.norm(p8a - p5a)) / max(np.linalg.norm(p5a - p17), 1e-6)
-                    D_N_S = 2.40; D_N_B = 0.90; D_N_MIN = 0.20; D_N_MAX = 0.88
-                    t = (dist_raw - D_N_B) / (D_N_S - D_N_B)
-                    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-                    dist_norm = D_N_MIN + t * (D_N_MAX - D_N_MIN)
-                    final_v = float(index_bend) if index_bend is not None else float('nan')
-                    tm = tap_detector.metrics()
-                    br = tm["bend_ratio"]
-                    di_down = tm["di_sum_down"]
-                    di_thr = tm["DI_DOWN_THR"]
-                    MIN_ABS = float(tap_detector.params.get("MIN_ABS_BEND_RATIO_FOR_DELTA", 0.75))
-                    ENTER = float(tap_detector.params.get("ENTER_BEND_RATIO", 0.698))
-                    down_ok_delta = bool(di_down >= di_thr and br <= min(MIN_ABS, ENTER + 0.06))
-                    drop_now = 0.0
-                    if tm["baseline"] > 1e-6 and tap_detector._max_recent_bend is not None:
-                        drop_now = (tap_detector._max_recent_bend - tm["bend"]) / max(tap_detector._max_recent_bend, 1e-6)
-                    down_ok_abs = bool((tm["bend"] < tm["enter_t"]) and (drop_now > float(tap_detector.params.get("MIN_BEND_DROP", 0.14))))
-                    down_ok = bool(down_ok_delta or down_ok_abs)
-                    _STATE_NAMES = {0:"IDLE",1:"ARM",2:"HOLD",3:"PRS",4:"COOL"}
-                    st = _STATE_NAMES.get(tm["state"], f"?{tm['state']}")
-                    ev_name = {0:"-",1:"TAP",2:"LNG_D",3:"LNG_U",4:"DRAG"}.get(tap_event, str(tap_event))
-                    anchor_range_str = f"{anchor_y_px:6.1f}({band_y_top:5.1f}~{band_y_bot:5.1f})"
-                    if not _log_header_printed:
-                        print("┌────────────── TOP BAND TAP LOG (ROI顶部25%条带，每2帧) ──────────────┐", flush=True)
-                        print("│frm │IN_TB│PS │DIPΔ°│PIPΔ°│  anchor_y_px(条带顶~底)    │∠PIP │∠MCP │∠DIP │dist_rw│dist_nm│ final │bratio│DI_down│DIthr │dδOK │dOK↓│downOK│tap_ev│state│", flush=True)
-                        print("├────│─────┼───┼─────┼─────┼──────────────────────────┼─────┼─────┼─────┼───────┼───────┼───────┼──────┼───────┼──────┼─────┼────┼──────┼──────┼─────┤", flush=True)
-                        setattr(run_loop, '_tap_log_header_printed', True)
-                    dS = "Y" if down_ok_delta else "N"
-                    dA = "Y" if down_ok_abs else "N"
-                    print(f"│{_log_cnt:>3} │ {'Y' if _c_in_tb else 'N'}   │ {_ps_str:1} │ {_c_dip_chg:+4.1f}│ {_c_pip_chg:+4.1f}│ {anchor_range_str:24} │ {a_pip:3.0f}°│ {a_mcp:3.0f}°│ {a_dip:3.0f}°│ {dist_raw:5.3f} │ {dist_norm:5.3f} │ {final_v:5.3f} │ {br:4.2f} │ {di_down:5.3f} │ {di_thr:4.2f} │ {dS:3}  │ {dA:3} │ {'Y' if down_ok else 'N'}    │ {ev_name:4} │ {st:3} │", flush=True)
+                    # 用户要求删除 [HEARTBEAT-TAPLOG] 心跳兜底日志（2026-08-26）
+                    # print(f"[HEARTBEAT-TAPLOG] frame={_log_cnt:>4} labels={labels} safe_rect_y=[{band_y_top:5.1f}~{band_y_bot:5.1f}~{ry2:5.1f}] | {anchor_info}",
+                    #       file=_sys.stdout, flush=True)
+                # (2) 详细逐帧 TAP 表格日志 │368 │ Y ... 已直接删除（2026-08-26，用户要求）
             except Exception as _tap_log_e:
                 import traceback as _tb
                 print(f"  [ERROR] top-band tap log 异常：{_tap_log_e!r}\n{_tb.format_exc()}", flush=True)
