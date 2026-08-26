@@ -35,6 +35,16 @@ HOLD_FRAMES = 4
 DEFAULT_ROI_SCALE = 0.70   # ✨ 原 0.85 再往内收缩：中心 70% 映射全屏，每边留白 15%（掌心活动区更小=更不易跑出镜头边缘，避免无法识别到掌心/整只手）
 ROI_SCALE_MIN = 0.30
 ROI_SCALE_MAX = 1.00
+# ⭐ 2026-08-24 新增："安全子 ROI" 等比内缩比例（需求 1：避免指尖超出显示框边缘）
+#   语义：在「--roi-scale 定义的原始 ROI 长方形」基础上，**再按中心等比乘 ROI_SAFE_SHRINK 内缩**，
+#         作为「鼠标映射真正生效的区域」+「UI 上绘制的虚线矩形」。
+#   例：roi_scale=0.70 → 原始 ROI 左右各 margin 15%；再 SAFE_SHRINK=0.82 → 安全子 ROI 每边再加 padding ≈9%
+#       总每边留白 15%+9%×0.70≈21% → 掌心移到虚线框边缘时，整只手掌 + 向上伸展的指尖距离画面边缘还有缓冲，
+#       不会顶出摄像头边界 → MediaPipe 仍能完整看到所有 landmark = 不会丢识别。
+#   SAFE_SHRINK 越小=虚线框越小=指尖越不容易超，但手要覆盖全屏的动作幅度越大（反向=ROI 越小）。
+ROI_SAFE_SHRINK = 0.82
+ROI_SAFE_SHRINK_MIN = 0.50
+ROI_SAFE_SHRINK_MAX = 1.00
 # ✨ ROI 垂直偏移（新增 2026-08-20）
 #   ⚠️ 只改 Y 方向位置，X 方向宽度和 Y 方向高度 100% 保持 roi_scale 原尺寸不变（严禁擅自改成正方形！）
 #   语义：roi_offset_y ∈ [-1.0, +1.0]，控制「长方形 ROI 区域」在画面高度方向的位置：
@@ -47,7 +57,9 @@ ROI_SCALE_MAX = 1.00
 #        0.0  → ROI 垂直居中（老默认）
 #       +0.5  → ROI 往下偏（**新默认**，画面顶部多留 50% 可分配 Y margin 给向上伸展的食指/中指，避免顶部手指超出摄像头上边界）
 #       +1.0  → ROI 贴画面底
-DEFAULT_ROI_OFFSET_Y = 0.5
+DEFAULT_ROI_OFFSET_Y = 0.62  # ✨ 2026-08-25 组合根治B1：从0.50下移至0.62（=ROI整体向画面底部多挪12%）
+#   目的：掌心锚点顶到安全矩形最上沿时，腕#0/食指MCP#5/小指MCP#17/食指TIP#8 整只手仍在画面内，不被上边缘clip
+#   公式：top_margin = avail_y_margin * (0.5 + 0.5 * oy)；oy+0.50→顶空75%，oy+0.62→顶空81%，下方缩12%，X方向不变
 ROI_OFFSET_Y_MIN = -1.0
 ROI_OFFSET_Y_MAX = +1.0
 
@@ -55,10 +67,14 @@ ROI_OFFSET_Y_MAX = +1.0
 # 1) 滑动中值窗口
 MEDIAN_WINDOW = 5
 # 2) 静止方差锁：近 N 帧屏幕像素位移的协方差 (px^2) 低于此值 → 锁死光标不动
-LOCK_WINDOW = 8
+# ⭐ 2026-08-24 用户反馈「难以稳定」：
+#   LOCK_WINDOW 8→10（取更多帧算方差，统计更稳，不会因为 2-3 帧抖就判在动）
+#   LOCK_THRESH_BROWSE 3.0→4.5（OPEN 浏览更宽松 = 4.5px² ≈ 2.1px 单维抖动就允许锁死，之前要 1.7px=更难锁）
+#   LOCK_THRESH_HOVER 0.80→1.20（POINT 悬停也适当放宽，1.1px 单维就能锁）
+LOCK_WINDOW = 10
 #  不同模式下的锁死阈值 (px^2)，越大=越容易锁死=越稳
-LOCK_THRESH_HOVER  = 0.80       # POINT 悬停：极稳（0.8px²≈0.9px单维抖动就锁）
-LOCK_THRESH_BROWSE = 3.0        # OPEN 浏览：中等
+LOCK_THRESH_HOVER  = 1.20       # POINT 悬停：放宽到 1.2px²≈1.1px单维
+LOCK_THRESH_BROWSE = 4.50       # OPEN 浏览：放宽到 4.5px²≈2.1px单维
 LOCK_THRESH_DRAG   = 99999.0    # （保留兼容定义，但 FIST 不再用于拖拽）
 # 3) 1€ Filter 核心参数（不同模式下 fc_min / beta 组合）
 #    fc_min = 最小截止频率(Hz)，越小→慢动时越平滑
@@ -82,30 +98,41 @@ CLICK_FREEZE_FRAMES = 3
 
 # cursor 模式
 CURSOR_MODE_SMOOTH   = "smooth"    # 当前 AR 5 层平滑（悬停稳、但有滞后）
-CURSOR_MODE_ABSOLUTE = "absolute"  # ✨ 掌心绝对坐标直接跳（像触摸屏指哪打哪，方案A 3层流水线：中值杀尖峰 + Sigmoid微移阻尼 + 静止方差锁）
+CURSOR_MODE_ABSOLUTE = "absolute"  # ✨ 掌心绝对坐标（方案A 3层：中值杀尖峰 + Sigmoid微移阻尼 + 静止方差锁，兼顾稳+跟手）
+CURSOR_MODE_DIRECT   = "direct"    # ⭐ 2026-08-22 新增：严格跟随 UI 掌心绿圈——只保留 3 帧中值杀 1-2 帧飞点，无 Sigmoid 阻尼、无静止锁，无论手掌如何翻转都 1:1 跟手不卡顿
 
 # absolute 模式下为了避免 MediaPipe 1~2 帧偶发尖峰跳到屏幕角落，保留一个轻量的 3 帧中值
 ABS_MEDIAN_WINDOW = 3
 
 # ✨✨ 方案 A 新增：absolute 模式「大范围跟手 + 小范围不晃」的 3 层流水线参数（只作用在 absolute 模式，不影响 smooth）
 #   Layer 2 Sigmoid：微移阻尼增益（响应曲线拐点，k 越大=拐点越陡=越严格压制小抖动）
-#     调参语义：ABS_SIGMOID_K = 0.35  → 位移 <3px 增益≈0.2（5倍阻尼）；>20px 增益→1.0（完全不衰减=跟手）
-#     不想要 Sigmoid（嫌麻烦）→ 设 0.0 即可直接关闭这一层
+#     ⚠️ 2026-08-22 复原（用户确认 Sigmoid/静止锁不会造成卡顿，参数应与工程约定一致，不做折中放宽）
+#       参数：MIN_G=0.20 / INFLECT=11px / K=0.35（之前的官方 baseline）
+#         Δ=1px → 增益≈0.22（阻尼 4.5 倍，纯噪声 1px 抖→0.22px）
+#         Δ=3px → 增益≈0.25（阻尼 4 倍）
+#         Δ=5px → 增益≈0.29（阻尼 3.4 倍 = 用户之前约定的 5px 压缩边界）
+#         Δ=11px→ 增益≈0.60（拐点中点，阻尼 1.7 倍）
+#         Δ>20px→ 增益→1.0（0 衰减 = 大范围跟手指哪打哪）
+#   ⭐ 2026-08-24 用户反馈「难以稳定」：
+#     · INFLECTION_PX 11.0 → 14.0（拐点右移，0~14px 的小/中幅度移动都保持更强阻尼，移动不抖=更易稳定；18px+ 才开始近 100% 跟手=大范围跟手不丢）
+#     · ABS_LOCK_WINDOW 6→10（取帧更多=方差统计更稳，1-2 帧偶发飞点不会破锁）
+#     · ABS_LOCK_THRESH 3.5→5.6（σ<5.6px 就锁=更容易锁；单维 2.4px 抖动就锁，之前是 1.9px=更难锁）
+#     · UNLOCK=5.6*1.6=9.0px（累计位移超过 9px 才解锁，慢移动解锁更"果断"=不拖泥带水；RELOCK_COOLDOWN 同步加大=解锁后 20 帧不重锁=移动连续）
 ABS_SIGMOID_K     = 0.35
-ABS_SIGMOID_MIN_G = 0.20  # 最小增益（Δ→0 时的阻尼）；0.20 = 5 倍阻尼（1px抖→0.2px输出）
+ABS_SIGMOID_MIN_G = 0.20  # 最小增益（Δ→0）：工程约定 baseline
 #   Layer 3 静止方差锁：连续 N 帧内，掌心样本方差 σ² < threshold² → 硬锁死光标到一个点（钉住=完全不漂移）
-#     ✅ 2026-08-20 调参（修复「掌心标识动了但鼠标不动」的核心bug）：
-#       旧：LOCK_WINDOW=10 / THRESH=2.5 / UNLOCK=4.0px(单点)
-#       新：LOCK_WINDOW=6 → 锁得更快解锁也更快；THRESH=3.5 → 不容易被轻微噪声误锁；
-#           ⭐ 新增「累计位移趋势解锁」：即使单点每帧都 < UNLOCK（=缓慢移动），
-#              只要最近 LOCK_WIN 帧相对锁点的累计（sum|dx|+sum|dy|）> 2.0×UNLOCK → 立即解锁，
-#              彻底解决"手慢慢移了30px，鼠标还钉死在原地"的问题。
-ABS_LOCK_WINDOW   = 6    # 连续多少帧进入锁死判定（之前10=330ms太长，6≈200ms是折中）
-ABS_LOCK_THRESH   = 3.5  # 静止判定阈值（像素）：之前2.5太严，轻微噪声就锁死；3.5更中性
+ABS_LOCK_WINDOW   = 10
+ABS_LOCK_THRESH   = 5.6
 
 # pyautogui 安全设置
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.0
+# ⭐ 2026-08-22 补充：显式锁死"动作内部最小耗时 / 最小休眠"为 0
+#   PAUSE=0 只保证"两个动作之间"不强制 sleep 0.1s；
+#   MINIMUM_DURATION（默认 0，已安全）是 moveTo/click 内部 duration 参数若 < MINIMUM_DURATION 则直接置 0（duration=0 → 无过渡，瞬时跳转）；
+#   MINIMUM_SLEEP（默认 0.05s）是 pyautogui 做任何 move/click 后强制短暂休眠的兜底——我们自己有 EMA/1€/Sigmoid 多层平滑，不需要 pyautogui 再加 50ms 拖尾，否则 30fps 输入下叠加 50ms 主动 sleep = 连续 moveTo 的理论上限 20fps，体感明显顿。
+pyautogui.MINIMUM_DURATION = 0.0
+pyautogui.MINIMUM_SLEEP = 0.0
 
 
 # ============================================================================
@@ -208,15 +235,18 @@ class ARSmoother:
         # ✨✨ absolute 模式 Layer 3：静止方差锁（样本缓冲 + 锁位置）
         self._abs_lock_buf_x: deque[float] = deque(maxlen=ABS_LOCK_WINDOW)
         self._abs_lock_buf_y: deque[float] = deque(maxlen=ABS_LOCK_WINDOW)
-        self._abs_locked_x: float | None = None   # 当前被锁死的固定光标 X（None=未锁）
+        self._abs_locked_x: float | None = None   # 当前被锁死的固定光标 X（None=未锁）——=输出给鼠标的像素位置
         self._abs_locked_y: float | None = None   # 当前被锁死的固定光标 Y（None=未锁）
+        self._abs_locked_ref_ax: float | None = None  # ⭐ 锁成立时 Layer1(ax) 参考值（用于解锁判定时比较手掌是否真的移动）
+        self._abs_locked_ref_ay: float | None = None  # ⭐ 锁成立时 Layer1(ay) 参考值
+        self._abs_lock_cooldown: int = 0  # ⭐ 刚解锁后的冷却帧数：此期间不允许重新锁死（防止解锁→重锁抖动）
 
     # ---------- 外部：模式切换 ----------
     def set_mode(self, mode: str):
-        """切换 cursor 模式：smooth / absolute"""
+        """切换 cursor 模式：smooth / absolute / direct"""
         if mode == self._mode:
             return
-        assert mode in (CURSOR_MODE_SMOOTH, CURSOR_MODE_ABSOLUTE), f"unknown cursor mode: {mode}"
+        assert mode in (CURSOR_MODE_SMOOTH, CURSOR_MODE_ABSOLUTE, CURSOR_MODE_DIRECT), f"unknown cursor mode: {mode}"
         self._mode = mode
         self.reset()
 
@@ -256,6 +286,9 @@ class ARSmoother:
         # ✨✨ absolute 模式 Layer 3 锁状态清空
         self._abs_locked_x = None
         self._abs_locked_y = None
+        self._abs_locked_ref_ax = None
+        self._abs_locked_ref_ay = None
+        self._abs_lock_cooldown = 0
 
     # ---------- 内部工具 ----------
     @staticmethod
@@ -277,38 +310,62 @@ class ARSmoother:
         """✨ 方案 A：absolute 模式 Layer 2 专用 Sigmoid 增益（用 ABS_* 参数，拐点/最小增益可独立调）"""
         if ABS_SIGMOID_K <= 1e-6:
             return 1.0
-        # ✨ 用户要求：sigmoid 增益压缩「增大到 5px」
-        #   目标：Δ ≤ 5px 全部都落在「接近最小增益 0.20」的位置 → 阻尼 ≥ 3.3 倍以上
-        #   计算方法（确保 5px 处真正在 Sigmoid 贴底区= inflection - (2/K) ≈ 5）：
-        #     K=0.35 → 2/K ≈ 5.71 → inflection ≈ 5 + 5.71 ≈ 11.0
-        #   最终 INFLECTION_PX = 11.0：
-        #     Δ=1px → 增益≈0.22（几乎贴底）
-        #     Δ=3px → 增益≈0.25
-        #     Δ=5px → 增益≈0.29（=刚好在 5px 压缩边界，3.4 倍阻尼）
-        #     Δ=11px→ 增益≈0.60（拐点中点）
-        #     Δ=20px→ 增益≈0.98（完全不衰减，大范围跟手）
-        INFLECTION_PX = 11.0
+        # ⭐ 2026-08-24 用户反馈「难以稳定」：INFLECTION_PX 11.0 → 14.0
+        #   K=0.35 / MIN_G=0.20 / INFLECT=14px：
+        #     Δ≤6px → 增益 0.21~0.28（更强阻尼压制微抖=更易稳定）
+        #     Δ=14px → 增益≈0.60（拐点中点，1.7x阻尼，仍顺滑）
+        #     Δ≥22px → 增益→1.0（大范围 0 衰减=指哪打哪不丢）
+        INFLECTION_PX = 14.0
         s = 1.0 / (1.0 + np.exp(-ABS_SIGMOID_K * (float(delta_px) - INFLECTION_PX)))
         min_g = float(max(0.0, min(1.0, ABS_SIGMOID_MIN_G)))
         amp = 1.0 - min_g
-        # 输出 ∈ [min_g, 1.0]；默认 min_g=0.20 → [0.20, 1.0]
         return float(min_g + amp * s)
 
     # ---------- 主入口：5 层流水线 ----------
     def filter(self, raw_x: float, raw_y: float, gesture: str | None = None):
         """输入=归一化坐标映射后的「屏幕像素原始值」，输出=AR平滑后屏幕像素。
 
-        两种模式：
-          - CURSOR_MODE_SMOOTH: 完整 5 层 AR 悬停流水线（方差锁/1€/Sigmoid 等）
-          - CURSOR_MODE_ABSOLUTE: 方案 A 3 层流水线 → 大范围跟手（指哪打哪）+ 小范围不晃（微移阻尼+静止锁）
+        三种模式：
+          - CURSOR_MODE_SMOOTH  : 完整 5 层 AR 悬停流水线（方差锁/1€/Sigmoid 等）
+          - CURSOR_MODE_ABSOLUTE: 方案 A 3 层流水线 → 大范围跟手 + 小范围不晃
+          - CURSOR_MODE_DIRECT  : ⭐ 严格跟随 UI 掌心绿圈（仅 3 帧中值杀飞点，无阻尼无锁）
         """
-        # 点击前冻结（两种模式都生效：点击瞬间锁死避免漂移）
+        # 点击前冻结（三种模式都生效：点击瞬间锁死避免漂移）
         if self._freeze_left > 0:
             self._freeze_left -= 1
             fx, fy = self._freeze_x, self._freeze_y
             self._last_out_x = fx
             self._last_out_y = fy
             return fx, fy
+
+        # ============================================================
+        # ⭐⭐ CURSOR_MODE_DIRECT（严格跟手模式：1:1 匹配 UI 掌心绿圈）
+        #   目标：无论手掌如何翻转/倾斜，鼠标和预览画面的绿圈严格同步，绝不再"绿圈动了鼠标卡"
+        #   流水线：
+        #     Layer 1：3 帧中值（杀 1~2 帧 MediaPipe 偶发飞点，保留画面上看得到的那种跟手感）
+        #     无 Layer 2 Sigmoid 阻尼
+        #     无 Layer 3 静止方差锁
+        #   ⚠️ 原理：landmarks 端已做 EMA α=0.85（+ 掌心大位移硬重置），UI 绿圈已经跟手且稳定；
+        #           鼠标端再叠任何阻尼/锁，都会导致"绿圈动鼠标不动"的视觉脱节。
+        #           尤其是手掌翻转时，掌心在 3D 中旋转 → X/Y 投影会出现 2~5px 高频微抖，
+        #           absolute 模式的 Sigmoid+静止锁会把这种抖动误判为"应该阻尼/锁死"，表现为卡顿；
+        #           但 UI 上绿圈直接画（无额外锁），所以看起来"绿圈准、鼠标卡"——
+        #           direct 模式就是让鼠标端和绿圈用完全一样的策略，从根上消除脱节。
+        # ============================================================
+        if self._mode == CURSOR_MODE_DIRECT:
+            # Layer 1：3 帧中值（仅杀偶发 1 帧飞点，不引入任何延迟）
+            self._abs_buf_x.append(float(raw_x))
+            self._abs_buf_y.append(float(raw_y))
+            if len(self._abs_buf_x) >= ABS_MEDIAN_WINDOW and len(self._abs_buf_y) >= ABS_MEDIAN_WINDOW:
+                mx = float(np.median(self._abs_buf_x))
+                my = float(np.median(self._abs_buf_y))
+            else:
+                mx = float(raw_x)
+                my = float(raw_y)
+            # 直接输出（无 sigmoid / 无锁 / 无 EMA）——和 UI 绿圈完全同步
+            self._last_out_x = float(mx)
+            self._last_out_y = float(my)
+            return float(mx), float(my)
 
         # ============================================================
         # ✨✨ CURSOR_MODE_ABSOLUTE（方案 A 3 层流水线：大范围跟手 + 小范围不晃）
@@ -329,23 +386,16 @@ class ARSmoother:
 
             # ============================================================
             # Layer 2：Sigmoid 非线性微移增益压缩（抑制小抖动，但大位移完全不衰减=跟手）
-            #   ✨ 用户要求「sigmoid 增益压缩增大到 5px」：压缩生效边界=5px（Δ≤5px 全压）
-            #   原理：用「Layer1 输出 - 上一帧输出」计算位移 Δ；套 Sigmoid 得增益 g(Δ)（拐点=11px）：
-            #     Δ ≤ 5px  → g ∈ [0.22, 0.29]          → 阻尼 ≥ 3.4 倍（5px 内微抖 1px→0.22px 输出,完全不晃）
-            #     Δ = 11px → g ≈ 0.60                  → 拐点, ~1.7 倍阻尼（微调场景略稳）
-            #     Δ > 20px → g → 1.0                   → 0 衰减（大范围移动=和以前的absolute一样跟手）
-            #   关键：绝对位置不做 EMA/1€（这两种引入相位滞后=大范围拖尾），只对「这一帧和上一帧的差值」按增益缩放
-            #         → 大范围仍然是绝对指哪打哪，不会有滞后
+            #   ⚠️ 2026-08-22 放宽：Δ≤2px 阻尼 1.7 倍；Δ=5px 增益≈0.87；Δ>9px 增益→1.0
+            #   核心：鼠标端阻尼必须匹配 UI 绿圈（EMA 0.85）的响应速度，不能再叠加强阻尼导致视觉脱节
             # ============================================================
             if self._last_out_x is None or self._last_out_y is None:
-                # 第一帧：没有上一帧，直接用 Layer1 输出（避免除以 0 / 跳变）
                 sx, sy = float(ax), float(ay)
             else:
                 dx = float(ax) - float(self._last_out_x)
                 dy = float(ay) - float(self._last_out_y)
                 delta_px = float(np.sqrt(dx * dx + dy * dy))
                 if ABS_SIGMOID_K <= 1e-6:
-                    # 参数设为 0 → 关闭 Layer2
                     g = 1.0
                 else:
                     g = float(self._abs_sigmoid_gain(delta_px))
@@ -354,59 +404,70 @@ class ARSmoother:
 
             # ============================================================
             # Layer 3：静止方差锁（对准小按钮的核心杀招 → 光标"钉住"完全不动）
-            #   判定：连续 ABS_LOCK_WINDOW=6 帧的 Layer2 输出，在 X/Y 两个方向上 σ（标准差）< ABS_LOCK_THRESH=3.5px
-            #         → 视为「手掌完全没动 = MediaPipe 纯噪声抖动」→ 硬锁死到这 6 帧的均值点（之后直接输出锁点，不再随噪声漂）
-            #   解锁：已锁死的情况下，满足 **任一** 条件立即解锁：
-            #         ① 当前帧 Layer2 输出与锁点距离 > UNLOCK=5.6px（单点跳变，明显真实动作）
-            #         ② ⭐ 累计位移趋势解锁：最近一帧缓冲内所有点相对锁点的（|dx|+|dy|）累计 > 2.0×UNLOCK
-            #            → 解决「缓慢移动：每帧位移<5.6px，解不开锁，掌心图标动了但鼠标不动」的核心bug
+            #   ⚠️ 2026-08-22 关键修复：
+            #     ① 判定/解锁全部改用 Layer1 原始 (ax,ay)，不再用 Sigmoid 压缩后的 sx/sy——
+            #        之前用 sx/sy 导致 Sigmoid 把真实移动压小，解锁累计量永远凑不够→鼠标死锁不动
+            #     ② 锁点本身仍取最近 Layer2 (sx,sy) 均值（保证输出连续不跳）
+            #     ③ UNLOCK_DIST 累计阈值从 2.0×降到 1.5×（更灵敏解锁）
             # ============================================================
-            UNLOCK_DIST = float(ABS_LOCK_THRESH) * 1.6   # 解锁阈值 = 锁定阈值的 1.6 倍 = 5.6px
-            self._abs_lock_buf_x.append(float(sx))
-            self._abs_lock_buf_y.append(float(sy))
+            UNLOCK_DIST = float(ABS_LOCK_THRESH) * 1.6   # 8.0px
+            RELOCK_COOLDOWN_FRAMES = ABS_LOCK_WINDOW * 2  # ⭐ 解锁后 10 帧内不允许重锁（防止缓慢移动时解锁-重锁抖动）
+            # ⭐ 用 Layer1 原始 ax/ay 送入锁判定缓冲（真实反映手掌有没有在动）
+            self._abs_lock_buf_x.append(float(ax))
+            self._abs_lock_buf_y.append(float(ay))
+            # 解锁冷却计数（每帧 -1，到 0 才允许再次锁死）
+            if self._abs_lock_cooldown > 0:
+                self._abs_lock_cooldown -= 1
 
             buf_full = len(self._abs_lock_buf_x) >= ABS_LOCK_WINDOW and len(self._abs_lock_buf_y) >= ABS_LOCK_WINDOW
-            # ① 已在锁死状态 → 先检查是否需要解锁
+            # ① 已在锁死状态 → 先检查是否需要解锁（基于原始 Layer1 值判断手掌是否真动）
             if self._abs_locked_x is not None and self._abs_locked_y is not None:
+                # 单点距离：原始 Layer1 (ax,ay) 到「锁点对应的原始参考点」的距离
                 dist_to_lock = float(np.sqrt(
-                    (float(sx) - float(self._abs_locked_x)) ** 2 +
-                    (float(sy) - float(self._abs_locked_y)) ** 2
+                    (float(ax) - float(self._abs_locked_ref_ax)) ** 2 +
+                    (float(ay) - float(self._abs_locked_ref_ay)) ** 2
                 ))
-                # 条件②：累计位移趋势解锁（最近缓冲内所有点的|dx|+|dy|之和）
+                # 累计位移趋势解锁：缓冲内所有 Layer1 原始点相对参考点的累计
                 cum_disp = 0.0
                 try:
                     for xi, yi in zip(self._abs_lock_buf_x, self._abs_lock_buf_y):
-                        cum_disp += abs(float(xi) - float(self._abs_locked_x)) + abs(float(yi) - float(self._abs_locked_y))
+                        cum_disp += abs(float(xi) - float(self._abs_locked_ref_ax)) + abs(float(yi) - float(self._abs_locked_ref_ay))
                 except Exception:
                     cum_disp = 0.0
-                unlock_trend = cum_disp > (2.0 * UNLOCK_DIST)
+                # ⭐ 累计阈值从 2.0×UNLOCK 降到 1.5×：手掌持续移动能更快解锁
+                unlock_trend = cum_disp > (1.5 * UNLOCK_DIST)
 
                 if dist_to_lock <= UNLOCK_DIST and not unlock_trend:
-                    # 仍然在锁点附近 + 累计也没动 → 继续锁死，输出固定点
+                    # 仍然在锁点附近 + 累计也没动 → 继续锁死，输出固定光标位置
                     lx, ly = float(self._abs_locked_x), float(self._abs_locked_y)
                     self._last_out_x = lx
                     self._last_out_y = ly
                     return lx, ly
                 else:
-                    # 真实动作（单点跳变 OR 缓慢移动累计量到了）→ 解锁；清空锁缓冲（下一轮再满 6 帧才重新锁）
+                    # 真实动作 → 解锁；清空锁缓冲 + 启动冷却（N 帧内不再重锁）
                     self._abs_locked_x = None
                     self._abs_locked_y = None
+                    self._abs_locked_ref_ax = None
+                    self._abs_locked_ref_ay = None
+                    self._abs_lock_cooldown = RELOCK_COOLDOWN_FRAMES
                     self._abs_lock_buf_x.clear()
                     self._abs_lock_buf_y.clear()
-                    self._abs_lock_buf_x.append(float(sx))
-                    self._abs_lock_buf_y.append(float(sy))
-                    buf_full = False  # 刚清空 → 缓冲不满，不做锁判定
-            # ② 未锁死 → 尝试满足「缓冲满 + 方差 < 阈值」→ 进入锁死
-            if buf_full and self._abs_locked_x is None:
+                    self._abs_lock_buf_x.append(float(ax))
+                    self._abs_lock_buf_y.append(float(ay))
+                    buf_full = False
+            # ② 未锁死 → 尝试满足「缓冲满 + 冷却已过 + Layer1 原始 σ < 阈值」→ 进入锁死
+            if buf_full and self._abs_locked_x is None and self._abs_lock_cooldown <= 0:
                 std_x = float(np.std(self._abs_lock_buf_x))
                 std_y = float(np.std(self._abs_lock_buf_y))
                 if std_x < ABS_LOCK_THRESH and std_y < ABS_LOCK_THRESH:
-                    # 满足静止条件 → 锁死到均值位置
-                    lock_x = float(np.mean(self._abs_lock_buf_x))
-                    lock_y = float(np.mean(self._abs_lock_buf_y))
+                    # 锁光标位置 = 最近的 Layer2 (sx,sy) 均值（不跳）
+                    # 参考点（用于解锁判断）= 最近的 Layer1 (ax,ay) 均值
+                    self._abs_locked_ref_ax = float(np.mean(self._abs_lock_buf_x))
+                    self._abs_locked_ref_ay = float(np.mean(self._abs_lock_buf_y))
+                    lock_x = float(sx)
+                    lock_y = float(sy)
                     self._abs_locked_x = lock_x
                     self._abs_locked_y = lock_y
-                    # 锁死首帧：直接返回锁点
                     self._last_out_x = lock_x
                     self._last_out_y = lock_y
                     return lock_x, lock_y
@@ -491,7 +552,8 @@ class ARSmoother:
 class MouseController:
     def __init__(self, screen_size=None, cursor_mode: str = CURSOR_MODE_SMOOTH,
                  roi_scale: float = DEFAULT_ROI_SCALE,
-                 roi_offset_y: float = DEFAULT_ROI_OFFSET_Y, **_ignored):
+                 roi_offset_y: float = DEFAULT_ROI_OFFSET_Y,
+                 roi_safe_shrink: float | None = None, **_ignored):
         if screen_size is None:
             self.sw, self.sh = pyautogui.size()
         else:
@@ -506,6 +568,14 @@ class MouseController:
         if roi_offset_y < ROI_OFFSET_Y_MIN: roi_offset_y = ROI_OFFSET_Y_MIN
         if roi_offset_y > ROI_OFFSET_Y_MAX: roi_offset_y = ROI_OFFSET_Y_MAX
         self._roi_offset_y = roi_offset_y
+        # ROI 安全内缩：在原 ROI 长方形基础上中心等比再缩多少（0.50~1.00）；None=用全局默认 ROI_SAFE_SHRINK
+        if roi_safe_shrink is None:
+            self._roi_safe_shrink = float(ROI_SAFE_SHRINK)
+        else:
+            s = float(roi_safe_shrink)
+            if s < ROI_SAFE_SHRINK_MIN: s = ROI_SAFE_SHRINK_MIN
+            if s > ROI_SAFE_SHRINK_MAX: s = ROI_SAFE_SHRINK_MAX
+            self._roi_safe_shrink = s
         # 摄像头画面尺寸（默认 None = 未知 → _norm_to_screen 退化为"兼容旧模式"）；
         # 由主循环 hands_tasks / main.py 在第一次拿到 frame 时调用 set_frame_size 填入。
         # 只有填入后，_norm_to_screen 的坐标映射才和 compute_roi_bbox_px 绘制的绿框 100% 精确对齐。
@@ -518,6 +588,15 @@ class MouseController:
         self._hold_frames = 0
         # 拖拽状态
         self._drag_active = False
+        # ⭐ 2026-08-22 新增：同帧共享"最新屏幕坐标缓存"
+        #   避免 move_only() + handle() + 食指 Tap-Click 段各自独立调用 _smooth() → smoother 缓冲/锁/EMA 被同一帧更新3次 → 状态混乱、点击坐标严重错位
+        #   规则：每一帧对同一个右手 cursor_anchor_norm → 只跑一次 _norm_to_screen + _smooth → 结果存在这里
+        #         move_only() 输出 = last_screen_pt（移动）
+        #         handle() 防抖/移动分支直接用 last_screen_pt，不再重跑 _smooth
+        #         食指 Tap-Click 的 right_screen_pt 也直接用 last_screen_pt（100% 与绿圈对齐）
+        self.last_screen_norm: tuple[float, float] | None = None  # 上次跑 smooth 用的归一化锚点（用于判"是否同帧同坐标"）
+        self.last_screen_px:   tuple[float, float] | None = None  # 上次输出屏幕像素坐标（gx,gy 原始 raw 像素）
+        self.last_smoothed_px: tuple[float, float] | None = None  # 上次输出平滑后屏幕像素坐标（sx,sy 已过 smoother）
 
     # ---------------- 外部：ROI / cursor 模式切换 ----------------
     def set_roi_scale(self, roi_scale: float):
@@ -542,13 +621,25 @@ class MouseController:
     def roi_offset_y(self) -> float:
         return self._roi_offset_y
 
+    def set_roi_safe_shrink(self, roi_safe_shrink: float):
+        """动态调整安全子 ROI 等比内缩比例（0.50~1.00）：越小=虚线框越小=指尖越不易超框。"""
+        s = float(roi_safe_shrink)
+        if s < ROI_SAFE_SHRINK_MIN: s = ROI_SAFE_SHRINK_MIN
+        if s > ROI_SAFE_SHRINK_MAX: s = ROI_SAFE_SHRINK_MAX
+        self._roi_safe_shrink = s
+
+    @property
+    def roi_safe_shrink(self) -> float:
+        return self._roi_safe_shrink
+
     def set_frame_size(self, frame_w: int, frame_h: int):
         """主循环在拿到第一帧后调用，让 _norm_to_screen 计算的坐标与预览绿框 100% 对齐。"""
         self._cam_frame_w = int(max(1, frame_w))
         self._cam_frame_h = int(max(1, frame_h))
 
     @staticmethod
-    def compute_roi_bbox_px(frame_w: int, frame_h: int, roi_scale: float, roi_offset_y: float = 0.0):
+    def compute_roi_bbox_px(frame_w: int, frame_h: int, roi_scale: float, roi_offset_y: float = 0.0,
+                            roi_safe_shrink: float | None = None):
         """✨ 统一工具：计算 ROI 矩形在画面中的像素坐标 (x1,y1,x2,y2)。
         供预览绘制、diagonal_stretch 等所有 UI 代码共用（保证与 _norm_to_screen 的映射范围完全一致）。
 
@@ -558,10 +649,21 @@ class MouseController:
           2. Y 方向：高度仍 = rs*min(fw,fh)（和原来完全一样，高度不变）
               → 仅通过 roi_offset_y 把"可用 Y margin"在 顶/底 之间重新分配
               → 顶 margin = (h - roi_h) * (0.5 + 0.5*oy)，实现整体上下移动。
+          3. ⭐ 2026-08-24 新增：roi_safe_shrink "安全子 ROI"等比内缩
+              · 在步骤 1+2 算出的「原始 ROI 矩形」中心位置保持不变的前提下，
+                宽×高 再乘以 roi_safe_shrink（默认 ROI_SAFE_SHRINK=0.82）得到更小的"安全子矩形"。
+              · 这个安全子矩形 = UI 画的虚线框 = 鼠标坐标真正映射生效的区域；
+              · 但 landmark/手势检测仍传入**整帧画面**（检测范围不受此框影响）
+                → 掌心/指尖落在安全子矩形外但仍在画面内：MediaPipe 仍能正常识别=不会丢手
+                → 刚好满足需求 2：鼠标映射限定在虚线框内，手势识别 = 全画面覆盖。
         """
         fw = float(max(1, int(frame_w))); fh = float(max(1, int(frame_h)))
         rs = float(max(ROI_SCALE_MIN, min(ROI_SCALE_MAX, float(roi_scale))))
         oy = float(max(ROI_OFFSET_Y_MIN, min(ROI_OFFSET_Y_MAX, float(roi_offset_y))))
+        if roi_safe_shrink is None:
+            s = float(ROI_SAFE_SHRINK)
+        else:
+            s = float(max(ROI_SAFE_SHRINK_MIN, min(ROI_SAFE_SHRINK_MAX, float(roi_safe_shrink))))
         m = (1.0 - rs) * 0.5 * min(fw, fh)       # 原逻辑：X方向margin（左右各 m）
         x1 = m
         x2 = fw - m
@@ -570,7 +672,12 @@ class MouseController:
         top_margin_px = avail_y_margin * (0.5 + 0.5 * oy)  # oy=-1→全给底（顶=0）；oy=0→各一半（居中）；oy=+1→全给顶
         y1 = top_margin_px
         y2 = y1 + roi_h_px
-        return (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)))
+        # ⭐ SAFE_SHRINK 等比内缩：中心不动，宽高 × s
+        cx = 0.5 * (x1 + x2); cy = 0.5 * (y1 + y2)
+        nw = max(1.0, (x2 - x1) * s); nh = max(1.0, (y2 - y1) * s)
+        sx1 = cx - 0.5 * nw; sx2 = cx + 0.5 * nw
+        sy1 = cy - 0.5 * nh; sy2 = cy + 0.5 * nh
+        return (int(round(sx1)), int(round(sy1)), int(round(sx2)), int(round(sy2)))
 
     def set_cursor_mode(self, mode: str):
         """切换光标策略：smooth（AR悬停5层）/ absolute（掌心绝对坐标直接跳）"""
@@ -581,7 +688,44 @@ class MouseController:
         return self._smoother.mode
 
     # ---------------- 内部工具 ----------------
+    def _eval_anchor_once(self, anchor_norm, gesture_hint: str | None = None):
+        """⭐ 2026-08-22 新增：同帧同一归一化锚点 → 只跑一次 norm_to_screen + smoother.filter。
+
+        返回 (gx, gy, sx, sy, ix, iy)：
+          (gx,gy) = ROI 映射后的原始屏幕像素（未平滑）
+          (sx,sy) = 经过 smoother 后的屏幕像素
+          (ix,iy) = int(round(sx,sy)) 用于 pyautogui
+
+        缓存命中逻辑：若传入的 anchor_norm 与上次调用完全一致（浮点比较 |Δ|<1e-9），直接返回缓存 → 保证 move_only / handle / tap-click 同帧共享完全相同的平滑结果，smoother 状态每帧只更新一次。
+        """
+        nx, ny = float(anchor_norm[0]), float(anchor_norm[1])
+        # 缓存命中（归一化锚点没变化 = 同一帧调用多次）→ 直接用缓存
+        if (self.last_screen_norm is not None
+                and abs(nx - self.last_screen_norm[0]) < 1e-9
+                and abs(ny - self.last_screen_norm[1]) < 1e-9
+                and self.last_screen_px is not None
+                and self.last_smoothed_px is not None):
+            gx, gy = self.last_screen_px
+            sx, sy = self.last_smoothed_px
+            return gx, gy, sx, sy, int(round(sx)), int(round(sy))
+        # 缓存未命中 → 实际执行映射 + 平滑一次 → 写缓存
+        gx, gy = self._norm_to_screen(nx, ny)
+        sx, sy = self._smoother.filter(gx, gy, gesture=gesture_hint)
+        self.last_screen_norm = (nx, ny)
+        self.last_screen_px   = (float(gx), float(gy))
+        self.last_smoothed_px = (float(sx), float(sy))
+        return float(gx), float(gy), float(sx), float(sy), int(round(sx)), int(round(sy))
+
+    def invalidate_anchor_cache(self):
+        """外部在一帧完全处理完后可调用，清空缓存以强制下一帧重新评估；
+        也可不清（下一帧 anchor_norm 自然不同就会自动重跑）。"""
+        self.last_screen_norm = None
+        self.last_screen_px = None
+        self.last_smoothed_px = None
+
     def _smooth(self, nx: float, ny: float, gesture: str | None = None):
+        """⚠️ 直接调用 _smooth 会绕过同帧缓存——请优先使用 _eval_anchor_once()。
+        保留此接口兼容外部代码（如 Tap-Click 段重构前的直接调用）。"""
         return self._smoother.filter(nx, ny, gesture=gesture)
 
     def _norm_to_screen(self, norm_x: float, norm_y: float):
@@ -595,46 +739,94 @@ class MouseController:
             avail_y_margin=720-504=216px
             y1=216*(0.5+0.25)=162 y2=162+504=666 → 顶边从原 108px 下移到 162px（多 54px 顶部空间给手指伸展）
           ROI 内部坐标 0..1 → 线性映射屏幕 (0,0) ~ (sw,sh)。
+
+        ⭐ 2026-08-24 追加：在上述「原始 ROI」基础上，再做一次 SAFE_SHRINK=0.82 的等比内缩（需求1+2）：
+          · 最终映射到屏幕的区域 = 这个缩小后的「安全子矩形」= UI 画的虚线框；
+          · 手势识别本身仍是整帧检测（detector.detect(frame) 传入未裁剪的整画面），不在此 ROI 范围内限制。
         """
         r = float(self._roi_scale)
         oy = float(self._roi_offset_y)
+        s  = float(self._roi_safe_shrink)
         nx = float(norm_x); ny = float(norm_y)
 
         # ===== 精确模式（已调用 set_frame_size，和 compute_roi_bbox_px 100% 对齐）=====
+        # ⚠️ 严格遵循经验 ID 977325：只在【原精确计算结果末尾】追加 SAFE_SHRINK 补丁，
+        #    不修改原 roi_scale / roi_offset_y 的任何推导逻辑与变量名（避免引入变量命名错乱破坏链路）。
         if self._cam_frame_w is not None and self._cam_frame_h is not None:
             fw = float(self._cam_frame_w); fh = float(self._cam_frame_h)
             m = (1.0 - r) * 0.5 * min(fw, fh)        # 原逻辑 X 方向 margin（左右对称）
             x1_px = m
             x2_px = fw - m
-            roi_w_px = max(x2_px - x1_px, 1e-6)      # ROI 宽度（长方形，**绝对不再是正方形**！）
-            roi_h_px = r * min(fw, fh)               # ROI 高度：原逻辑不变
+            roi_w_px = max(x2_px - x1_px, 1e-6)      # 原始 ROI 宽度（长方形，原精确模式变量名）
+            roi_h_px = r * min(fw, fh)               # 原始 ROI 高度：原逻辑不变
+            roi_h_px = max(roi_h_px, 1e-6)
             avail_y_margin = fh - roi_h_px
             y1_px = avail_y_margin * (0.5 + 0.5 * oy)
-            roi_h_px = max(roi_h_px, 1e-6)
-            u = (nx * fw - x1_px) / roi_w_px
-            v = (ny * fh - y1_px) / roi_h_px
+            y2_px = y1_px + roi_h_px
+            # ⭐ 单点增量：在原矩形 (x1_px,y1_px)~(x2_px,y2_px) 中心等比内缩 SAFE_SHRINK
+            cx = 0.5 * (x1_px + x2_px); cy = 0.5 * (y1_px + y2_px)
+            nw = max(roi_w_px * s, 1e-6); nh = max(roi_h_px * s, 1e-6)
+            sx1_px = cx - 0.5 * nw; sy1_px = cy - 0.5 * nh
+            # 用缩后的安全子矩形做 u/v 映射（= 鼠标坐标严格限定在虚线框内）
+            u = (nx * fw - sx1_px) / nw
+            v = (ny * fh - sy1_px) / nh
             u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
             v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
             return u * self.sw, v * self.sh
 
         # ===== 兼容模式（未设置 frame_size，保留原 margin 近似算法，比例不变）=====
         margin = (1.0 - r) * 0.5
-        # Y 方向的 margin 重新分配：顶=margin*(1-oy)？实际用可用 Y margin 的按比例分配和精确模式语义对齐
-        #   在未知 fw/fh 比例时折中用 margin_norm 近似：总 Y margin_norm = 1 - r（对应居中时上下各 margin）
-        #   顶 margin_norm = (1 - r) * (0.5 + 0.5*oy)
         avail_y_norm = 1.0 - r
         margin_y_top_norm = avail_y_norm * (0.5 + 0.5 * oy)
-        denom_x = max(1.0 - 2.0 * margin, 1e-6)   # ROI 在 X 方向的归一化宽度 = 1-2margin
-        denom_y = max(r, 1e-6)                    # ROI 在 Y 方向的归一化高度 = r（原逻辑）
-        x = (nx - margin) / denom_x
-        y = (ny - margin_y_top_norm) / denom_y
+        denom_x = max(1.0 - 2.0 * margin, 1e-6)   # 原始 ROI X 归一化宽度（原变量名无后缀）
+        denom_y = max(r, 1e-6)                    # 原始 ROI Y 归一化高度
+        x1_norm = margin                          # 原始 ROI X 起点
+        y1_norm = margin_y_top_norm               # 原始 ROI Y 起点
+        # ⭐ 单点增量：中心等比 SAFE_SHRINK
+        cx_norm = x1_norm + 0.5 * denom_x
+        cy_norm = y1_norm + 0.5 * denom_y
+        nw_norm = max(denom_x * s, 1e-6)
+        nh_norm = max(denom_y * s, 1e-6)
+        sx1_norm = cx_norm - 0.5 * nw_norm
+        sy1_norm = cy_norm - 0.5 * nh_norm
+        x = (nx - sx1_norm) / nw_norm
+        y = (ny - sy1_norm) / nh_norm
         x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
         y = 0.0 if y < 0.0 else (1.0 if y > 1.0 else y)
         return x * self.sw, y * self.sh
 
     # ---------------- 对外主接口 ----------------
+    def move_only(self, cursor_anchor_norm, gesture_hint: str | None = None):
+        """⭐ 2026-08-22 新增：先移动鼠标（与 UI 绿圈严格 1:1 对齐），手势只负责点击语义。
+
+        完全不做点击/拖拽判断，只做：
+          anchor_norm → _eval_anchor_once（同帧只跑 1 次 smooth）→ pyautogui.moveTo
+        例外不移动：
+          - FIST（用户明确握拳=不动=纯空指令）
+          - drag_active=True：拖拽期间由拖拽分支专门 move，避免 moveTo 打断 mouseDown 按下状态
+        ⚠️ 每次调用都会先移动鼠标，保证"预览画绿圈的这一帧"和"屏幕光标位置"严格同步——
+           不会因上游门控（双手 / OPEN / 拉伸状态）跳过移动而造成"绿圈动了、鼠标钉住"的视觉脱节。
+
+        Args:
+            cursor_anchor_norm: (nx, ny) 归一化 0~1，掌心锚点 = 和画绿圈用的完全同一份
+            gesture_hint: 可选，传给 smoother 做平滑的手势上下文（不决定移不移动）
+        """
+        # 1. 坐标映射 + 平滑（⭐ 同帧只跑 1 次：如果 move_only 之后 handle 再传同一份 cursor_anchor_norm 直接命中缓存）
+        _, _, sx, sy, ix, iy = self._eval_anchor_once(cursor_anchor_norm, gesture_hint=gesture_hint)
+        # 2. 不移动的唯二例外：FIST 或 drag_active（拖拽分支会处理 move）
+        if gesture_hint == "FIST":
+            return
+        if self._drag_active:
+            return
+        pyautogui.moveTo(ix, iy)
+
     def handle(self, gesture: str, fingertip_norm, cursor_anchor_norm=None):
-        """手势 → 鼠标事件。
+        """手势 → 鼠标事件（仅处理点击/拖拽语义；移动请先调用 move_only 保证对齐）。
+
+        ⚠️ 2026-08-22：**强烈建议调用顺序 = move_only(cursor_anchor_norm, gesture_hint=gesture) 在前，handle(gesture, ...) 在后**
+        这样：鼠标位置永远先与绿圈对齐；handle 内部只判断"要不要点击/长按/拖拽"，不会因手势门控导致"该帧不移动"。
+        为保持兼容：若外部未调 move_only，handle 内部仍会按原逻辑（防抖 + 手势分支）尝试 moveTo，不会回归；
+        但若外部已先调用 move_only，handle 内部的 moveTo 会被下面的门控语义控制，不过坐标是一样的（幂等）。
 
         Args:
             gesture: 如 PEACE / PINCH / OPEN / POINT / FIST / ROCK / THUMB_UP / OTHER
@@ -643,10 +835,10 @@ class MouseController:
                                 None 时回退用 fingertip_norm（兼容）。
         """
         anchor_norm = cursor_anchor_norm if cursor_anchor_norm is not None else fingertip_norm
-        # 1. 坐标映射 + AR 5 层平滑（把当前手势作为模式上下文传入）
-        gx, gy = self._norm_to_screen(*anchor_norm)
-        sx, sy = self._smooth(gx, gy, gesture=gesture)
-        ix, iy = int(round(sx)), int(round(sy))
+        # 1. 坐标映射 + AR 5 层平滑
+        #   ⚠️ 2026-08-22 改为用 _eval_anchor_once：如果 move_only() 已经在本帧用同一份 anchor_norm 跑过 → 直接命中缓存，smoother 不会再被二次更新
+        #      （否则：同一帧 move_only → handle → tap-click 三段各跑一次 smooth，缓冲/锁被更新 3 次 → 状态全乱）
+        _, _, sx, sy, ix, iy = self._eval_anchor_once(anchor_norm, gesture_hint=gesture)
 
         # 2. 防抖状态机
         if gesture != self._last_gesture:
@@ -661,10 +853,20 @@ class MouseController:
         self._hold_frames += 1
 
         # 3. 移动类手势：未满 HOLD_FRAMES 也持续移动
+        # ✨ 2026-08-22 修复对齐问题：手掌倾斜/翻转时，MediaPipe 可能偶尔把 POINT/OPEN 误判成 ROCK/PINCH/PEACE/THUMB。
+        #   原代码只有 OPEN/POINT/OTHER 在稳定后才 moveTo，若手势"稳定落在"ROCK/PEACE/...（hold_frames >= N）则再也不 moveTo → 鼠标钉死，但 UI 绿圈继续移动 → 用户感知为"无规律卡顿"。
+        #   修复原则：
+        #     - 移动锚点永远 = cursor_anchor_norm（掌心），和预览画面绿圈画的坐标完全一致（Sigmoid+静止锁只负责平顺，不会改变锚点）
+        #     - 手势 = 只是"是否能点击"的语义，不应该决定"鼠标移不移动"
+        #     - 不移动的例外：FIST（用户明确=握拳取消无指令，不动鼠标）、drag_active（拖拽期间专门分支处理 move，避免 moveTo 打断按下状态）
         if gesture in ("OPEN", "POINT", "OTHER"):
             if self._drag_active:
                 pyautogui.mouseUp()
                 self._drag_active = False
+            pyautogui.moveTo(ix, iy)
+            return
+        # ✨ 补充：稳定的 ROCK/PINCH/PEACE/THUMB/OTHER 等非 FIST 且非拖拽 → 也每帧 moveTo（否则鼠标钉死=对齐失控）
+        if not self._drag_active and gesture != "FIST":
             pyautogui.moveTo(ix, iy)
             return
 

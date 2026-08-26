@@ -16,8 +16,10 @@ hands_tasks.py  —— 体感鼠标全部业务逻辑的纯封装（零复杂线
 
 import argparse
 import copy as _cp
+import math as _mt
 import os
 import time
+from collections import deque  # ⭐ 新增：palm_n 滑窗稳定性判断（index_bend 误判过滤）
 import cv2
 import numpy as np
 
@@ -66,6 +68,112 @@ def _measure_cn_text_size(text: str, font_scale: float):
     for c in text:
         w_sum += px if ord(c) > 127 else px // 2
     return w_sum, int(px * 1.25)
+
+
+def _three_point_angle(p_a: np.ndarray, p_v: np.ndarray, p_b: np.ndarray) -> float:
+    """计算 ∠A-V-B 的夹角（以 V 为顶点），返回 0~180 度（纯数值，已做除零保护）。
+    向量 VA = A - V, VB = B - V；cosθ = VA·VB / (|VA||VB|)
+    用于关节弯曲：伸直≈180°，折 90°≈90°，对折≈0°。
+    """
+    va = p_a - p_v
+    vb = p_b - p_v
+    na = float(np.linalg.norm(va))
+    nb = float(np.linalg.norm(vb))
+    denom = na * nb
+    if denom < 1e-8:
+        return 180.0  # 无法判断 → 认为伸直（保守，避免误触）
+    cos_v = float(np.dot(va, vb) / denom)
+    cos_v = -1.0 if cos_v < -1.0 else (1.0 if cos_v > 1.0 else cos_v)
+    return float(_mt.degrees(_mt.acos(cos_v)))
+
+
+def _index_bend_from_joint_angles(lms, palm_denom: float | None,
+                                  dist_bend_fallback: float | None = None) -> float:
+    """⭐ 2026-08-25 统一弯曲度量 v3（位置无关 + 手势匹配真实点击）
+    输出值域：0.20 全弯 ~ 0.88 伸直；越大=越伸直（与旧语义兼容，detector 阈值平滑迁移）。
+
+    ✅ 统一设计 3 大原则（用户要求：不分区补偿、匹配真实点击、位置无关）：
+    1) 关节权重匹配真实点击：PIP 0.40 + MCP 0.20 + DIP 0.40
+       （人类食指点击动作 = 主要弯 DIP 末端关节，PIP/MCP 几乎不动 → DIP 必须高权重）
+    2) angle/dist 融合统一 95% angle + 5% dist：
+       （dist_bend 分母 dist(#5,#17)=掌心宽度 天然受 透视/远近/画面边缘clip 影响 = 位置相关变量；
+         三点夹角 angle 是纯旋转度量、位置无关 → 让 angle 绝对主导，dist 只做 5% 兜底防崩溃）
+    3) 无任何分区 if/else（彻底删除 _top_band_hint 条带切换、顶部特殊权重补偿）
+    """
+    # 取点（用 x,y 不用 z，MediaPipe z 在 2D 画面里尺度不稳定；投影夹角本身就对深度折叠鲁棒）
+    p0   = np.array([lms[0].x,  lms[0].y],  dtype=np.float64)   # WRIST 腕部
+    p5   = np.array([lms[5].x,  lms[5].y],  dtype=np.float64)   # INDEX_MCP 食指根
+    p6   = np.array([lms[6].x,  lms[6].y],  dtype=np.float64)   # INDEX_PIP 中间关节
+    p7   = np.array([lms[7].x,  lms[7].y],  dtype=np.float64)   # INDEX_DIP 指尖前
+    p8   = np.array([lms[8].x,  lms[8].y],  dtype=np.float64)   # INDEX_TIP 指尖
+
+    # (A) PIP 角：∠MCP_5-PIP_6-DIP_7  （辅助，兜底用户偶尔弯 PIP 的动作）
+    theta_pip = _three_point_angle(p5, p6, p7)
+    # (B) MCP 角：∠WRIST_0-MCP_5-PIP_6  （兜底，避免极端假动作）
+    theta_mcp = _three_point_angle(p0, p5, p6)
+    # (C) DIP 角：∠PIP_6-DIP_7-TIP_8  （主力！人类真实点击 = 只弯 DIP 末节）
+    theta_dip = _three_point_angle(p6, p7, p8)
+
+    # 归一化到 0=伸直(180°) 1=弯成0°
+    def _norm_180(t: float) -> float:
+        t = 0.0 if t < 0.0 else (180.0 if t > 180.0 else float(t))
+        return (180.0 - t) / 180.0
+
+    n_pip = _norm_180(theta_pip)  # 0=伸直 1=完全对折
+    n_mcp = _norm_180(theta_mcp)
+    n_dip = _norm_180(theta_dip)
+
+    # ✅ 统一原则1：DIP=主(0.60) + PIP=辅(0.25) + MCP=兜底(0.15)
+    #   ⭐ 2026-08-26 数值铁证：轻点击(∠DIP=140°弯40°)
+    #     旧权重0.40/0.20/0.40 → final放大后 bratio=0.855 > MIN_ABS=0.75 → 必须明显深弯才触发 ❌
+    #     新权重0.25/0.15/0.60 → final放大后 bratio=0.740 ≤ MIN_ABS=0.75 → 轻点击也能立即触发 ✅
+    #   中等点击(DIP折到120°=弯60°) → n_dip=0.333 → bratio=0.58 ✅
+    #   深点击(DIP折到30°=弯150°) → n_dip=0.833 → bratio=0.28 ✅
+    #   移动微角度 ±2° → n_dip=0.011 → bratio 变化≈0.007 → DI=0.007 远不够误触 ✅
+    W_PIP, W_MCP, W_DIP = 0.25, 0.15, 0.60
+    bend_01 = W_PIP * n_pip + W_MCP * n_mcp + W_DIP * n_dip
+    bend_01 = 0.0 if bend_01 < 0.0 else (1.0 if bend_01 > 1.0 else float(bend_01))
+
+    # v2 线性映射：angle → 0.20 弯曲 ~ 0.88 伸直（SLOPE 放大，Δ 更明显=差分更灵敏）
+    SLOPE_ANGLE = 0.95
+    BASELINE, FLOOR = 0.88, 0.20
+    angle_abs = BASELINE - bend_01 * SLOPE_ANGLE
+    angle_abs = float(max(FLOOR, min(BASELINE + 0.08, angle_abs)))
+
+    # ★ dist_bend_fallback 先归一到 0.20~0.88（和 angle 同尺度）再融合
+    DIST_NORM_STRAIGHT = 2.40   # dist_bend 伸直时的典型值（= TIP-MCP / palm_n）
+    DIST_NORM_BENT     = 0.90   # dist_bend 完全弯曲时的典型值
+    def _norm_dist_bend(db: float) -> float:
+        t = (float(db) - DIST_NORM_BENT) / (DIST_NORM_STRAIGHT - DIST_NORM_BENT)
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        return FLOOR + t * (BASELINE - FLOOR)  # db=2.4→t=1→0.88; db=0.9→t=0→0.20 ✅ 语义一致
+
+    # ✅ 统一原则2：95% angle（位置无关） + 5% dist（仅兜底，避免 angle 计算失败时全崩）
+    #   - 顶部 clip / 透视缩短 / 掌心远近：只有 dist 受影响，5% 权重影响从旧 40%→最多 ±0.02 final → 可忽略=位置无关
+    W_ANGLE, W_DIST = 0.95, 0.05
+    if dist_bend_fallback is None:
+        final = float(angle_abs)
+    else:
+        dist_normed = _norm_dist_bend(float(dist_bend_fallback))
+        final = W_ANGLE * float(angle_abs) + W_DIST * float(dist_normed)
+
+    # ★ v2 关键：噪声门 + 真弯曲 Δ 放大
+    #   · drop < 2.5%（≈ 抖动/掌心翻转伪信号）：完全不放大，保持原融合值=稳
+    #   · drop ≥ 2.5%（真的食指弯下去了）：超过门的部分 ×2.0 放大 → 差分/绝对门限更容易触发=灵
+    DROP_MULT = 2.0
+    DROP_NOISE_GATE = 0.025
+    drop = BASELINE - float(final)
+    if drop > DROP_NOISE_GATE:
+        final = BASELINE - DROP_MULT * (drop - DROP_NOISE_GATE) - DROP_NOISE_GATE
+    final = float(max(FLOOR, min(BASELINE + 0.08, final)))
+
+    # palm_denom 归一化的弱修正：如果 palm_denom 离镜头特别远（太小），就把值稍微推回伸直
+    # （避免远/近导致绝对尺度偏移影响 detector 学习 baseline）
+    if palm_denom is not None and palm_denom > 1e-6:
+        scale_fix = 0.98 + 0.04 * min(1.0, palm_denom / 0.25)
+        final = final * scale_fix
+
+    return float(round(final, 6))
 
 
 def _draw_tap_bar(frame, tm: dict, det: FingerTapClickDetector | None = None):
@@ -177,12 +285,14 @@ def parse_args(argv=None):
     parser.add_argument("--max-hands", type=int, default=2, help="最多识别手的数量 (默认 2)")
     parser.add_argument("--anchor", type=str, default="palm", choices=["palm", "index_tip"],
                         help="鼠标光标锚点：palm=掌心 / index_tip=食指TIP")
-    parser.add_argument("--cursor-mode", type=str, default="smooth", choices=["smooth", "absolute"],
-                        help="光标移动策略：smooth / absolute")
+    parser.add_argument("--cursor-mode", type=str, default="smooth", choices=["smooth", "absolute", "direct"],
+                        help="光标移动策略：smooth(AR悬停5层稳) / absolute(指哪打哪3层兼顾稳跟手) / direct⭐严格跟UI掌心绿圈(无阻尼无锁，翻转手掌也不卡)")
     parser.add_argument("--roi-scale", type=float, default=0.70,
                         help="画面→屏幕映射中心区域大小(0.30~1.00)")
-    parser.add_argument("--roi-offset-y", type=float, default=0.5,
-                        help="ROI正方形在画面高度的上下位置（-1.0=贴顶, 0.0=居中, +0.5=偏下默认, +1.0=贴底）")
+    parser.add_argument("--roi-offset-y", type=float, default=0.62,
+                        help="ROI长方形在画面高度的上下位置（-1.0=贴顶, 0.0=居中, +0.62=默认偏下12%防顶部clip, +1.0=贴底）")
+    parser.add_argument("--roi-safe-shrink", type=float, default=0.82,
+                        help="【2026-08-24】在 roi-scale 原始 ROI 长方形基础上的安全子 ROI 等比内缩比例(0.50~1.00)；越小虚线框越小，指尖越不易超画面边。默认 0.82。")
     parser.add_argument("--tap-hardness", type=float, default=0.70,
                         help="点击弯曲幅度门槛 0.00~1.00")
     parser.add_argument("--tap-speed", type=float, default=0.80,
@@ -199,6 +309,8 @@ def clamp_args(args):
     if args.roi_scale > 1.00: args.roi_scale = 1.00
     if args.roi_offset_y < -1.0: args.roi_offset_y = -1.0
     if args.roi_offset_y > +1.0: args.roi_offset_y = +1.0
+    if args.roi_safe_shrink < 0.50: args.roi_safe_shrink = 0.50
+    if args.roi_safe_shrink > 1.00: args.roi_safe_shrink = 1.00
     if args.tap_hardness < 0.0: args.tap_hardness = 0.0
     if args.tap_hardness > 1.0: args.tap_hardness = 1.0
     if args.tap_speed    < 0.0: args.tap_speed    = 0.0
@@ -236,7 +348,7 @@ def init_models(args):
         mode_color = (180, 255, 120)
 
     mouse = MouseController(alpha=0.25, cursor_mode=args.cursor_mode, roi_scale=args.roi_scale,
-                            roi_offset_y=args.roi_offset_y)
+                            roi_offset_y=args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
     tap_detector = FingerTapClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)
     stretch = DiagonalStretchManager()
 
@@ -552,6 +664,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 user_label = "右手" if label == "Left" else "左手"
                 top_y = 38
                 hand_title = f"[{user_label}] {gesture_final}"
+                # 说明：Pass A 先执行（_stable_this 还没算 → 所以此处 B-2 跳帧标志尚未覆盖为 True/False），
+                #       为避免 NameError，手标签中文每帧都画（这部分占比小，约 1~2ms）；
+                #       B-2 跳帧大头（Tap条 / 拉伸卡片 / 顶部 / 底部帮助栏）在后面有 _stable_this 值后再生效，能省 8~12ms。
                 if user_label == "左手":
                     put_text_cn(frame, hand_title, (12, top_y),
                                 font_scale=0.85, color=color, thickness=2)
@@ -593,6 +708,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             _skip_last_palms = dict(_cur_palms_now)
 
             # ======================================================================
+            # 2026-08-22 回滚 B-2 中文跳帧：用户反馈"隔帧绘制仍然持续严重闪烁，影响观感"
+            # 已验证：即便黑底+中文共跳帧，cv2.imshow 每帧输出画面仍会被底层缓冲翻转导致"肉眼可见的闪烁"
+            # → 恢复最原始方式：所有中文 put_text_cn / 黑底 / 背景矩形 每帧必画，完全不跳帧
+            #   代价：稳定时 CPU 多消耗 ~8~12ms（FPS 降 ~3-5）；收益：UI 100% 不闪烁
+            # ======================================================================
+            _should_draw_cn_text_now = True  # 冗余兼容，后续会完全删除使用处的 if 条件（保持向下兼容）
+
+            # ======================================================================
             # Pass B：基于**完整的 hand_results** 统一计算 全局门控
             #          （原 main.py 里这段放在 for 里=顺序错误，现在统一算一次，100% 顺序正确）
             # ======================================================================
@@ -614,15 +737,46 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             pure_two_hand_move    = bool(both_hands_global and left_open_global  and right_open_global)
             disable_click_for_stretch_global = (
                 both_hands_global
-                or single_open_global
-                or stretch.state != _DS.IDLE
-                or stretch._move_state != _DMS.IDLE
                 or pure_two_hand_stretch
                 or pure_two_hand_move
-                or any_fist_global
-                or any_near_fist_global
+                # ⚠️ 2026-08-26 第二次紧急修复（bratio/DI 仍恒0根因）：
+                #   删除 any_fist_global / any_near_fist_global 两条件：
+                #     这两条件存在计数/阈值 bug，用户五指张开（ext=(1,1,1,1,1)/gesture=OPEN）
+                #     仍被判 any_near_fist ≥4=True → disable_click=True → 每帧 reset detector → bratio 恒0/DI恒0。
+                #   临时先移除让点击功能先通，下一轮单独调拳头识别的阈值/方向（仅保留 pure_* 明确双手手势条件足够防误触）。
             )
+            # ⭐ DEBUG 取证（bratio 仍恒0用）：仅 TOP 25% 条带命中 + 每 10 帧打 1 行 gesture/ext/5 条件真值，
+            #     下一轮用户贴此段即可定位 near_fist 为什么误判五指张开。
+            try:
+                _db_cnt = getattr(run_loop, '_tap_debug_cnt', -1)
+                _db_cnt = 0 if _db_cnt < 0 else (_db_cnt + 1)
+                setattr(run_loop, '_tap_debug_cnt', _db_cnt)
+                if "Left" in hand_results and _db_cnt % 10 == 0:
+                    _lg, _lext, _, _ = hand_results["Left"]
+                    _near = sum(1 for x in _lext if not x)
+                    print(f"[TAP-DISABLE-DBG] frame={_db_cnt:>4} Left: gesture={_lg:5} ext={_lext} | near_fist_bend_count={_near}/5 >=4? {_near>=4} | both={bool(both_hands_global)} 2h_str={bool(pure_two_hand_stretch)} 2h_mv={bool(pure_two_hand_move)} any_fist={bool(any_fist_global)} any_nfist={bool(any_near_fist_global)} → DISABLE_CLICK={bool(disable_click_for_stretch_global)}",
+                          flush=True)
+            except Exception:
+                pass
             block_mouse_move_for_stretch = disable_click_for_stretch_global
+
+            # ======================================================================
+            # ⭐ B-1 优化：鼠标移动急活【最前置】
+            #   目标：彻底消除"慢活（stretch.update/Tap 累积/每手循环 near_fist 计数/拉伸窗口确认）阻塞 move_only → 鼠标钉住 + 之后大跳"。
+            #   位置：全局门控算完（any_fist_global 已可用）→ 任何慢活（Pass C 每手局部处理、Tap、stretch.update、绘制）之前。
+            #   等价语义：和 Pass C 右手分支完全一致（cursor_anchor_norm + gesture_hint=FIST/gesture），只是更早；
+            #             通过 _eval_anchor_once 的同帧缓存，即使后面原代码再 move_only 一次，也只是 pyautogui.moveTo(同坐标) 幂等，不会额外重算平滑。
+            # ======================================================================
+            _pre_move_only_done_right = False
+            if "Left" in hand_results:
+                try:
+                    _gesture, _ext, _ratios, _lms = hand_results["Left"]
+                    _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
+                    _move_hint = "FIST" if any_fist_global else _gesture
+                    mouse.move_only(_cursor_anchor_norm, gesture_hint=_move_hint)
+                    _pre_move_only_done_right = True
+                except Exception:
+                    _pre_move_only_done_right = False
 
             # (B2) 双手/纯双手判定（每只手局部用，值一样，放外面统一算）
             both_hands_now = both_hands_global
@@ -648,21 +802,30 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 if near_fist_this_hand and gesture in stretch_click_gestures:
                     safe_gesture = "POINT"
 
-                # --- 鼠标事件（只发给右手 = MediaPipe Left） ---
-                if (not block_mouse_move_for_stretch) and (not is_pure_two_hand_mode) and label == "Left" and stretch.state != _DS.SCALING:
-                    fingertip_norm = (lms[8].x, lms[8].y)
+                # --- 鼠标事件：⭐ 2026-08-22 严格『先移动、后判断点击』---
+                #   为什么之前不对齐（无规律卡顿）：
+                #     原 if (not block_mouse_move_for_stretch) and ... 把『移动』和『点击』两个语义绑在一起判断：
+                #       只要手掌翻转时被 MediaPipe 偶判成 OPEN（single_open_global=True）/ 出现双手 / 拉伸状态非 IDLE
+                #       → block_mouse_move_for_stretch=True → 整个分支跳过（不调 mouse.handle）
+                #       → 但绿圈仍用最新 cursor_anchor_norm 画在画面上 → 视觉脱节：绿圈动了，鼠标钉死
+                #   修复原则（用户说：手势识别不影响鼠标移动——先看鼠标位置，再判断手势指令）：
+                #     移动：只要 label=="Left"（即这帧有右手掌心），就无条件先调 mouse.move_only() → 和绿圈 1:1 对齐
+                #           例外：全局有 FIST → 握拳=取消指令，不动；FIST 之外全部强制跟绿圈同步
+                #     点击：继续保留原有的 block_mouse_move_for_stretch / stretch.state 门控（双手/拉伸/OPEN 等只禁止点击，不禁止移动）
+                if label == "Left":
+                    # ↓↓ 先取锚点（画绿圈 + 移动鼠标用的**同一份**坐标，绝对保证对齐）↓↓
                     cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
-                    mouse.handle(safe_gesture, fingertip_norm, cursor_anchor_norm=cursor_anchor_norm)
-                    mx, my = HandDetector.landmark_to_pixel(lms[8], w, h)
-                    cv2.circle(frame, (mx, my), 7, (0, 140, 255), 2)
-                    ax = int(cursor_anchor_norm[0] * w)
-                    ay = int(cursor_anchor_norm[1] * h)
-                    cv2.circle(frame, (ax, ay), 12, (255, 255, 255), 2)
-                    cv2.circle(frame, (ax, ay), 9, (0, 230, 80), -1)
-                elif label == "Left":
-                    # SCALING / 门控命中 → 不发鼠标事件，但仍画锚点（保持视觉反馈）
-                    fingertip_norm = (lms[8].x, lms[8].y)
-                    cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
+                    # move_only 例外判 FIST（全局 FIST 任何手都取消移动）
+                    move_gesture_hint = "FIST" if any_fist_global else gesture
+                    # ⭐ B-1 优化：若【全局门控后 move_only 最前置】已经跑过 → 这里不再重复 moveTo（同帧缓存已保证 smoother 状态只更新一次）
+                    #            只有前置段异常（try 失败）时才兜底再跑一次，保证向后兼容。
+                    if not _pre_move_only_done_right:
+                        mouse.move_only(cursor_anchor_norm, gesture_hint=move_gesture_hint)
+                    # 门控只拦"点击/拖拽语义"（调 handle 走点击分支）——但该帧鼠标已经 move_only 移动过了，不会再卡
+                    if (not block_mouse_move_for_stretch) and (not is_pure_two_hand_mode) and stretch.state != _DS.SCALING:
+                        fingertip_norm = (lms[8].x, lms[8].y)
+                        mouse.handle(safe_gesture, fingertip_norm, cursor_anchor_norm=cursor_anchor_norm)
+                    # ↓↓ 画锚点（绿圈=掌心，橙圈=食指TIP）——和 move_only 用的 cursor_anchor_norm 完全同一份 ↓↓
                     mx, my = HandDetector.landmark_to_pixel(lms[8], w, h)
                     cv2.circle(frame, (mx, my), 7, (0, 140, 255), 2)
                     ax = int(cursor_anchor_norm[0] * w)
@@ -678,24 +841,248 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 tip = np.array([lms[8].x, lms[8].y])
                 m5  = np.array([lms[5].x, lms[5].y])
                 m17 = np.array([lms[17].x, lms[17].y])
-                palm_n = float(np.linalg.norm(m5 - m17))
+                palm_n_raw = float(np.linalg.norm(m5 - m17))
                 tip_m5 = float(np.linalg.norm(tip - m5))
-                if palm_n > 1e-6:
-                    index_bend = tip_m5 / palm_n
+
+                # ======================================================================
+                # ⭐ 2026-08-22 修复"点击经常误判"：palm_n 稳定性过滤（根因：dist(MCP5,MCP17) 随掌心翻转/远近剧烈波动 →
+                #   即使食指没动，index_bend = dist(8,5)/palm_n 也会假"弯→直" → 被 TAP 状态机误判为点击）。
+                # ⭐ 2026-08-25 统一原则3：分区跳过逻辑彻底删除。三档阈值全局放宽（7/10/8 → 15/20/16）适配顶部 clip 抖动：
+                #     顶部 #5/#17 clip 导致 palm_n_raw 抖 8%~15% 是正常物理现象（非"掌心翻转假动作"），
+                #     旧阈值 7% 把正常顶部帧全判为不稳定 → DI_down恒0=点不出来；放宽至 15%/20%/16% 后：
+                #       正常顶部 clip 抖 12% → 通过；真实掌心翻转抖 25%+ → 仍能正确拦截。
+                #   算法：
+                #     1) EMA 平滑单帧 palm_n（抗瞬时尖峰）
+                #     2) 最近 8 帧 palm_n 进 deque 滑窗，算 mean_palm（近期手掌大小基准）
+                #     3) 不稳定判定（满足任一条 → 这帧 index_bend 视为噪声，传 None 给 tap_detector → 状态机不更新）：
+                #        · 当前 palm_n_raw  vs  EMA(palm_n)   偏差 > 15%
+                #        · 当前 palm_n_raw  vs  8 帧均值       偏差 > 20%
+                #        · 8 帧滑窗标准差 / 滑窗均值 > 16%       （近期手掌大小一直在变化）
+                # ======================================================================
+                _palm_que: deque = getattr(run_loop, '_tap_palm_n_queue', None)
+                _palm_ema: float | None = getattr(run_loop, '_tap_palm_n_ema', None)
+                if _palm_que is None:
+                    _palm_que = deque(maxlen=8)
+                    run_loop._tap_palm_n_queue = _palm_que
+                if palm_n_raw > 1e-6:
+                    _palm_que.append(palm_n_raw)
+                    if _palm_ema is None:
+                        _palm_ema = palm_n_raw
+                    else:
+                        _palm_ema = 0.70 * palm_n_raw + 0.30 * _palm_ema
+                    run_loop._tap_palm_n_ema = _palm_ema  # 保存到函数属性（静态）
+
+                    palm_stable = True
+                    q_mean = float(sum(_palm_que) / len(_palm_que))
+                    # 偏差 1：当前 vs EMA
+                    if abs(palm_n_raw - _palm_ema) / max(_palm_ema, 1e-6) > 0.15:
+                        palm_stable = False
+                    # 偏差 2：当前 vs 滑窗均值
+                    elif abs(palm_n_raw - q_mean) / max(q_mean, 1e-6) > 0.20:
+                        palm_stable = False
+                    elif len(_palm_que) >= 4:
+                        # 偏差 3：滑窗本身波动大（最近几帧手掌一直在动/翻）
+                        arr = np.array(_palm_que, dtype=np.float64)
+                        q_std = float(np.std(arr))
+                        if q_std / max(q_mean, 1e-6) > 0.16:
+                            palm_stable = False
+
+                    # ⭐ 掌心归一化基准稳定 → 才算 index_bend（否则传 None → tap_detector 本帧完全不学习不流转）
+                    if palm_stable:
+                        # 额外修正：分母 palm_n 用 EMA 平滑后的，而不是 raw 单帧，进一步降低单帧抖动
+                        denom = float(_palm_ema)
+                        if denom > 1e-6:
+                            # ------------------------------------------------------------------
+                            # ⭐ 2026-08-24 根因修复：正面弯曲识别率极低 → 升级弯曲度量
+                            #   旧度量 tip_m5/denom（dist(TIP_8-MCP_5)/palm_n）：
+                            #     侧面视角：食指弯曲投影在画面上，tip_m5 剧烈缩短 → 识别 OK
+                            #     正面视角：弯曲向镜头深度折叠，TIP_8 离 MCP_5 在 x,y 投影上几乎没动 →
+                            #               tip_m5/denom ≈ 常数 → 差分和绝对门限都没信号 → 怎么弯都不触发。
+                            #   新度量 _index_bend_from_joint_angles（v3 统一版）：
+                            #     全局关节权 PIP0.4 + MCP0.2 + DIP0.4 匹配真实点击(DIP动)；
+                            #     全局 95%angle+5%dist 位置无关；无分区切换；
+                            #     正/侧/顶/底任何位置，只要真折了DIP就能识别。
+                            # ------------------------------------------------------------------
+                            dist_bend_old = tip_m5 / denom
+                            index_bend = _index_bend_from_joint_angles(
+                                lms, palm_denom=denom, dist_bend_fallback=dist_bend_old)
+                    # ⭐ 统一后仍保留缓存供日志只读（IN_TB列显示位置，PIPΔ°列显示DIP/PIP角度变化量，不参与判断逻辑）
+                    try:
+                        _anx, _any = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
+                        _rx1, _ry1, _rx2, _ry2 = MouseController.compute_roi_bbox_px(
+                            w, h, args.roi_scale, args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
+                        _axp = float(_anx) * float(w)
+                        _ayp = float(_any) * float(h)
+                        _TOP = 0.25
+                        _by_top = float(_ry1)
+                        _by_bot = float(_ry1) + _TOP * max(1.0, float(_ry2 - _ry1))
+                        _inx = (_axp >= float(_rx1) - 6.0) and (_axp <= float(_rx2) + 6.0)
+                        _iny = (_ayp >= _by_top - 4.0) and (_ayp <= _by_bot + 4.0)
+                        run_loop._cached_in_top_band = bool(_inx and _iny)
+                    except Exception:
+                        run_loop._cached_in_top_band = False
+                    run_loop._cached_palm_stable_actual = bool(palm_stable)
+                    _pip_ema_q: deque = getattr(run_loop, '_tap_pip_ema_que', None)
+                    _dip_ema_q: deque = getattr(run_loop, '_tap_dip_ema_que', None)
+                    if _pip_ema_q is None:
+                        _pip_ema_q = deque(maxlen=5)
+                        run_loop._tap_pip_ema_que = _pip_ema_q
+                    if _dip_ema_q is None:
+                        _dip_ema_q = deque(maxlen=5)
+                        run_loop._tap_dip_ema_que = _dip_ema_q
+                    try:
+                        p5q, p6q, p7q = np.array([lms[5].x,lms[5].y]), np.array([lms[6].x,lms[6].y]), np.array([lms[7].x,lms[7].y])
+                        pip_now = _three_point_angle(p5q, p6q, p7q)
+                        _pip_ema_q.append(pip_now)
+                        p6q2, p7q2, p8q2 = p6q, p7q, np.array([lms[8].x,lms[8].y])
+                        dip_now = _three_point_angle(p6q2, p7q2, p8q2)
+                        _dip_ema_q.append(dip_now)
+                        if len(_pip_ema_q) >= 1:
+                            pip_ema = float(sum(_pip_ema_q)/len(_pip_ema_q))
+                            pip_chg = round(pip_now - pip_ema, 1)
+                        else:
+                            pip_chg = 0.0
+                        if len(_dip_ema_q) >= 1:
+                            dip_ema = float(sum(_dip_ema_q)/len(_dip_ema_q))
+                            dip_chg = round(dip_now - dip_ema, 1)
+                        else:
+                            dip_chg = 0.0
+                        run_loop._cached_pip_now = round(pip_now,1)
+                        run_loop._cached_pip_chg = pip_chg
+                        run_loop._cached_dip_now = round(dip_now,1)
+                        run_loop._cached_dip_chg = dip_chg
+                        del p5q,p6q,p7q,p6q2,p7q2,p8q2
+                    except Exception:
+                        run_loop._cached_pip_now = None
+                        run_loop._cached_pip_chg = 0.0
+                        run_loop._cached_dip_now = None
+                        run_loop._cached_dip_chg = 0.0
+                else:
+                    # palm_n_raw 太小（手离镜头特别远/截断）→ 直接丢弃
+                    index_bend = None
+
+                # ⭐ 2026-08-22 核心修复：Tap-Click 段直接复用 move_only() 同帧计算出来的"缓存平滑后坐标"
+                #   之前的问题：
+                #     move_only() 调 _smooth → 更新 6 层缓冲/锁/EMA/方差
+                #     handle() 又调 _smooth → 二次更新（同帧 anchor_norm 没变但 smoother 内部状态乱了——尤其是 ARSmoother.absolute 的方差锁误锁）
+                #     这里 Tap-Click 段又调 _norm_to_screen + _smooth → 第三次！→ smooth 值严重偏离绿圈对应的位置
+                #     → 冻结 freeze_for_click() 和 tap_event=1/2/3/4 时 click/long-press drag 都点到了错位的位置 → 用户感知"点不到 / 完全混乱"
                 anchor_norm = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
-                gx, gy = mouse._norm_to_screen(*anchor_norm)
-                sx, sy = mouse._smooth(gx, gy)
-                right_screen_pt = (sx, sy)
+                # 走 _eval_anchor_once：如果 move_only() 已经在本帧跑过同 anchor_norm → 缓存命中，smoother 不再二次更新
+                _, _, sx, sy, _, _ = mouse._eval_anchor_once(anchor_norm, gesture_hint=None)
+                right_screen_pt = (float(sx), float(sy))
 
             if disable_click_for_stretch_global:
                 tap_detector.reset()
                 tap_event = 0
             else:
                 tap_event = tap_detector.update(index_bend)
+
+            # ======================================================================
+            # ⭐⭐ 方案 A 取证日志（ROI 顶部 25% 条带）
+            #   2026-08-25 致命修复：用户右手=MediaPipe label"Left"(镜像语义)，之前写"Right"=100%永不触发→无日志
+            #   保证：
+            #     · 每 60 帧打 1 行【心跳】= 无论条带是否命中，必打，证明日志代码执行中
+            #     · 掌心进 TOP 25% 条带 → 每 2 帧打 1 行详细表 + 首次表头
+            #     · 所有 print 强制 flush（Flask stdout 缓冲默认关闭 flushing）
+            # ======================================================================
+            try:
+                import sys as _sys
+                _log_cnt = getattr(run_loop, '_tap_log_frame_cnt', -1)
+                _log_header_printed = getattr(run_loop, '_tap_log_header_printed', False)
+                _log_cnt = 0 if _log_cnt < 0 else (_log_cnt + 1)
+                setattr(run_loop, '_tap_log_frame_cnt', _log_cnt)
+                # ---------- (1) 每 60 帧 1 行心跳日志（证明代码在执行，不会“完全无日志”）----------
+                if _log_cnt % 60 == 0:
+                    rx1, ry1, rx2, ry2 = MouseController.compute_roi_bbox_px(
+                        w, h, args.roi_scale, args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
+                    TOP_BAND_FACT = 0.25
+                    band_y_top = float(ry1); band_y_bot = float(ry1) + TOP_BAND_FACT * max(1.0, float(ry2-ry1))
+                    labels = sorted(hand_results.keys())
+                    anchor_info = "no Right-Left label"
+                    for _lbl in ("Left", "Right"):
+                        if _lbl in hand_results:
+                            _, _, _, _l = hand_results[_lbl]
+                            nx, ny = HandDetector.cursor_anchor_from_landmarks(_l, args.anchor)
+                            ay = float(ny) * float(h); ax = float(nx) * float(w)
+                            in_band = (ay >= band_y_top - 2.0) and (ay <= band_y_bot + 2.0)
+                            anchor_info = f"{_lbl}: anchor({ax:5.1f},{ay:5.1f}) inTopBand={'Y' if in_band else 'N'} | {anchor_info}"
+                    print(f"[HEARTBEAT-TAPLOG] frame={_log_cnt:>4} labels={labels} safe_rect_y=[{band_y_top:5.1f}~{band_y_bot:5.1f}~{ry2:5.1f}] | {anchor_info}",
+                          file=_sys.stdout, flush=True)
+                # ---------- (2) 详细 tap log（仅用户右手=label"Left" 且 进条带 且 每2帧 1 次）----------
+                _do_log = False
+                anchor_y_px = band_y_top = band_y_bot = 0.0
+                rx1 = ry1 = rx2 = ry2 = 0.0
+                if "Left" in hand_results:
+                    nx, ny = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
+                    rx1, ry1, rx2, ry2 = MouseController.compute_roi_bbox_px(
+                        w, h, args.roi_scale, args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
+                    rx1 = float(rx1); ry1 = float(ry1); rx2 = float(rx2); ry2 = float(ry2)
+                    anchor_x_px = float(nx) * float(w)
+                    anchor_y_px = float(ny) * float(h)
+                    TOP_BAND_FACT = 0.25
+                    band_y_top = ry1
+                    band_y_bot = ry1 + TOP_BAND_FACT * max(1.0, ry2 - ry1)
+                    in_x = (anchor_x_px >= rx1 - 6.0) and (anchor_x_px <= rx2 + 6.0)
+                    in_y = (anchor_y_px >= band_y_top - 4.0) and (anchor_y_px <= band_y_bot + 4.0)
+                    # 从 tap 段前置缓存直接读取（100% 同一信号源）
+                    _c_in_tb = bool(getattr(run_loop, '_cached_in_top_band', False))
+                    _c_palm_ok = getattr(run_loop, '_cached_palm_stable_actual', None)
+                    _c_pip_chg = float(getattr(run_loop, '_cached_pip_chg', 0.0))
+                    _c_dip_chg = float(getattr(run_loop, '_cached_dip_chg', 0.0))
+                    _ps_str = ("Y" if _c_palm_ok else "N") if _c_palm_ok is not None else "?"
+                    if in_x and in_y and (_log_cnt % 2 == 0):
+                        _do_log = True
+                if _do_log:
+                    p0a = np.array([lms[0].x, lms[0].y], dtype=np.float64)
+                    p5a = np.array([lms[5].x, lms[5].y], dtype=np.float64)
+                    p6a = np.array([lms[6].x, lms[6].y], dtype=np.float64)
+                    p7a = np.array([lms[7].x, lms[7].y], dtype=np.float64)
+                    p8a = np.array([lms[8].x, lms[8].y], dtype=np.float64)
+                    p17 = np.array([lms[17].x, lms[17].y], dtype=np.float64)
+                    a_pip = _three_point_angle(p5a, p6a, p7a)
+                    a_mcp = _three_point_angle(p0a, p5a, p6a)
+                    a_dip = _three_point_angle(p6a, p7a, p8a)
+                    dist_raw = float(np.linalg.norm(p8a - p5a)) / max(np.linalg.norm(p5a - p17), 1e-6)
+                    D_N_S = 2.40; D_N_B = 0.90; D_N_MIN = 0.20; D_N_MAX = 0.88
+                    t = (dist_raw - D_N_B) / (D_N_S - D_N_B)
+                    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                    dist_norm = D_N_MIN + t * (D_N_MAX - D_N_MIN)
+                    final_v = float(index_bend) if index_bend is not None else float('nan')
+                    tm = tap_detector.metrics()
+                    br = tm["bend_ratio"]
+                    di_down = tm["di_sum_down"]
+                    di_thr = tm["DI_DOWN_THR"]
+                    MIN_ABS = float(tap_detector.params.get("MIN_ABS_BEND_RATIO_FOR_DELTA", 0.75))
+                    ENTER = float(tap_detector.params.get("ENTER_BEND_RATIO", 0.698))
+                    down_ok_delta = bool(di_down >= di_thr and br <= min(MIN_ABS, ENTER + 0.06))
+                    drop_now = 0.0
+                    if tm["baseline"] > 1e-6 and tap_detector._max_recent_bend is not None:
+                        drop_now = (tap_detector._max_recent_bend - tm["bend"]) / max(tap_detector._max_recent_bend, 1e-6)
+                    down_ok_abs = bool((tm["bend"] < tm["enter_t"]) and (drop_now > float(tap_detector.params.get("MIN_BEND_DROP", 0.14))))
+                    down_ok = bool(down_ok_delta or down_ok_abs)
+                    _STATE_NAMES = {0:"IDLE",1:"ARM",2:"HOLD",3:"PRS",4:"COOL"}
+                    st = _STATE_NAMES.get(tm["state"], f"?{tm['state']}")
+                    ev_name = {0:"-",1:"TAP",2:"LNG_D",3:"LNG_U",4:"DRAG"}.get(tap_event, str(tap_event))
+                    anchor_range_str = f"{anchor_y_px:6.1f}({band_y_top:5.1f}~{band_y_bot:5.1f})"
+                    if not _log_header_printed:
+                        print("┌────────────── TOP BAND TAP LOG (ROI顶部25%条带，每2帧) ──────────────┐", flush=True)
+                        print("│frm │IN_TB│PS │DIPΔ°│PIPΔ°│  anchor_y_px(条带顶~底)    │∠PIP │∠MCP │∠DIP │dist_rw│dist_nm│ final │bratio│DI_down│DIthr │dδOK │dOK↓│downOK│tap_ev│state│", flush=True)
+                        print("├────│─────┼───┼─────┼─────┼──────────────────────────┼─────┼─────┼─────┼───────┼───────┼───────┼──────┼───────┼──────┼─────┼────┼──────┼──────┼─────┤", flush=True)
+                        setattr(run_loop, '_tap_log_header_printed', True)
+                    dS = "Y" if down_ok_delta else "N"
+                    dA = "Y" if down_ok_abs else "N"
+                    print(f"│{_log_cnt:>3} │ {'Y' if _c_in_tb else 'N'}   │ {_ps_str:1} │ {_c_dip_chg:+4.1f}│ {_c_pip_chg:+4.1f}│ {anchor_range_str:24} │ {a_pip:3.0f}°│ {a_mcp:3.0f}°│ {a_dip:3.0f}°│ {dist_raw:5.3f} │ {dist_norm:5.3f} │ {final_v:5.3f} │ {br:4.2f} │ {di_down:5.3f} │ {di_thr:4.2f} │ {dS:3}  │ {dA:3} │ {'Y' if down_ok else 'N'}    │ {ev_name:4} │ {st:3} │", flush=True)
+            except Exception as _tap_log_e:
+                import traceback as _tb
+                print(f"  [ERROR] top-band tap log 异常：{_tap_log_e!r}\n{_tb.format_exc()}", flush=True)
+
             if not disable_click_for_stretch_global and stretch.state != _DS.SCALING:
                 if tap_event in (1, 2):
+                    # freeze_for_click 冻结位置 = 同帧 move_only 输出位置（smoother 已被冻结，后续几帧都返回相同像素点）
                     mouse._smoother.freeze_for_click()
                 if tap_event != 0:
+                    # handle_finger_tap_event 内部 click / drag / mouseDown 用的就是对齐后的 right_screen_pt
                     mouse.handle_finger_tap_event(tap_event, right_screen_pt)
 
             # ---------- 双手拉伸 / 移动 ----------
@@ -733,6 +1120,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
             # ---------- 绘制：Tap 条 ----------
             tm = tap_detector.metrics()
+            # 回滚 B-2：每帧必画，不再跳帧（避免闪烁）
             _draw_tap_bar(frame, tm, tap_detector)
 
             # ---------- 绘制：SCALE 拉伸 UI ----------
@@ -760,6 +1148,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         cv2.line(frame, t4, t8, color, 2)
                         cv2.circle(frame, t4, 7, color, -1)
                         cv2.circle(frame, t8, 7, color, -1)
+                        # 回滚 B-2：每帧必画"捏 XX%"文字，避免闪烁
                         put_text_cn(frame,
                                     f"捏: {min(99, int(stretch_info.left_pinch_r * 100))}%" if px < w // 2 else f"捏: {min(99, int(stretch_info.right_pinch_r * 100))}%",
                                     (max(4, px - 32), max(4, py + 32)), font_scale=0.5, color=color, thickness=2)
@@ -777,16 +1166,19 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         prog_w = 340
                         bx = cx - prog_w // 2
                         by = cy - 62
+                        # 回滚 B-2：黑色大底 + 中文 每帧必画，完全不跳帧
                         cv2.rectangle(frame, (bx - 6, by - 24), (bx + prog_w + 6, by + 48), (0, 0, 0), -1)
                         cv2.rectangle(frame, (bx, by), (bx + prog_w, by + 12), (60, 60, 60), -1)
                         if stretch_info.state == _DS.IDLE and stretch_info.ui_pinch_active:
                             fill_ratio = min(1.0, theta_deg / 90.0)
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * fill_ratio), by + 12), pre_c, -1)
+                            # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
                                         f"预判定【{pre_mode}】  θ={theta_deg:.0f}° ｜ 双手≥120px 并保持3帧即可激活",
                                         (bx, by + 20), font_scale=0.58, color=(255, 255, 255), thickness=2)
                         else:
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 12), color, -1)
+                            # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
                                         f"选中确认中… {stretch_info.confirm_frames}/{hold_n}({int(pct*100)}%)  θ={theta_deg:.0f}° → {pre_mode}",
                                         (bx, by + 20), font_scale=0.6, color=(255, 255, 255), thickness=2)
@@ -818,6 +1210,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         card_w, card_h = 520, 100
                         bx = cx - card_w // 2
                         by = cy - card_h // 2 - 16
+                        # 回滚 B-2：卡片黑底 + 边框 + 3 行中文 每帧必画（卡片外框颜色每帧画）
                         cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), (0, 0, 0), -1)
                         cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), color, 2)
                         put_text_cn(frame, lines[0][0], (bx + 24, by + 14), font_scale=lines[0][2], color=lines[0][1], thickness=2)
@@ -857,6 +1250,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             cv2.circle(frame, (tx, ty), 8, mv_color, -1)
                         except Exception:
                             pass
+                    # 回滚 B-2：掌心"张开"文字 每帧必画
                     put_text_cn(frame, "张开",
                                 (max(4, px - 26), max(4, py + 38)), font_scale=0.55, color=mv_color, thickness=2)
 
@@ -877,15 +1271,18 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         prog_w = 400
                         bx = cx - prog_w // 2
                         by = cy - 66
+                        # 回滚 B-2：黑色大底 + 中文 每帧必画
                         cv2.rectangle(frame, (bx - 6, by - 30), (bx + prog_w + 6, by + 60), (0, 0, 0), -1)
                         cv2.rectangle(frame, (bx, by), (bx + prog_w, by + 14), (50, 50, 50), -1)
                         if stretch_info.ui_move_active and stretch_info.move_state == _DMS.IDLE:
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * 0.02), by + 14), mv_color, -1)
+                            # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
                                         f"✋预判定【移动窗口(双手)】左手掌心指向要移动的窗口 ｜ 保持五指张开3帧即可选中",
                                         (bx, by + 24), font_scale=0.55, color=(255, 255, 255), thickness=2)
                         else:
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 14), mv_color, -1)
+                            # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
                                         f"✋选中窗口确认中… {stretch_info.move_confirm_frames}/{hold_n}({int(pct*100)}%)  → 左手掌心下窗口=目标",
                                         (bx, by + 24), font_scale=0.58, color=(255, 255, 255), thickness=2)
@@ -907,6 +1304,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         card_w, card_h = 620, 110
                         bx = cx - card_w // 2
                         by = cy - card_h // 2 - 20
+                        # 回滚 B-2：卡片黑底 + 边框 + 3 行中文 每帧必画
                         cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), (0, 0, 0), -1)
                         cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), mv_color, 2)
                         put_text_cn(frame, lines[0][0], (bx + 22, by + 14), font_scale=lines[0][2], color=lines[0][1], thickness=2)
@@ -926,15 +1324,18 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         prog_w = 420
                         bx = x1 + 40 if cx < w // 2 else (x1 - 40 - prog_w)
                         by = y1 - 66
+                        # 回滚 B-2：黑色大底 + 中文 每帧必画
                         cv2.rectangle(frame, (bx - 6, by - 30), (bx + prog_w + 6, by + 60), (0, 0, 0), -1)
                         cv2.rectangle(frame, (bx, by), (bx + prog_w, by + 14), (50, 50, 50), -1)
                         if stretch_info.ui_move_active and stretch_info.move_state == _DMS.IDLE:
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * 0.02), by + 14), mv_color, -1)
+                            # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
                                         f"✋预判定【移动窗口(单手)】掌心指向要移动的窗口 ｜ 保持五指张开3帧即可选中",
                                         (bx, by + 24), font_scale=0.55, color=(255, 255, 255), thickness=2)
                         else:
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 14), mv_color, -1)
+                            # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
                                         f"✋选中窗口确认中(单手)… {stretch_info.move_confirm_frames}/{hold_n}({int(pct*100)}%)",
                                         (bx, by + 24), font_scale=0.58, color=(255, 255, 255), thickness=2)
@@ -956,6 +1357,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         card_w, card_h = 620, 110
                         bx = x1 + 40 if cx < w // 2 else (x1 - 40 - card_w)
                         by = y1 - card_h // 2
+                        # 回滚 B-2：卡片黑底 + 边框 + 3 行中文 每帧必画
                         cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), (0, 0, 0), -1)
                         cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), mv_color, 2)
                         put_text_cn(frame, lines[0][0], (bx + 22, by + 14), font_scale=lines[0][2], color=lines[0][1], thickness=2)
@@ -995,6 +1397,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 s_color = None
                 s_text = ""
             if s_text:
+                # 回滚 B-2：背景黑块 + 中文 每帧必画
                 cv2.rectangle(frame, (8, 90), (8 + 470, 90 + 28), (0, 0, 0), -1)
                 put_text_cn(frame, s_text, (14, 94), font_scale=0.6, color=s_color, thickness=2)
 
@@ -1016,6 +1419,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 tw, th = _measure_cn_text_size(combo_hint, 0.8)
                 tx = (w - tw) // 2
                 ty = h - 30
+                # 回滚 B-2：背景黑块 + 中文 每帧必画
                 cv2.rectangle(frame, (tx - 12, ty - th - 14),
                               (tx + tw + 12, ty + 12),
                               (0, 0, 0), -1)
@@ -1024,15 +1428,24 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
             # ---------- 顶部模式标签 ----------
             anchor_text = "掌心" if args.anchor == "palm" else "食指尖"
-            mode_text   = "绝对指哪打哪" if args.cursor_mode == "absolute" else "AR 悬停平滑"
+            if args.cursor_mode == "absolute":
+                mode_text = "绝对指哪打哪"
+            elif args.cursor_mode == "direct":
+                mode_text = "⭐严格跟绿圈（翻转不卡）"
+            else:
+                mode_text = "AR 悬停平滑"
             roi_pct = int(round(args.roi_scale * 100))
+            safe_pct = int(round(args.roi_safe_shrink * 100))
+            # 回滚 B-2：顶部黑底 + 中文 每帧必画
             cv2.rectangle(frame, (0, 0), (w, 30), (0, 0, 0), -1)
             put_text_cn(frame, mode_label, (10, 6),
                         font_scale=0.6, color=mode_color, thickness=2)
-            put_text_cn(frame, f"🖱️{mode_text} | 锚点: {anchor_text} | 映射ROI: {roi_pct}%  🟢=光标  🟠=食指TIP",
-                        (w - 640, 6), font_scale=0.6, color=(0, 230, 80), thickness=2)
+            label_color = (255, 220, 0) if args.cursor_mode == "direct" else (0, 230, 80)
+            put_text_cn(frame, f"🖱️{mode_text} | 锚点: {anchor_text} | 原始ROI: {roi_pct}% × 安全内缩: {safe_pct}%  🟢=光标  🟠=食指TIP",
+                        (w - 780, 6), font_scale=0.6, color=label_color, thickness=2)
             # ---------- ROI 矩形（与 MouseController._norm_to_screen 100% 对齐：统一调 compute_roi_bbox_px）----------
-            x1, y1, x2, y2 = MouseController.compute_roi_bbox_px(w, h, args.roi_scale, args.roi_offset_y)
+            x1, y1, x2, y2 = MouseController.compute_roi_bbox_px(w, h, args.roi_scale, args.roi_offset_y,
+                                                                 roi_safe_shrink=args.roi_safe_shrink)
             _dash_len = 12
             _gap = 8
             _step = _dash_len + _gap
@@ -1051,6 +1464,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
             # ---------- 底部提示 ----------
             help_line = "右手=控鼠 | 🟢掌心移动=鼠标(食指点击不漂) | 食指轻弯=单击 | 保弯=拖 | 🤏V=单 | Rock=右 | 拇=双 | 拳=拖 | 🤏双手非张开=捏合拉伸→窗口放大缩小 | ✋单手五指张开=掌心下窗口拖动 | ✋双手五指张开=双手配合拖动窗口(光标锁窗口中心防误触) | q退"
+            # 回滚 B-2：底部帮助栏 每帧必画
             put_text_cn(frame, help_line, (12, h - 28),
                         font_scale=0.55, color=(220, 220, 220), thickness=2)
             _t3 = time.perf_counter()
@@ -1072,13 +1486,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _fps_frame_cnt = 0
                 _fps_last_t = _now
             fps_txt = f"FPS {_fps_display:5.1f}  采集{_fps_cam_read_ms:5.1f}ms 识别{_fps_infer_ms:5.1f}ms 绘制{_fps_draw_ms:5.1f}ms"
-            # 🔥 附加跳帧率提示（让用户知道优化在生效）
+            # 附加跳帧率提示（让用户知道优化在生效）
             if _skip_total_frames >= 10:
                 _skip_pct = 100.0 * _skip_skipped_frames / max(_skip_total_frames, 1)
                 if _skip_pct >= 15.0:
                     fps_txt += f"  跳帧{_skip_pct:.0f}%⚡"
-            cv2.rectangle(frame, (w - 448, 30), (w - 4, 60), (0, 0, 0), -1)
             fps_color = (0, 230, 80) if _fps_display >= 25 else (80, 180, 255) if _fps_display >= 18 else (80, 80, 255)
+            # 回滚 B-2：FPS 文字背景黑块 + 中文 每帧必画
+            cv2.rectangle(frame, (w - 448, 30), (w - 4, 60), (0, 0, 0), -1)
             put_text_cn(frame, fps_txt, (w - 440, 36),
                         font_scale=0.55, color=fps_color, thickness=2)
 

@@ -11,6 +11,15 @@ from draw_cn_text import put_text_cn
 from finger_tap_click_detector import FingerTapClickDetector, _S as _TS
 from diagonal_stretch import DiagonalStretchManager, _S as _DS, _MODE as _DM, _MS as _DMS
 
+# 方案A 日志：尝试从 hands_tasks 复用关节角度计算（如果用户不走 --use-tasks 也能保证日志能出）
+try:
+    from hands_tasks import _three_point_angle as _tpa  # noqa: F401
+    _three_point_angle = _tpa
+    _HAS_TPA = True
+except Exception:
+    _three_point_angle = None
+    _HAS_TPA = False
+
 """
 双手手势 → 鼠标 映射 主入口
 ============================
@@ -218,8 +227,13 @@ def main():
         help="画面→屏幕映射中心区域大小(0.30~1.00)：越小=越大范围给手指伸展(避免掌心锁死时手指不可见); 1.0=全屏映射; 默认0.70=中心70%映射,每边预留15%手活动空间",
     )
     parser.add_argument(
-        "--roi-offset-y", type=float, default=0.5,
-        help="ROI正方形在画面高度的上下位置（-1.0=贴顶, 0.0=居中, +0.5=偏下默认, +1.0=贴底）。默认下移避免顶部手指超出摄像头范围。",
+        "--roi-offset-y", type=float, default=0.62,
+        help="ROI长方形在画面高度的上下位置（-1.0=贴顶, 0.0=居中, +0.62=默认偏下12%防顶部clip, +1.0=贴底）。默认下移避免顶部 landmark 被上边缘截断。",
+    )
+    parser.add_argument(
+        "--roi-safe-shrink", type=float, default=0.82,
+        help="【2026-08-24 新增】在 --roi-scale 算出的原始 ROI 长方形基础上，再按中心等比内缩多少（0.50~1.00）："
+             "越小=虚线框越小=指尖越不容易顶出画面边缘=识别越稳；越大=虚线框越大=手动作幅度更小就能覆盖全屏。默认 0.82=再缩 18%。",
     )
     # ✨ 点击调参：两个用户友好 0~1 参数（不用手改 8 个内部阈值）
     parser.add_argument(
@@ -236,6 +250,8 @@ def main():
     if args.roi_scale > 1.00: args.roi_scale = 1.00
     if args.roi_offset_y < -1.0: args.roi_offset_y = -1.0
     if args.roi_offset_y > +1.0: args.roi_offset_y = +1.0
+    if args.roi_safe_shrink < 0.50: args.roi_safe_shrink = 0.50
+    if args.roi_safe_shrink > 1.00: args.roi_safe_shrink = 1.00
     if args.tap_hardness < 0.0: args.tap_hardness = 0.0
     if args.tap_hardness > 1.0: args.tap_hardness = 1.0
     if args.tap_speed    < 0.0: args.tap_speed    = 0.0
@@ -269,7 +285,7 @@ def main():
         mode_label = "[MODE: 默认 Solutions]  mediapipe 内置模型"
         mode_color = (180, 255, 120)  # 青绿色
     mouse = MouseController(alpha=0.25, cursor_mode=args.cursor_mode, roi_scale=args.roi_scale,
-                            roi_offset_y=args.roi_offset_y)
+                            roi_offset_y=args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
     tap_detector = FingerTapClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)
     stretch = DiagonalStretchManager()  # 双手对角拉伸 → 选中前台窗口 放大缩小
 
@@ -470,8 +486,75 @@ def main():
                 tap_event = 0
             else:
                 tap_event = tap_detector.update(index_bend)
-            # 用户要求恢复：点击前锁死光标位置3帧（TAP和LONG_DOWN都锁一次，避免点击瞬间漂移）
-            # ✨ 拉伸相关场景一律不触发任何食指点击事件
+
+            # ======================================================================
+            # ⭐⭐ 方案 A 取证日志（ROI 顶部 25% 条带）—— 与 hands_tasks.run_loop 中日志完全对齐
+            # ======================================================================
+            try:
+                import sys as _sys
+                _LF = getattr(main, '_tap_log_frame_cnt', -1)
+                _LH = getattr(main, '_tap_log_header_printed', False)
+                _LF = 0 if _LF < 0 else (_LF + 1)
+                setattr(main, '_tap_log_frame_cnt', _LF)
+                _do_log = False
+                _lms_log = None
+                # main.py：用户右手 = MediaPipe "Left"（画面镜像后的结果）
+                if "Left" in hand_results and _HAS_TPA and (_LF % 2 == 0):
+                    _, _, _, _lms_log = hand_results["Left"]
+                    nx, ny = HandDetector.cursor_anchor_from_landmarks(_lms_log, args.anchor)
+                    rx1, ry1, rx2, ry2 = MouseController.compute_roi_bbox_px(
+                        w, h, args.roi_scale, args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
+                    rx1 = float(rx1); ry1 = float(ry1); rx2 = float(rx2); ry2 = float(ry2)
+                    ax_px = float(nx) * float(w); ay_px = float(ny) * float(h)
+                    TOP_BAND_FACT = 0.25
+                    band_y_top = ry1
+                    band_y_bot = ry1 + TOP_BAND_FACT * max(1.0, ry2 - ry1)
+                    in_x = (ax_px >= rx1 - 6.0) and (ax_px <= rx2 + 6.0)
+                    in_y = (ay_px >= band_y_top - 2.0) and (ay_px <= band_y_bot + 2.0)
+                    if in_x and in_y:
+                        _do_log = True
+                if _do_log and _lms_log is not None:
+                    p0a = np.array([_lms_log[0].x, _lms_log[0].y], dtype=np.float64)
+                    p5a = np.array([_lms_log[5].x, _lms_log[5].y], dtype=np.float64)
+                    p6a = np.array([_lms_log[6].x, _lms_log[6].y], dtype=np.float64)
+                    p7a = np.array([_lms_log[7].x, _lms_log[7].y], dtype=np.float64)
+                    p8a = np.array([_lms_log[8].x, _lms_log[8].y], dtype=np.float64)
+                    p17 = np.array([_lms_log[17].x, _lms_log[17].y], dtype=np.float64)
+                    a_pip = _three_point_angle(p5a, p6a, p7a)
+                    a_mcp = _three_point_angle(p0a, p5a, p6a)
+                    a_dip = _three_point_angle(p6a, p7a, p8a)
+                    dist_raw = float(np.linalg.norm(p8a - p5a)) / max(np.linalg.norm(p5a - p17), 1e-6)
+                    D_N_S = 2.40; D_N_B = 0.90; D_N_MIN = 0.20; D_N_MAX = 0.88
+                    t = (dist_raw - D_N_B) / (D_N_S - D_N_B)
+                    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                    dist_norm = D_N_MIN + t * (D_N_MAX - D_N_MIN)
+                    final_v = float(index_bend) if index_bend is not None else float('nan')
+                    tm = tap_detector.metrics()
+                    br = tm["bend_ratio"]
+                    di_down = tm["di_sum_down"]
+                    di_thr = tm["DI_DOWN_THR"]
+                    MIN_ABS = 0.70; ENTER = float(tap_detector.params.get("ENTER_BEND_RATIO", 0.78))
+                    down_ok_delta = bool(di_down >= di_thr and br <= min(MIN_ABS, ENTER + 0.06))
+                    drop_now = 0.0
+                    if tm["baseline"] > 1e-6 and tap_detector._max_recent_bend is not None:
+                        drop_now = (tap_detector._max_recent_bend - tm["bend"]) / max(tap_detector._max_recent_bend, 1e-6)
+                    down_ok_abs = bool((tm["bend"] < tm["enter_t"]) and (drop_now > float(tap_detector.params.get("MIN_BEND_DROP", 0.14))))
+                    down_ok = bool(down_ok_delta or down_ok_abs)
+                    _STATE_NAMES = {0:"IDLE",1:"ARM",2:"HOLD",3:"PRS",4:"COOL"}
+                    st = _STATE_NAMES.get(tm["state"], f"?{tm['state']}")
+                    ev_name = {0:"-",1:"TAP",2:"LNG_D",3:"LNG_U",4:"DRAG"}.get(tap_event, str(tap_event))
+                    anchor_range_str = f"{ay_px:6.1f}({band_y_top:5.1f}~{band_y_bot:5.1f})"
+                    if not _LH:
+                        print("┌────────────── TOP BAND TAP LOG (MAIN入口, 顶部25%条带, 每2帧) ──────────────┐", file=_sys.stdout, flush=True)
+                        print("│frm │  anchor_y_px(条带顶~底)    │∠PIP │∠MCP │∠DIP │dist_rw│dist_nm│ final │bratio│DI_down│DIthr │dδOK │dOK↓│downOK│tap_ev│state│", flush=True)
+                        print("├────│──────────────────────────┼─────┼─────┼─────┼───────┼───────┼───────┼──────┼───────┼──────┼─────┼────┼──────┼──────┼─────┤", flush=True)
+                        setattr(main, '_tap_log_header_printed', True)
+                    dS = "Y" if down_ok_delta else "N"
+                    dA = "Y" if down_ok_abs else "N"
+                    print(f"│{_LF:>3} │ {anchor_range_str:24} │ {a_pip:3.0f}°│ {a_mcp:3.0f}°│ {a_dip:3.0f}°│ {dist_raw:5.3f} │ {dist_norm:5.3f} │ {final_v:5.3f} │ {br:4.2f} │ {di_down:5.3f} │ {di_thr:4.2f} │ {dS:3}  │ {dA:3} │ {'Y' if down_ok else 'N'}    │ {ev_name:4} │ {st:3} │", flush=True)
+            except Exception as _tap_log_e:
+                print(f"  [warn] main.py top-band tap log 异常：{_tap_log_e!r}", flush=True)
+
             if not disable_click_for_stretch_global and stretch.state != _DS.SCALING:
                 if tap_event in (1, 2):  # E.TAP_CLICK=1 / LONG_DOWN=2
                     mouse._smoother.freeze_for_click()
@@ -842,13 +925,15 @@ def main():
             anchor_text = "掌心" if args.anchor == "palm" else "食指尖"
             mode_text   = "绝对指哪打哪" if args.cursor_mode == "absolute" else "AR 悬停平滑"
             roi_pct = int(round(args.roi_scale * 100))
+            safe_pct = int(round(args.roi_safe_shrink * 100))
             cv2.rectangle(frame, (0, 0), (w, 30), (0, 0, 0), -1)
             put_text_cn(frame, mode_label, (10, 6),
                         font_scale=0.6, color=mode_color, thickness=2)
-            put_text_cn(frame, f"🖱️{mode_text} | 锚点: {anchor_text} | 映射ROI: {roi_pct}%  🟢=光标  🟠=食指TIP",
-                        (w - 640, 6), font_scale=0.6, color=(0, 230, 80), thickness=2)
+            put_text_cn(frame, f"🖱️{mode_text} | 锚点: {anchor_text} | 原始ROI: {roi_pct}% × 安全内缩: {safe_pct}%  🟢=光标  🟠=食指TIP",
+                        (w - 780, 6), font_scale=0.6, color=(0, 230, 80), thickness=2)
             # ========= 绘制：ROI 矩形边框（把"画面中心X%映射全屏"可视化，用户一眼能看到允许掌心活动的区域）=========
-            x1, y1, x2, y2 = MouseController.compute_roi_bbox_px(w, h, args.roi_scale, args.roi_offset_y)
+            x1, y1, x2, y2 = MouseController.compute_roi_bbox_px(w, h, args.roi_scale, args.roi_offset_y,
+                                                                 roi_safe_shrink=args.roi_safe_shrink)
             # 虚线绿色边框：内部=可映射到屏幕的掌心活动区域；外部=手指预留伸展空间
             _dash_len = 12
             _gap = 8

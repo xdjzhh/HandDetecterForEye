@@ -1,5 +1,6 @@
 import time
 import numpy as np
+from collections import deque  # 存最近 N 帧 bend_ratio，算一阶差分
 
 """
 食指 "Tap-Click" 点击检测器（完全不依赖手掌整体运动！）
@@ -21,23 +22,37 @@ import numpy as np
     食指第一关节勾回  → bend ≈ 0.40~0.55
     完全握拳食指    → bend ≈ 0.20~0.35
 
+⭐ 2026-08-22 用户明确：「点击应该计算的是最近几帧手指弯曲的变化量，而不是以绝对弯曲度判断」
+根因：老方案用绝对弯曲度 bend/baseline → 但 baseline 依赖 palm 宽度(MCP_5→MCP_17)，手掌翻转/远近变化时
+      palm_n 慢波动 → bend_ratio 也跟着变 → 明明没弯手指，也会在 enter_t / exit_t 上上下下 → 疯狂误判。
+新方案（一阶差分 + 绝对阈值兜底，双判据 OR 兼容）：
+  主判据 = 最近 K 帧 bend_ratio（=smoothed_bend / baseline）的「一阶差分累积和」
+    · 按下 = 近 5 帧 Δbend_ratio 累计 ≤ -TAP_DOWN_DI_SUM（bend_ratio 变小了 = 食指真的主动弯了）
+    · 松开 = 近 5 帧 Δbend_ratio 累计 ≥ +TAP_UP_DI_SUM（bend_ratio 变大了 = 食指真的主动回弹伸直）
+  兜底判据（保留旧工程约定，高级用户仍能用老参数习惯）：
+    · 原来的 enter_t/exit_t + MIN_BEND_DROP 仍作为「绝对弯曲度门槛」兜底，保证：
+      - 纯差分的小抖动（比如差分刚好触发但实际根本没弯）= 绝对门槛拦下
+      - 差分窗口太窄没接住、但用户确实明显弯了 = 绝对门槛仍能触发（兼容）
+  → 手掌翻转/远近变化是低频慢漂（相邻几帧 Δbend_ratio ≈ ±0.01）→ 差分和 = 0 → 绝不误判。
+  → 只有真的"食指主动弯下去再弹回来"才会形成大幅差分正负脉冲 → 精准识别。
+
 状态机（严格时序：伸直→弯→伸直 = 一次Tap；弯曲超时=Hold拖拽）：
 
  STRAIGHT_IDLE (bend≈伸直, 持续学习伸直基线)
-   │ (bend < baseline * 0.78   且   相对下降幅度 > 0.12)
+   │ (主：近5帧Δ累积 ≥ DOWN_DI  且  B < enter_t*1.02)  OR  (兜底：B < enter_t 且 drop>MIN_DROP)
    ▼
  BEND_ARMED (检测到弯曲，等 1 帧避免瞬间尖峰)
    │ 下一帧仍满足弯曲
    ▼
  BEND_HOLD  (弯曲持续中 → 计时)
-   ├─ (bend 回到 > baseline*0.86  且 hold_frames <= LONG_PRESS)  → TAP_CLICK → 单击
-   └─ (hold_frames > LONG_PRESS  且 bend 仍<baseline*0.80)       → LONG_PRESS → 长按拖拽开始
+   ├─ (主：近5帧Δ累积 ≥ UP_DI  或  兜底：B≥exit_t)  且 hold_frames <= LONG_PRESS  → TAP_CLICK → 单击
+   └─ (hold_frames > LONG_PRESS  且 bend 仍<baseline*0.80)                           → LONG_PRESS → 长按拖拽开始
                 │
                 ▼
           PRESSED_HOLD (保持按住，拖拽跟随)
-                │  (bend 回到 > baseline*0.86 → 释放)
+                │  (主：差分释放  或  兜底：B≥exit_t → 释放)
                 ▼
-          COOLDOWN (14帧冷却 + 重置伸直基线慢速学习) → IDLE
+          COOLDOWN (4帧冷却 + 重置伸直基线慢速学习) → IDLE
 """
 
 # 阈值（文件级默认值；实际运行时可通过构造参数 hardness/speed 被 CLI 参数覆盖）
@@ -56,6 +71,19 @@ BEND_STABLE_MIN_HOLD_DEFAULT = 2
 MIN_BEND_HOLD_DEFAULT    = 1
 # COOLDOWN_FRAMES：用户明确要求保留改动（原14→4，解决连点第二下卡死）
 COOLDOWN_FRAMES  = 4
+
+# ⭐ 2026-08-22 差分点击新增常量
+DI_WINDOW = 5                 # 差分窗口：最近 5 帧 bend_ratio（30fps=167ms，刚好是"按下去"的动作时长）
+# ⭐ 2026-08-24 适配 v2 弯曲度度量（关节角度融合版，Δ 比旧 dist_bend 略小 15~20%）：
+#   差分门限整体 ×0.70 左右，保证灵敏度回到或略高于纯旧度量的水平
+TAP_DOWN_DI_SUM = 0.10        # 按下门限：ΣΔbend_ratio ≤ -0.10 → 食指真的主动弯了（bend_ratio 下降）
+#   （v2 关节角度 手指从伸直→90°弯，bend_ratio 变化≈0.85→0.30=-0.55 → 取 0.10 半程即可触发，5帧内必须完成）
+TAP_UP_DI_SUM   = 0.07        # 松开门限：ΣΔbend_ratio ≥ +0.07 → 食指真的主动回伸（bend_ratio 上升）
+MIN_ABS_BEND_RATIO_FOR_DELTA = 0.75  # 差分触发后仍必须满足 bend_ratio ≤ 这个兜底（防止"差分刚好到了、但其实没弯"）
+                                      # ✅ v3 统一弯曲度量（DIP=0.40 主力）后校准：
+                                      #   中等点击(DIP 弯至 120°=60°折) → bratio≈0.70 ≤ 0.75 ✅（能过）
+                                      #   移动微角度 ±2° → bratio 变化≈0.004 → DI=0.004 远不够，不会误触
+                                      #   深点击(DIP 弯至 30°=150°折) → bratio≈0.45 ≤ 0.75 ✅ 肯定过
 
 # 平滑 / 基线学习
 BEND_SMOOTH_ALPHA_DEFAULT = 0.75
@@ -77,26 +105,47 @@ def resolve_tap_params(hardness: float | None = None,
       0 = 最稳：ALPHA=0.55, MIN_HOLD=2, TAP_MAX=14, STABLE=0.020
       0.5= 默认快：ALPHA=0.77, MIN_HOLD=1, TAP_MAX=21, STABLE=0.0125
       1 = 极速：ALPHA=0.95, MIN_HOLD=0, TAP_MAX=28, STABLE=0.005
+
+    ⭐ 2026-08-22 差分点击新增：down/up 差分和 随 hardness/speed 联动
+      · hardness↑ = DOWN_DI↑（更严=必须更大幅度弯下来才触发），UP_DI 同步
+      · speed↑ = DI_WINDOW↓（更灵=窗口更短，更短时间内的变化就能触发）
     """
     if hardness is None: hardness = 0.6
     if speed    is None: speed    = 0.6
     hardness = 0.0 if hardness < 0.0 else (1.0 if hardness > 1.0 else float(hardness))
     speed    = 0.0 if speed    < 0.0 else (1.0 if speed    > 1.0 else float(speed))
 
-    # ✨ ENTER_BEND_RATIO：整体平移 -0.10（0.62 ~ 0.70），间距 0.08 保持不变（= 旧 0.72~0.80 线性下移 0.10）
-    enter = 0.62 + hardness * 0.08           # 0.62 ~ 0.70
-    drop  = 0.10 + hardness * 0.16           # 0.10 ~ 0.26（门槛B相对降幅，用户未指定改动，保持旧公式不变）
+    # ✨ ENTER_BEND_RATIO：v3 统一度量校准档 0.65~0.73（旧 0.62~0.70 略提 0.03 = 中等点击能过，移动不误触）
+    #    h=0.6(默认) → enter=0.698 → enter_t=baseline*0.7 ≈ 0.85*0.7=0.595（中等点击 B≈0.58 < 0.595 → down_abs 刚好过）
+    enter = 0.65 + hardness * 0.08           # 0.65 ~ 0.73
+    drop  = 0.10 + hardness * 0.16           # 0.10 ~ 0.26（门槛B相对降幅，保持稳定）
     # EXIT = ENTER + 0.06 形成滞回，ENTER 整体下移 EXIT 同步下移（更早识别回弹）
     exit_r = min(0.92, enter + 0.06)
 
     alpha       = 0.55 + speed * 0.40        # 0.55 ~ 0.95
-    min_hold    = int(round(2.0 - 2.0 * speed))  # speed=0→2; 0.5→1; 1→0
-    if min_hold < 0: min_hold = 0
-    if min_hold > 3: min_hold = 3
+    # ⭐ 2026-08-22 修复"点击经常误判"：最小稳定帧数 MIN_BEND_HOLD 全档位 +1（过滤单帧/双帧假尖峰）
+    #   原映射（速度越快允许越少帧）：speed=0→2, 0.5→1, 1→0
+    #   新映射：speed=0→3, 0.5→2, 0.6→2, 0.8→1, 1→1
+    #     · 新手慢速档(0~0.2)：3 帧弯曲稳定 → 必须"连续 3 帧都明显弯"才进 BEND_HOLD（最稳，误触几乎为 0）
+    #     · 默认档(0.4~0.7)：2 帧弯曲稳定（原极速档=1 帧，现在默认档=2 帧，响应速度仍够、但过滤单帧噪声）
+    #     · 极速档(0.8~1.0)：1 帧稳定（高级用户可接受偶尔误触换速度）
+    min_hold_raw = int(round(2.0 - 2.0 * speed)) + 1
+    min_hold = 1 if min_hold_raw < 1 else (4 if min_hold_raw > 4 else min_hold_raw)
     tap_max     = int(round(14.0 + 14.0 * speed))  # 14 ~ 28 帧
     stable_thr  = 0.020 - 0.015 * speed            # 0.020 ~ 0.005
     stable_min  = 2  # 保持稳定最小帧数不变（这是防抖用的，速度不应该影响它）
     long_press  = 22  # 用户要求恢复22帧长按，保持
+
+    # ⭐ 2026-08-22 差分点击参数联动
+    #   - DOWN_DI_SUM：hardness=0 → 0.08（松），hardness=1 → 0.14（严）；speed 越大略减（更灵）
+    #   - UP_DI_SUM  : 同步 = DOWN_DI_SUM * 0.72（松开通常幅度小，按下去必须更明确）
+    #   - DI_WINDOW  : speed=0 → 6帧，speed=0.5 → 5帧，speed=1 → 4帧
+    #   ⭐ 2026-08-24 适配 v2 关节角度弯曲度：基准整体 ×0.72（补偿 v2 Δ 比旧 dist_bend 略小的问题）
+    down_di = 0.08 + 0.06 * hardness - 0.022 * speed
+    down_di = 0.06 if down_di < 0.06 else (0.16 if down_di > 0.16 else float(round(down_di, 4)))
+    up_di   = float(round(down_di * 0.72, 4))
+    di_win  = int(round(6.0 - 2.0 * speed))
+    di_win  = 4 if di_win < 4 else (7 if di_win > 7 else di_win)
 
     return dict(
         ENTER_BEND_RATIO   = round(enter, 4),
@@ -109,18 +158,23 @@ def resolve_tap_params(hardness: float | None = None,
         BEND_STABLE_THRESH = round(stable_thr, 4),
         BEND_STABLE_MIN_HOLD = stable_min,
         COOLDOWN_FRAMES    = COOLDOWN_FRAMES,
+        # ⭐ 差分点击新增参数
+        DI_WINDOW          = di_win,
+        TAP_DOWN_DI_SUM    = down_di,
+        TAP_UP_DI_SUM      = up_di,
+        MIN_ABS_BEND_RATIO_FOR_DELTA = MIN_ABS_BEND_RATIO_FOR_DELTA,
         # 保留用户传入的 hardness/speed 原始值（给 UI 展示）
         _hardness          = hardness,
         _speed             = speed,
     )
 
 class _S:
-    IDLE        = "IDLE"          # 伸直待机（学习伸直基线）
-    BEND_ARMED  = "BEND_ARMED"    # 刚检测到弯曲，等待下一帧确认
-    BEND_HOLD   = "BEND_HOLD"     # 弯曲中：区分是 tap 还是 long-press
-    PRESSED     = "PRESSED"       # long-press 已经触发 mouseDown，当前按住=拖拽
-    TAPPED      = "TAPPED"        # tap已触发（只是1帧态，立刻入冷却）
-    COOLDOWN    = "COOLDOWN"
+    IDLE        = 0  # 伸直待机（学习伸直基线） → 匹配 hands_tasks.py _STATE_NAMES[0]="IDLE"
+    BEND_ARMED  = 1  # 刚检测到弯曲，等待下一帧确认 → 映射 "ARM"（_STATE_NAMES[1]）
+    BEND_HOLD   = 2  # 弯曲中：区分是 tap 还是 long-press → 映射 "HOLD"（_STATE_NAMES[2]）
+    PRESSED     = 3  # long-press 已经触发 mouseDown，当前按住=拖拽 → 映射 "PRS"（_STATE_NAMES[3]）
+    COOLDOWN    = 4  # 冷却 → 映射 "COOL"（_STATE_NAMES[4]）
+    TAPPED      = 5  # tap已触发（1帧瞬态，立刻入COOLDOWN；_STATE_NAMES无映射=不会出现在日志，安全）
 
 class E:
     NONE       = 0
@@ -147,6 +201,15 @@ class FingerTapClickDetector:
         self._stable_frames = 0          # 连续"弯曲深度稳定"的帧数
         self._cooldown_frames = 0
 
+        # ⭐ 2026-08-22 差分点击新增状态
+        #   _bend_ratio_hist：连续最近 N 帧 bend_ratio（=smoothed_bend / baseline），maxlen=8 够覆盖窗口波动
+        self._bend_ratio_hist: deque = deque(maxlen=8)
+        #   标记当前 ARMED→HOLD→PRESSED 这段是「差分进入」还是「绝对兜底进入」，影响 EXIT 判据优先级
+        self._armed_by_delta = False
+        #   本帧计算出的差分和（给 metrics/UI 展示用）
+        self._di_sum_neg_now = 0.0  # ΣΔ<0 的总和 = 按下去的累积（负值；触发时 ≤ -DOWN_DI）
+        self._di_sum_pos_now = 0.0  # ΣΔ>0 的总和 = 抬起来的累积（正值；触发时 ≥ +UP_DI）
+
         self.tap_count = 0
         self.long_count = 0
         self.last_tap_time = None
@@ -165,6 +228,11 @@ class FingerTapClickDetector:
         self._bend_total_frames = 0
         self._stable_frames = 0
         self._cooldown_frames = 0
+        # 差分点击状态也同步清空
+        self._bend_ratio_hist.clear()
+        self._armed_by_delta = False
+        self._di_sum_neg_now = 0.0
+        self._di_sum_pos_now = 0.0
         # 计数器保留（让 UI 统计不丢），若想清空可自行注释放开：
         # self.tap_count = 0
         # self.long_count = 0
@@ -182,6 +250,37 @@ class FingerTapClickDetector:
     def params(self) -> dict:
         return dict(self._p)
 
+    # ---------------------- 内部：一阶差分计算 ----------------------
+    def _compute_di_sums(self, bend_ratio_now: float):
+        """把当前 bend_ratio 入队，然后计算：
+          - di_sum_neg = 最近 DI_WINDOW 帧 一阶差分中 负值的总和（向下按：bend_ratio↓ → Δ<0，累加其绝对值）
+            注意：bend_ratio 越大=越伸直；所以"食指弯下去" = bend_ratio 变小 → 每帧 Δ=br_now - br_prev < 0。
+            为了 UI 展示和阈值判断直观，di_sum_neg 存「负值累积的绝对值」，即一个正数。
+          - di_sum_pos = 最近 DI_WINDOW 帧 一阶差分中 正值的总和（向上抬：bend_ratio↑ → Δ>0）
+        返回：(di_sum_neg, di_sum_pos)，都是非负实数。
+        """
+        self._bend_ratio_hist.append(float(bend_ratio_now))
+        win = self._p["DI_WINDOW"]
+        if len(self._bend_ratio_hist) < 2:
+            self._di_sum_neg_now = 0.0
+            self._di_sum_pos_now = 0.0
+            return 0.0, 0.0
+        # 取最近 win 个（最多 deque 里有的）算差分
+        hist = list(self._bend_ratio_hist)
+        if len(hist) > win + 1:
+            hist = hist[-(win + 1):]
+        neg = 0.0
+        pos = 0.0
+        for i in range(1, len(hist)):
+            d = hist[i] - hist[i - 1]  # bend_ratio 差分（正=伸直，负=弯曲）
+            if d < 0:
+                neg += (-d)  # 负值→按下去的幅度累积（正数）
+            elif d > 0:
+                pos += d     # 正值→抬起来的幅度累积（正数）
+        self._di_sum_neg_now = float(round(neg, 5))
+        self._di_sum_pos_now = float(round(pos, 5))
+        return self._di_sum_neg_now, self._di_sum_pos_now
+
     # ---------------------- 主入口 ----------------------
     def update(self, bend: float | None) -> int:
         """
@@ -198,11 +297,16 @@ class FingerTapClickDetector:
             if self._cooldown_frames <= 0:
                 self.state = _S.IDLE
                 self._bend_hold_frames = 0
+                self._armed_by_delta = False
             self._update_baseline(bend, can_update=True)
             return E.NONE
 
         # ---- 无手：回到IDLE；若之前按住则释放 ----
         if bend is None:
+            # ⭐ 差分队列清空（下一次有手是全新场景，不能带上旧差分）
+            self._bend_ratio_hist.clear()
+            self._di_sum_neg_now = 0.0
+            self._di_sum_pos_now = 0.0
             if self.state in (_S.BEND_HOLD, _S.BEND_ARMED):
                 pass  # 只是中间态，不算
             elif self.state == _S.PRESSED:
@@ -235,30 +339,61 @@ class FingerTapClickDetector:
         if self._baseline is None:
             self._baseline = self._smoothed_bend
 
+        # ---- bend_ratio（归一化弯曲度 = 当前伸直度 / 伸直基线）+ 一阶差分 ----
+        #   含义：1.00 = 完全伸直（和基线一致）；0.50 = 弯到一半；0.25 = 弯得很深
+        B = self._smoothed_bend
+        bend_ratio = B / max(self._baseline, 1e-6)
+        # ⭐ 计算差分（push 到历史队列 + 返回 ΣΔ负 / ΣΔ正）
+        di_sum_down, di_sum_up = self._compute_di_sums(bend_ratio)
+
         # 计算 参考阈值（基于 伸直基线）
         enter_t = self._baseline * self._p["ENTER_BEND_RATIO"]
         exit_t  = self._baseline * self._p["EXIT_BEND_RATIO"]
         # 下降幅度 = 相对近期伸直高值的跌幅
         drop = 0.0 if self._max_recent_bend is None else (self._max_recent_bend - self._smoothed_bend) / max(self._max_recent_bend, 1e-6)
 
+        # ⭐ 差分/绝对双判据的"按下判定"和"松开判定"封装
+        #   down_trigger = 进入弯曲（IDLE→ARMED）
+        down_delta = (di_sum_down >= self._p["TAP_DOWN_DI_SUM"]) and (
+            bend_ratio <= min(self._p["MIN_ABS_BEND_RATIO_FOR_DELTA"],
+                              self._p["ENTER_BEND_RATIO"] + 0.06)
+        )
+        down_abs   = (B < enter_t) and (drop > self._p["MIN_BEND_DROP"])
+        down_trigger = down_delta or down_abs
+
+        #   up_trigger = 从弯曲回到伸直（BEND_HOLD→TAP / PRESSED→LONG_UP）
+        #   【优先级】：如果当前这段是「差分进入」(armed_by_delta=True)，先看差分松手；否则看绝对松手；
+        #   再用另一种判据兜底 OR，确保不会漏。
+        if self._armed_by_delta:
+            up_delta_first = di_sum_up >= self._p["TAP_UP_DI_SUM"]
+            up_abs_fallback = B >= exit_t
+            up_trigger = up_delta_first or up_abs_fallback
+        else:
+            up_abs_first = B >= exit_t
+            up_delta_fallback = di_sum_up >= self._p["TAP_UP_DI_SUM"]
+            up_trigger = up_abs_first or up_delta_fallback
+
         # ================= 状态流转 =================
-        B = self._smoothed_bend
 
         if self.state == _S.IDLE:
             self._update_baseline(B, can_update=True)
-            if B < enter_t and drop > self._p["MIN_BEND_DROP"]:
+            if down_trigger:
                 self.state = _S.BEND_ARMED
                 self._bend_hold_frames = 1
                 self._bend_total_frames = 1
                 self._stable_frames = 0
+                # ⭐ 标记这次进入方式（决定 EXIT 判据的优先级）
+                self._armed_by_delta = bool(down_delta and not down_abs)  # 纯差分进入 = True；兜底或同时 = False 归绝对
             elif B > self._baseline * 0.97:
                 # 非常接近伸直 → 快速更新基线，避免基线长期滞后用户真实伸直姿态变化
                 self._baseline = BASELINE_ALPHA_FAST * B + (1 - BASELINE_ALPHA_FAST) * self._baseline
 
         elif self.state == _S.BEND_ARMED:
-            if B < enter_t:
+            # ARMED 的下一帧：仍需满足"还没回到伸直"（不能刚一帧就直接弹回去=尖峰）
+            still_down = (di_sum_down >= max(0.0, self._p["TAP_DOWN_DI_SUM"] * 0.35)) or (B < enter_t + self._baseline * 0.03)
+            if still_down:
                 self._bend_hold_frames += 1
-                self._bend_total_frames   += 1
+                self._bend_total_frames += 1
                 if self._bend_hold_frames >= self._p["MIN_BEND_HOLD"]:
                     self.state = _S.BEND_HOLD
             else:
@@ -267,13 +402,14 @@ class FingerTapClickDetector:
                 self._bend_hold_frames = 0
                 self._bend_total_frames = 0
                 self._stable_frames = 0
+                self._armed_by_delta = False
 
         elif self.state == _S.BEND_HOLD:
             # ✨ 总帧数：从 ENTER 开始累计（不管有没有稳定，都要算在 TAP_MAX_FRAMES 时间窗里）
             self._bend_total_frames += 1
 
             # ---------------- 修复1：先判断 EXIT（伸直回弹） → 优先于 LONG_PRESS ----------------
-            if B >= exit_t:
+            if up_trigger:
                 # -------- 修复3：快速短按优先级。总帧数 <= TAP_MAX_FRAMES 一律按 TAP，绝不能算长按 --------
                 if self._bend_total_frames <= self._p["TAP_MAX_FRAMES"]:
                     self.event_this_frame = E.TAP_CLICK
@@ -315,7 +451,7 @@ class FingerTapClickDetector:
                 self.last_long_time = time.time()
 
         elif self.state == _S.PRESSED:
-            if B >= exit_t:
+            if up_trigger:
                 # 松开 → release
                 self.event_this_frame = E.LONG_UP
                 self.last_long_time = time.time()
@@ -342,6 +478,13 @@ class FingerTapClickDetector:
         self._bend_hold_frames = 0
         self._bend_total_frames = 0
         self._stable_frames = 0
+        self._armed_by_delta = False
+        # ⭐ 冷却时不清空 bend_ratio_hist（保留弯曲尾部的差分，让"连点"的第二次 tap 也能被差分准确识别）
+        #   但要手动 push 一个"当前伸直值"，让下一帧 IDLE 阶段的 ΣΔ 不会被上一个 tap 的尾巴误触发
+        if self._baseline is not None and self._smoothed_bend is not None:
+            # 推两帧伸直基线 → 差分立刻回 0，防止连点残留
+            for _ in range(2):
+                self._bend_ratio_hist.append(self._smoothed_bend / max(self._baseline, 1e-6))
 
     # ---------------------- 查询 / 绘制 ----------------------
     def metrics(self) -> dict:
@@ -360,6 +503,16 @@ class FingerTapClickDetector:
             "cooldown_left":  max(0, self._cooldown_frames),
             "tap_count":      self.tap_count,
             "long_count":     self.long_count,
+            # ⭐ 差分点击新增字段（给 UI 条/调试）
+            "bend_ratio":     round(
+                (self._smoothed_bend / max(self._baseline, 1e-6)) if (self._baseline is not None and self._smoothed_bend is not None) else 0.0,
+                4),
+            "di_sum_down":    round(self._di_sum_neg_now, 4),   # 向下按=正值（累积 Σ|Δ负|）
+            "di_sum_up":      round(self._di_sum_pos_now, 4),   # 向上抬=正值（累积 ΣΔ正）
+            "DI_DOWN_THR":    round(self._p["TAP_DOWN_DI_SUM"], 4),
+            "DI_UP_THR":      round(self._p["TAP_UP_DI_SUM"],   4),
+            "DI_WINDOW":      self._p["DI_WINDOW"],
+            "armed_by_delta": bool(self._armed_by_delta),
             # 把硬度速度也放进去，方便上层 UI 直接拿
             "hardness_pct":   self.hardness_pct,
             "speed_pct":      self.speed_pct,
