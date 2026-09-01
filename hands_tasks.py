@@ -1455,11 +1455,17 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
             else:
-                # 无预览模式也需要让 OpenCV 内部事件泵偶尔动动（其实纯 cv2 可以不用，但保险起见加个极短 wait）
-                try:
-                    cv2.waitKey(1)
-                except Exception:
-                    pass
+                # ⚠️ 2026-08-26 核心修复（无预览=不能控制鼠标根因）：
+                #   无任何 imshow / namedWindow 的情况下，Windows 版 OpenCV 的 cv2.waitKey(1)
+                #   因为 HighGUI 消息泵没有窗口可挂，会进入「死等键盘事件」阻塞（不是1ms立即返回）
+                #   → 主循环每帧卡死在这里，move_only() / handle_finger_tap_event() 虽然已经执行完，
+                #     但下一轮循环永远到不了 → 用户体感「鼠标完全不动」。
+                #   修复：纯后台模式直接用 time.sleep(0.001)（1ms 轻量级调度让步，纯时间，不进 HighGUI）。
+                time.sleep(0.001)
+                # 无预览模式额外心跳（~每 2 秒 1 次，与输入无关）：证明循环在跑，方便排查静默状态
+                if (_log_cnt % 120 == 0) and (_log_cnt > 0):
+                    print(f"[RUN-OK bg-mode] frame={_log_cnt:>5} FPS={_fps_display:5.1f} preview=OFF gesture_left={hand_results.get('Left',(None,))[0]} move_ok={right_screen_pt is not None} tap_event={tap_event}",
+                          flush=True)
 
     # ================== finally：100% 与原 main.py 行为一致 ==================
     except Exception as e:
