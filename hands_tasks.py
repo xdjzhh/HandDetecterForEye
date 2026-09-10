@@ -18,8 +18,13 @@ import argparse
 import copy as _cp
 import math as _mt
 import os
+import re
+import threading
 import time
 from collections import deque  # ⭐ 新增：palm_n 滑窗稳定性判断（index_bend 误判过滤）
+# ⭐ 2026-09-10 摄像头加固：必须在 import cv2 之前设置——
+#   禁用 OpenCV MSMF 后端的硬件 MediaFoundation 变换（部分 UVC 相机因此持续输出黑帧，OpenCV 官方已知问题）
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 import cv2
 import numpy as np
 
@@ -201,6 +206,8 @@ def _draw_tap_bar(frame, tm: dict, det: FingerTapClickDetector | None = None):
     st = tm["state"]
     if st in (_TS.BEND_ARMED, _TS.BEND_HOLD, _TS.TAPPED):
         fill_c = (0, 0, 255)
+    elif st == _TS.WAIT_DBL:
+        fill_c = (255, 0, 255)  # 双击等待窗口=品红（单击挂起中）
     elif st == _TS.PRESSED:
         fill_c = (0, 200, 255)
     elif st == _TS.COOLDOWN:
@@ -220,6 +227,7 @@ def _draw_tap_bar(frame, tm: dict, det: FingerTapClickDetector | None = None):
         _TS.BEND_ARMED: ("食指弯曲确认中…",      (80, 180, 255)),
         _TS.BEND_HOLD:  (f"弯曲保持 {tm['hold_frames']} 帧",  (0, 180, 255)),
         _TS.TAPPED:     ("✅ TAP 单击触发!",     (60, 60, 255)),
+        _TS.WAIT_DBL:   (f"等待第二次点击(双击)… {tm.get('dbl_window_left', 0):.2f}s", (255, 0, 255)),
         _TS.PRESSED:    ("🔒 按住拖拽中",          (0, 200, 255)),
         _TS.COOLDOWN:   (f"冷却 {tm['cooldown_left']} 帧",   (180, 180, 180)),
     }
@@ -364,6 +372,549 @@ def init_models(args):
 
 
 # ======================================================================
+# 摄像头稳健打开（2026-09-10 加固，解决"冷启动黑屏/卡死，先开 Windows 设置测试后才能用"）
+# ======================================================================
+_CAM_WARMUP_FRAMES  = 25    # 预热读帧上限（30fps≈0.8s，等自动曝光/白平衡收敛 + USB 管线跑通）
+_CAM_MIN_NONBLACK   = 6     # 预热期至少多少帧"非全黑"才判定相机活着
+_CAM_BLACK_MEAN_THR = 10.0  # 帧平均亮度 < 此值 = 黑帧（正常室内画面均值通常 40~130；死相机输出≈0）
+
+
+def _warmup_capture(cap, max_frames=_CAM_WARMUP_FRAMES, min_nonblack=_CAM_MIN_NONBLACK):
+    """打开后连续读帧预热：丢黑帧、等自动曝光收敛。
+    返回 (ok, n_read, n_nonblack, elapsed_ms, last_mean)。
+    两阶段：冷启动相机自动曝光/USB 管线唤醒可能 >25 帧——若读得到帧但全黑，
+    再续读一轮（共 ~50 帧 ≈1.6s）；一帧都读不到（设备死/卡）则不等第二轮。"""
+    t0 = time.perf_counter()
+    n_read = 0
+    n_nonblack = 0
+    last_mean = 0.0
+    for _phase in range(2):
+        for _ in range(max_frames):
+            try:
+                ok_r, frame = cap.read()
+            except Exception:
+                ok_r, frame = False, None
+            if not ok_r or frame is None:
+                time.sleep(0.02)
+                continue
+            n_read += 1
+            try:
+                last_mean = float(frame.mean())
+            except Exception:
+                last_mean = 0.0
+            if last_mean >= _CAM_BLACK_MEAN_THR:
+                n_nonblack += 1
+                if n_nonblack >= min_nonblack:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                    return True, n_read, n_nonblack, elapsed_ms, last_mean
+        # 一帧都没读到 = 设备死/卡住，不必再等第二轮
+        if n_read == 0:
+            break
+        # 读到帧但全黑 = 可能冷启动曝光未收敛，续读一轮
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    return (n_nonblack >= min_nonblack), n_read, n_nonblack, elapsed_ms, last_mean
+
+
+def _run_in_com_thread(fn):
+    """在一次性 MTA 线程里执行 COM 枚举函数，返回其结果（异常返回 []）。
+    🔴 关键（2026-09-10 真机实测）：绝不能在"稍后要用 OpenCV MSMF 开相机"的
+       线程里调用 CoInitializeEx——该线程无论初始化为 MTA 还是 STA，cap_msmf
+       的设备激活都会走跨单元慢路径：VideoCapture 构造 ~18s + 设分辨率 ~58s
+       （对比：未初始化 COM 的线程构造只要 0.4s）。因此所有 CoInitializeEx
+       只在这个专用线程里做，线程结束前 CoUninitialize、线程随即销毁，
+       对调用方线程（run_loop 开相机线程）零 COM 状态污染。"""
+    import ctypes
+    box = {}
+
+    def _work():
+        try:
+            ctypes.windll.ole32.CoInitializeEx(None, 0)  # MTA
+        except Exception:
+            pass
+        try:
+            box["r"] = fn()
+        except Exception as e:
+            box["e"] = repr(e)
+        finally:
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except Exception:
+                pass
+
+    th = threading.Thread(target=_work, daemon=True)
+    th.start()
+    th.join()
+    if "e" in box:
+        return []
+    return box.get("r") or []
+
+
+def _list_dshow_cameras():
+    """枚举 DirectShow 视频输入设备（公开入口，内部在专用 COM 线程执行）。"""
+    return _run_in_com_thread(_dshow_enum_impl)
+
+
+def _dshow_enum_impl():
+    """枚举 DirectShow 视频输入设备，返回 [(index, friendly_name, device_path), ...]；失败返回 []。
+    纯 ctypes COM（零新依赖）。
+    🔴 这是"对标 Windows 设置"的关键：设置按设备身份（USB 符号链接/友好名）枚举、点哪台开哪台；
+       OpenCV 只能按枚举索引打开，且 DSHOW/MSMF 枚举顺序不一致、MSMF 打开失败会静默回退默认设备。
+       先拿到真实清单再按名字打开，才能保证"选对物理摄像头"。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD),
+                    ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    class _VARIANT(ctypes.Structure):
+        _fields_ = [("vt", wintypes.USHORT),
+                    ("_r1", wintypes.USHORT),
+                    ("_r2", wintypes.USHORT),
+                    ("_r3", wintypes.USHORT),
+                    ("bstrVal", ctypes.c_void_p),
+                    ("_pad", ctypes.c_void_p)]
+
+    ole32 = ctypes.windll.ole32
+    try:
+        ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED；已初始化/模式冲突返回值忽略
+    except Exception:
+        pass
+    # 🔴 不要给共享的 ole32 函数设置带局部 _GUID 类的 argtypes：windll 函数对象的
+    #    argtypes 是进程级缓存，局部 _GUID 类每次调用都新建，会让另一个枚举函数
+    #    （_mf_enum_impl，用自己的局部 _GUID）调用时抛 ArgumentError、被吞成"0 台"。
+    _CLSIDFromString = ole32.CLSIDFromString
+    _CoCreateInstance = ole32.CoCreateInstance
+
+    def _guid(s):
+        g = _GUID()
+        _CLSIDFromString(s, ctypes.byref(g))
+        return g
+
+    CLSID_SystemDeviceEnum = _guid("{62BE5D10-60EB-11d0-BD3B-00A0C911CE86}")
+    CLSID_VideoInputDevice  = _guid("{860BB310-5D01-11d0-BD3B-00A0C911CE86}")
+    IID_ICreateDevEnum      = _guid("{29840822-5B84-11D0-BD3B-00A0C911CE86}")
+    IID_IEnumMoniker        = _guid("{00000102-0000-0000-C000-000000000046}")
+    IID_IPropertyBag        = _guid("{55272A00-42CB-11CE-8135-00AA004BB851}")
+
+    def _vtbl(p, idx):
+        tbl = ctypes.cast(p, ctypes.POINTER(ctypes.c_void_p))[0]
+        return ctypes.cast(tbl, ctypes.POINTER(ctypes.c_void_p))[idx]
+
+    def _release(p):
+        if p:
+            try:
+                ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(_vtbl(p, 2))(p)
+            except Exception:
+                pass
+
+    dev_enum = ctypes.c_void_p()
+    hr = _CoCreateInstance(ctypes.byref(CLSID_SystemDeviceEnum), None, 1 | 4,
+                           ctypes.byref(IID_ICreateDevEnum), ctypes.byref(dev_enum))
+    if hr != 0 or not dev_enum:
+        return []
+    mon_enum = ctypes.c_void_p()
+    _CreateEnum = ctypes.WINFUNCTYPE(wintypes.LONG, ctypes.c_void_p,
+                                     ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p),
+                                     wintypes.DWORD)
+    hr = _CreateEnum(_vtbl(dev_enum, 3))(dev_enum, ctypes.byref(CLSID_VideoInputDevice),
+                                         ctypes.byref(mon_enum), 0)
+    _release(dev_enum)
+    if hr != 0 or not mon_enum:
+        return []
+
+    cams = []
+    try:
+        _Next = ctypes.WINFUNCTYPE(wintypes.LONG, ctypes.c_void_p,
+                                   wintypes.ULONG, ctypes.POINTER(ctypes.c_void_p),
+                                   ctypes.POINTER(wintypes.ULONG))
+        _BindToStorage = ctypes.WINFUNCTYPE(wintypes.LONG, ctypes.c_void_p,
+                                            ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p))
+        _Read = ctypes.WINFUNCTYPE(wintypes.LONG, ctypes.c_void_p,
+                                   wintypes.LPCWSTR, ctypes.POINTER(_VARIANT), ctypes.c_void_p)
+        f_next = _Next(_vtbl(mon_enum, 3))
+        idx = 0
+        while True:
+            mon = ctypes.c_void_p()
+            fetched = wintypes.ULONG(0)
+            if f_next(mon_enum, 1, ctypes.byref(mon), ctypes.byref(fetched)) != 0 \
+                    or not fetched.value or not mon:
+                break
+            name, path = "", ""
+            bag = ctypes.c_void_p()
+            # IMoniker vtable：IUnknown(0-2) → IPersist::GetClassID(3) →
+            # IPersistStream::IsDirty/Load/Save/GetSizeMax(4-7) → IMoniker::BindToObject(8)/BindToStorage(9)
+            if _BindToStorage(_vtbl(mon, 9))(mon, None, None,
+                                             ctypes.byref(IID_IPropertyBag), ctypes.byref(bag)) == 0 and bag:
+                f_read = _Read(_vtbl(bag, 3))
+                for key, is_path in (("FriendlyName", False), ("Description", False), ("DevicePath", True)):
+                    var = _VARIANT()
+                    if f_read(bag, key, ctypes.byref(var), None) == 0 and var.vt == 8 and var.bstrVal:
+                        try:
+                            val = ctypes.cast(var.bstrVal, wintypes.LPWSTR).value or ""
+                        except Exception:
+                            val = ""
+                        try:
+                            ctypes.windll.oleaut32.SysFreeString(var.bstrVal)
+                        except Exception:
+                            pass
+                        if is_path:
+                            path = path or val
+                        else:
+                            name = name or val
+                _release(bag)
+            _release(mon)
+            cams.append((idx, name or f"Camera{idx}", path))
+            idx += 1
+    finally:
+        _release(mon_enum)
+    return cams
+
+
+def _list_mf_cameras():
+    """枚举 Media Foundation 视频捕获设备（公开入口，内部在专用 COM 线程执行）。"""
+    return _run_in_com_thread(_mf_enum_impl)
+
+
+def _mf_enum_impl():
+    """枚举 Media Foundation 视频捕获设备（实时清单），返回 [(index, friendly_name, symbolic_link), ...]。
+    🔴 这就是 Windows 设置里的相机列表，也是 OpenCV MSMF 后端内部使用的同一枚举
+       （cap_msmf 用 MFEnumDeviceSources 按序取第 N 个）——因此这里拿到的 index 与
+       cv2.VideoCapture(i, CAP_MSMF) 打开的物理设备严格一一对应。
+       相比之下 DSHOW 过滤器表在摄像头重插/换 USB 口后会残留陈旧 moniker（isOpened=False）。
+    纯 ctypes 调 mfplat.dll，零新依赖。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD),
+                    ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    def _guid(s):
+        g = _GUID()
+        ctypes.windll.ole32.CLSIDFromString(s, ctypes.byref(g))
+        return g
+
+    # 属性键 GUID（本机 mfidl.h 实测，EXTERNS_GUID 原值；网上旧博客流传的
+    # {975E5F5E...}/{CA179C15...} 等是错的，用错会导致 MFEnumDeviceSources
+    # 返回 MF_E_ATTRIBUTENOTFOUND(0xC00D36E6)）
+    _KEY_SOURCE_TYPE = _guid("{C60AC5FE-252A-478F-A0EF-BC8FA5F7CAD3}")
+    _VAL_VIDCAP       = _guid("{8AC3587A-4AE7-42D8-99E0-0A6013EEF90F}")
+    _KEY_FRIENDLY     = _guid("{60D0E559-52F8-4FA2-BBCE-ACDB34A8EC01}")
+    _KEY_SYMLINK      = _guid("{58F0AAD8-22BF-4F8A-BB3D-D2C4978C6E2F}")
+
+    try:
+        mfplat = ctypes.windll.mfplat
+        mf = ctypes.windll.mf  # MFEnumDeviceSources 在 mf.dll（不在 mfplat.dll）
+    except Exception:
+        return []
+    # MFStartup 传 MF_VERSION = (MF_SDK_VERSION=2 << 0) | (MF_API_VERSION=0x70 << 16)
+    # = 0x00020070。注意：① 0x700002 字节序反了会被拒(0xC00D36E3)；
+    # ② 传 0x2 虽然返回 S_OK，但平台实际未完全初始化。
+    # 进程内只启动一次（引用计数），且永不 MFShutdown——OpenCV MSMF 后端也要用 MF。
+    if not getattr(_list_mf_cameras, "_mf_started", False):
+        try:
+            if mfplat.MFStartup(0x00020070, 0) == 0:
+                _list_mf_cameras._mf_started = True
+        except Exception:
+            return []
+
+    mfplat.MFCreateAttributes.restype = wintypes.LONG
+    mfplat.MFCreateAttributes.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                          ctypes.c_uint32]
+
+    def _vtbl(p, idx):
+        tbl = ctypes.cast(p, ctypes.POINTER(ctypes.c_void_p))[0]
+        return ctypes.cast(tbl, ctypes.POINTER(ctypes.c_void_p))[idx]
+
+    def _release(p):
+        if p:
+            try:
+                ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(_vtbl(p, 2))(p)
+            except Exception:
+                pass
+
+    attrs = ctypes.c_void_p()
+    if mfplat.MFCreateAttributes(ctypes.byref(attrs), 1) != 0 or not attrs:
+        return []
+    try:
+        # IMFAttributes vtable 顺序（本机 mfobjects.h 实测，Get 系列在前 Set 在后，
+        # 与很多旧资料写的序号不同）：
+        #   GetGUID=10 / GetAllocatedString=13 / DeleteAllItems=20 /
+        #   SetUINT32=21 / SetGUID=24 / SetString=25 / GetCount=30
+        _SetGUID = ctypes.WINFUNCTYPE(wintypes.LONG, ctypes.c_void_p,
+                                      ctypes.POINTER(_GUID), ctypes.POINTER(_GUID))
+        if _SetGUID(_vtbl(attrs, 24))(attrs, ctypes.byref(_KEY_SOURCE_TYPE),
+                                      ctypes.byref(_VAL_VIDCAP)) != 0:
+            return []
+
+        mf.MFEnumDeviceSources.restype = wintypes.LONG
+        mf.MFEnumDeviceSources.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.POINTER(ctypes.c_uint32)]
+        arr = ctypes.POINTER(ctypes.c_void_p)()
+        count = ctypes.c_uint32(0)
+        if mf.MFEnumDeviceSources(attrs, ctypes.byref(arr), ctypes.byref(count)) != 0:
+            return []
+
+        # IMFAttributes::GetAllocatedString = vtable slot 13
+        _GetStr = ctypes.WINFUNCTYPE(wintypes.LONG, ctypes.c_void_p,
+                                     ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p),
+                                     ctypes.POINTER(ctypes.c_uint32))
+        _CoTaskMemFree = ctypes.windll.ole32.CoTaskMemFree
+        cams = []
+        try:
+            for i in range(int(count.value)):
+                act = arr[i]
+                name, link = "", ""
+                for key, is_link in ((_KEY_FRIENDLY, False), (_KEY_SYMLINK, True)):
+                    out = ctypes.c_void_p()
+                    nch = ctypes.c_uint32(0)
+                    if _GetStr(_vtbl(act, 13))(act, ctypes.byref(key),
+                                               ctypes.byref(out), ctypes.byref(nch)) == 0 and out:
+                        try:
+                            val = ctypes.cast(out, wintypes.LPWSTR).value or ""
+                        except Exception:
+                            val = ""
+                        _CoTaskMemFree(out)
+                        if is_link:
+                            link = link or val
+                        else:
+                            name = name or val
+                cams.append((i, name or f"Camera{i}", link))
+                _release(act)
+        finally:
+            try:
+                _CoTaskMemFree(arr)
+            except Exception:
+                pass
+        return cams
+    finally:
+        _release(attrs)
+
+
+def _open_backend_once(cid, be, be_name, round_idx, target_w, target_h, _mjpg, attempts, dev_name=None):
+    """单次指定后端打开 + 协商 + 预热。成功返回 (cap, info_fields)，失败返回 (None, None)。
+    注意：OpenCV 5.0 的 DSHOW/MSMF 后端都只接受 index（不支持按名字打开）——设备身份
+    核验在 _open_camera_robust 的枚举层完成（MF 枚举顺序与 MSMF 后端严格一致），
+    dev_name 仅用于日志展示。"""
+    name, be = be_name, be
+    cap = None
+    try:
+        t0 = time.perf_counter()
+        _tag = f"index{int(cid)}({dev_name!r})" if dev_name else f"index{int(cid)}"
+        cap = cv2.VideoCapture(int(cid), be)
+        if cap is None or not cap.isOpened():
+            attempts.append(f"[{name}#轮{round_idx}]({_tag}) isOpened=False（设备不存在/被占用）")
+            if cap is not None:
+                try: cap.release()
+                except Exception: pass
+            return None, None
+
+        # ---- 媒体类型协商：先 MJPG，再分辨率、帧率 ----
+        try: cap.set(cv2.CAP_PROP_FOURCC, _mjpg)
+        except Exception: pass
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+        try: cap.set(cv2.CAP_PROP_FPS, 30)
+        except Exception: pass
+        aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        afps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+
+        # ---- 目标分辨率没协商上 → 降 VGA 重试 ----
+        if aw < target_w - 80 or ah < target_h - 80:
+            try: cap.set(cv2.CAP_PROP_FOURCC, _mjpg)
+            except Exception: pass
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            attempts.append(f"[{name}#轮{round_idx}] 目标{target_w}×{target_h}协商失败，已降 640×480")
+
+        # ---- 预热 + 黑帧检测 ----
+        ok_w, n_read, n_nonblack, w_ms, last_mean = _warmup_capture(cap)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        attempts.append(
+            f"[{name}#轮{round_idx}]({_tag}) open=OK {aw}×{ah}@{afps:.0f}fps "
+            f"预热:读{n_read}帧/非黑{n_nonblack}/末帧亮度{last_mean:.0f} "
+            f"预热{w_ms:.0f}ms/总{elapsed_ms:.0f}ms → {'✔采用' if ok_w else '✗全黑或死帧，弃用'}"
+        )
+        if ok_w:
+            return cap, dict(
+                backend=name, backend_id=int(be), width=aw, height=ah, fps=afps,
+                warmup_read=n_read, warmup_nonblack=n_nonblack,
+                warmup_ms=int(w_ms), open_ms=int(elapsed_ms), round=round_idx,
+                index_warning=False, device_name=(dev_name or f"index{int(cid)}"),
+            )
+        try: cap.release()
+        except Exception: pass
+        return None, None
+    except Exception as e:
+        attempts.append(f"[{name}#轮{round_idx}] exception: {e!r}")
+        if cap is not None:
+            try: cap.release()
+            except Exception: pass
+        return None, None
+
+
+def _open_camera_robust(cid, target_w=1280, target_h=720):
+    """稳健打开摄像头，返回 (cap, info_dict)；全部失败时 cap=None。
+
+    🔴 对标 Windows 设置（2026-09-10 真机定论）：
+      · 设置里的相机走 Media Foundation 实时枚举（MFEnumDeviceSources）+ Frame Server
+        管道，重插/换 USB 口都能秒开；OpenCV 的 MSMF 后端内部用的是**同一个枚举**，
+        所以 MSMF(index) 的 index 与我们自己枚举 MF 拿到的 index 严格一一对应。
+      · DSHOW 过滤器表在相机重插后会残留陈旧 moniker（实测 isOpened=False），
+        且枚举顺序与 MF 不一致（实测同机 MF: [0]外接[1]内置；DSHOW: [0]内置[1]外接）。
+    🔴 统一索引（2026-09-10 起）：
+      · **MF 实时清单是唯一的索引空间**——int cid = MF index、str cid = MF 友好名片段，
+        与 Windows 设置 / /cameras 接口返回的 index 完全一致；
+      · DSHOW 清单**不再参与定位**：仅在需要 DSHOW 备选后端时，按设备身份
+        （VID/PID，其次友好名）把同一物理设备翻译成 DSHOW 自己的本地 index 去打开；
+        查不到同名设备就跳过 DSHOW，❌绝不按位置开别的相机；
+      · 仅当 MF 枚举整体失败（清单为空）才降级用 DSHOW 清单定位，并显式告警。
+    流程：MF 实时清单定位 → MSMF 优先（与设置同管道）两轮预热唤醒，
+          失败再用身份映射后的 DSHOW 备选；MJPG 先设、分辨率降级、两阶段预热黑帧检测。
+    """
+    attempts = []
+    try:
+        _mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+    except Exception:
+        _mjpg = 0
+    t_all = time.perf_counter()
+
+    # ---- ① 双清单枚举：MF（实时真源） + DSHOW（参考） ----
+    mf_cams, ds_cams = [], []
+    try:
+        mf_cams = _list_mf_cameras()
+    except Exception as e:
+        attempts.append(f"[枚举] MF 设备枚举异常: {e!r}")
+    try:
+        ds_cams = _list_dshow_cameras()
+    except Exception as e:
+        attempts.append(f"[枚举] DSHOW 设备枚举异常: {e!r}")
+    if mf_cams:
+        attempts.append(f"[枚举] MF(=Windows设置同源) 检测到 {len(mf_cams)} 台相机: "
+                        + "；".join(f"[{i}] {n!r}" for i, n, _p in mf_cams))
+    else:
+        attempts.append("[枚举] MF 未枚举到相机（该管道不可用）")
+    if ds_cams:
+        attempts.append(f"[枚举] DSHOW 检测到 {len(ds_cams)} 台相机: "
+                        + "；".join(f"[{i}] {n!r}" for i, n, _p in ds_cams))
+
+    def _vidpid(path):
+        """从设备路径/符号链接提取 'vid_xxxx&pid_yyyy'（小写），用于跨后端物理身份匹配。"""
+        m = re.search(r"vid_[0-9a-f]{4}&pid_[0-9a-f]{4}", (path or ""), re.IGNORECASE)
+        return m.group(0).lower() if m else None
+
+    def _ds_idx_of_identity(dev_name, dev_path):
+        """把 MF 选定的物理设备翻译成 DSHOW 本地 index：VID/PID 严格匹配优先，
+        其次友好名精确/包含匹配；查不到返回 None（DSHOW 备选后端跳过，绝不按位置乱开）。"""
+        target_vp = _vidpid(dev_path)
+        if target_vp:
+            for i, n, p in ds_cams:
+                if _vidpid(p) == target_vp:
+                    return i
+        low = (dev_name or "").lower()
+        for i, n, _p in ds_cams:
+            if low and low == (n or "").lower():
+                return i
+        for i, n, _p in ds_cams:
+            if low and low in (n or "").lower():
+                return i
+        return None
+
+    # ---- ② 定位目标设备：MF 实时清单 = 唯一索引空间 ----
+    mf_idx, ds_idx, dev_name, dev_path = None, None, None, None
+    degraded = not mf_cams  # MF 管道整体不可用 → 才降级用 DSHOW 清单
+    if degraded and ds_cams:
+        attempts.append("[选择] ⚠ MF 实时枚举为空（管道不可用）→ 降级模式："
+                        "临时按 DSHOW 清单定位（index 以 DSHOW 清单为准），建议重启服务恢复 MF。")
+    pool = ds_cams if degraded else mf_cams
+
+    if isinstance(cid, str):
+        key = cid.lower().strip()
+        hit = [c for c in pool if key in (c[1] or "").lower()]
+        if not hit:
+            extra = ""
+            if not degraded:
+                ds_stale = [c for c in ds_cams if key in (c[1] or "").lower()]
+                if ds_stale:
+                    extra = ("；该名字只出现在 DSHOW 陈旧清单中——相机未真正在线"
+                             "（重插后 DSHOW moniker 残留），请重插相机并先在 Windows 设置里确认")
+            attempts.append(f"❌ 按名字 {cid!r} 未匹配到在线相机（实时清单见上{extra}）。")
+            return None, dict(attempts_summary=attempts)
+        dev_name, dev_path = hit[0][1], hit[0][2]
+        if degraded:
+            ds_idx = hit[0][0]
+        else:
+            mf_idx = hit[0][0]
+    else:
+        cid_int = int(cid)
+        if cid_int >= len(pool):
+            src = "MF 实时清单" if not degraded else "DSHOW 清单（降级模式）"
+            attempts.append(
+                f"❌ camera_id={cid_int} 越界：{src} 只有 {len(pool)} 台"
+                + ("：" + "；".join(f"[{i}] {n!r}" for i, n, _p in pool) if pool else "（为空）")
+                + f"。请用 /cameras 查看实时清单，或把 config.json 的 default_camera_id "
+                f"改为清单中的 index 或相机名字片段（如 \"HD\"）。❌ 不静默回退到其他相机。"
+            )
+            return None, dict(attempts_summary=attempts)
+        dev_name, dev_path = pool[cid_int][1], pool[cid_int][2]
+        if degraded:
+            ds_idx = cid_int
+        else:
+            mf_idx = cid_int
+
+    # 正常模式：DSHOW 仅按物理身份映射为备选后端的本地 index
+    if not degraded:
+        ds_idx = _ds_idx_of_identity(dev_name, dev_path)
+    attempts.append(
+        f"[选择] 目标设备 {dev_name!r}：统一 MF index={mf_idx}"
+        + (f"；DSHOW 备选后端映射到同身份设备 index={ds_idx}"
+           if ds_idx is not None else "；DSHOW 清单无同身份设备（备选后端跳过）")
+    )
+
+    # ---- ③ 按计划打开：MSMF 优先（设置同管道），DSHOW 仅备选；各两轮预热唤醒 ----
+    plans = []
+    if mf_idx is not None:
+        plans.append(("MSMF", cv2.CAP_MSMF, mf_idx))
+    if ds_idx is not None:
+        plans.append(("DSHOW", cv2.CAP_DSHOW, ds_idx))
+    if not plans:
+        attempts.append(f"❌ 相机 {dev_name!r} 无法定位到任何可打开的后端"
+                        f"（MF 清单为空且 DSHOW 清单也无此设备）。"
+                        f"请拔插相机后先在 Windows 设置里确认能看到它，再重试；或用相机名字选择。")
+        return None, dict(attempts_summary=attempts)
+
+    for be_name, be, idx in plans:
+        for round_idx in (1, 2):
+            cap, info = _open_backend_once(idx, be, be_name, round_idx,
+                                           target_w, target_h, _mjpg, attempts, dev_name=dev_name)
+            if cap is not None:
+                info["attempts_summary"] = attempts
+                info["open_ms"] = int((time.perf_counter() - t_all) * 1000.0)
+                info["index_warning"] = False  # 已通过 MF/DSHOW 双清单身份锚定
+                return cap, info
+            if round_idx == 1:
+                time.sleep(0.3)  # 给驱动 teardown/唤醒缓冲，再重开
+
+    attempts.append(
+        f"❌ 相机 {dev_name!r} 经 MSMF/DSHOW 两轮尝试仍打不开或持续黑帧——"
+        f"若 Windows 设置里能正常显示：请先关闭所有占用相机的程序（含本服务旧进程）后重试；"
+        f"若设置里也是黑的：检查镜头遮挡/IR 红外相机/线缆。"
+    )
+    return None, dict(attempts_summary=attempts)
+
+
+# ======================================================================
 # ④ run_loop(components, camera_id, stop_event, preview, status_store)
 #    完全对应原 main.py L239 (cap = VideoCapture) → L908 (finally destroyAllWindows)
 # ======================================================================
@@ -373,7 +924,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
     参数：
       components   : init_models() 返回的 dict（每次 /run 建议传新的组件，避免复用 closed detector）
-      camera_id    : 摄像头 ID，默认 0
+      camera_id    : 摄像头选择，默认 0；int = MF 实时清单 index（与 Windows 设置同源，
+                     /cameras 接口可查），str = 相机友好名片段（如 "HD"，不受枚举顺序影响）
       stop_event   : threading.Event；每帧开头先检查；set() 时立即干净退出（可 None = 纯脚本模式，靠 q 键退出）
       preview      : True=开 cv2.imshow 预览窗口；False=纯后台识别（不画窗）
       status_store : dict，写入实时状态（server.py 的 /status 接口直接读它）；None 时内部自动建一个（没用）
@@ -381,7 +933,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     写入 status_store 的字段（都是最简单的标量，读写无锁）：
       running            : bool   —— 是否处于主循环中（正常跑）
       fps                : float  —— 最近 ~0.5s 的 FPS（EMA 平滑）
-      current_camera_id  : int
+      current_camera_id  : int | str — 实际使用的相机选择（MF index 或名字片段）
       start_time_ms      : int    —— 进入循环的时间戳（ms）
       uptime_ms          : int    —— 已运行毫秒数
       last_left_gesture  : str or None
@@ -404,7 +956,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     start_ms = int(time.time() * 1000)
     status_store.clear()
     status_store.update(dict(
-        running=False, fps=0.0, current_camera_id=int(camera_id),
+        running=False, fps=0.0, current_camera_id=camera_id,
         start_time_ms=start_ms, uptime_ms=0,
         last_left_gesture=None, last_right_gesture=None,
         stretch_mode="IDLE", error=None,
@@ -464,59 +1016,47 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
     cap = None
     try:
-        # ---------- 打开摄像头（Windows 外置 USB 摄像头必须探测 CAP_DSHOW 后端） ----------
-        _cid = int(camera_id)
-        cap = None
-        _probe_log = []
-        _opened = False
-        # 优先尝试 DSHOW（外置 USB 摄像头在 Windows 上几乎必须用这个，否则要么打不开，要么 0.5fps 巨卡）
-        for _backend_name, _backend in [("DSHOW", cv2.CAP_DSHOW), ("DEFAULT", 0)]:
-            try:
-                t0 = time.perf_counter()
-                cap = cv2.VideoCapture(_cid, _backend) if _backend != 0 else cv2.VideoCapture(_cid)
-                ok_open = cap is not None and cap.isOpened()
-                t_open = (time.perf_counter() - t0) * 1000.0
-                ok_set_w = cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280) if ok_open else False
-                ok_set_h = cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720) if ok_open else False
-                ok_read, _ = cap.read() if ok_open else (False, None)
-                _probe_log.append(f"[{_backend_name}({_backend})#try1] opened={ok_open} bp={_backend}.0 set1280x720=({ok_set_w},{ok_set_h}) read1frame={ok_read} elapsed_ms={int(t_open)}")
-                if ok_open and ok_read:
-                    _opened = True
-                    _opened_backend = _backend_name
-                    print(f"[hands_tasks.run_loop] ✅ 摄像头 camera_id={_cid} 打开成功（后端={_backend_name}, 耗时={int(t_open)}ms）")
-                    break
-                else:
-                    try: cap.release()
-                    except Exception: pass
-                    cap = None
-            except Exception as _e:
-                _probe_log.append(f"[{_backend_name}] exception: {_e}")
-                try: cap.release()
-                except Exception: pass
-                cap = None
-        if not _opened or cap is None:
-            msg = f"无法打开摄像头 camera_id={_cid}，尝试后端: {'; '.join(_probe_log)}"
-            status_store["error"] = msg
+        # ---------- 打开摄像头（2026-09-10 加固：MF 实时枚举统一索引 + MSMF 优先 +
+        #            DSHOW 按身份映射备选 + MJPG + 两阶段预热黑帧检测） ----------
+        _cid = camera_id  # int = MF 实时清单 index；str = 相机友好名片段（如 "HD"）
+        print(f"[hands_tasks.run_loop] ⏳ 正在打开摄像头 camera_id={_cid!r}"
+              f"（MF 实时枚举定位，MSMF 同 Windows 设置管道；冷启动最长约 8 秒…）", flush=True)
+        cap, _cap_info = _open_camera_robust(_cid)
+        if cap is None:
+            _probe_log = _cap_info.get("attempts_summary", [])
+            msg = f"无法打开摄像头 camera_id={_cid!r}，尝试记录: {'; '.join(_probe_log)}"
             if status_store is not None:
-                try: status_store["_diag_backend_probe"] = dict(attempts_summary=_probe_log, camera_id=_cid, success_attempt=0 if not _opened else len(_probe_log), success_backend=_opened_backend if _opened else None, total_elapsed_ms=0)
-                except Exception: pass
+                status_store["error"] = msg
+                try:
+                    status_store["_diag_backend_probe"] = dict(
+                        attempts_summary=_probe_log, camera_id=_cid,
+                        success_attempt=0, success_backend=None)
+                except Exception:
+                    pass
             raise RuntimeError(msg)
+        print(f"[hands_tasks.run_loop] ✅ 摄像头 {_cap_info.get('device_name', _cid)!r}"
+              f"（camera_id={_cid!r}）打开成功"
+              f"（后端={_cap_info['backend']} {_cap_info['width']}×{_cap_info['height']}@{_cap_info['fps']:.0f}fps，"
+              f"预热非黑帧={_cap_info['warmup_nonblack']}/{_cap_info['warmup_read']}，"
+              f"第{_cap_info['round']}轮命中，总耗时={_cap_info['open_ms']}ms）")
+        for _pline in _cap_info.get("attempts_summary", []):
+            print(f"    {_pline}")
         # 把探测结果写到 status_store（/status 接口可查看排障）
         if status_store is not None:
             try:
-                # 🔴 实际读取一下摄像头设置后的真实分辨率（有些摄像头会悄悄 fallback）
-                actual_w = float(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                actual_h = float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                actual_fps_req = float(cap.get(cv2.CAP_PROP_FPS))
                 status_store["_diag_backend_probe"] = dict(
-                    attempts_summary=_probe_log, camera_id=_cid,
-                    success_attempt=len(_probe_log), success_backend=_opened_backend,
-                    total_elapsed_ms=0,
-                    actual_frame_w=int(actual_w),
-                    actual_frame_h=int(actual_h),
-                    actual_fps=float(actual_fps_req),
+                    attempts_summary=_cap_info.get("attempts_summary", []),
+                    camera_id=_cid,
+                    success_attempt=_cap_info.get("round", 1),
+                    success_backend=_cap_info.get("backend"),
+                    total_elapsed_ms=_cap_info.get("open_ms", 0),
+                    actual_frame_w=_cap_info.get("width"),
+                    actual_frame_h=_cap_info.get("height"),
+                    actual_fps=_cap_info.get("fps"),
+                    warmup_read=_cap_info.get("warmup_read"),
+                    warmup_nonblack=_cap_info.get("warmup_nonblack"),
+                    index_warning=bool(_cap_info.get("index_warning", False)),
                 )
-                print(f"[hands_tasks.run_loop] 摄像头实际分辨率 = {int(actual_w)}×{int(actual_h)}  标称FPS = {actual_fps_req:.1f}")
             except Exception:
                 pass
 
@@ -1004,7 +1544,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 print(f"  [ERROR] top-band tap log 异常：{_tap_log_e!r}\n{_tb.format_exc()}", flush=True)
 
             if not disable_click_for_stretch_global and stretch.state != _DS.SCALING:
-                if tap_event in (1, 2):
+                # 1=单击(窗口超时补发) 2=长按按下 5=双击：都要求鼠标钉在当前位置完成动作
+                if tap_event in (1, 2, 5):
                     # freeze_for_click 冻结位置 = 同帧 move_only 输出位置（smoother 已被冻结，后续几帧都返回相同像素点）
                     mouse._smoother.freeze_for_click()
                 if tap_event != 0:

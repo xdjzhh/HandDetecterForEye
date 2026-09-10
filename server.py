@@ -40,8 +40,13 @@ if os.path.exists(CONFIG_PATH):
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        _default_camera_id = int(cfg.get("default_camera_id", cfg.get("camera_id", 0)))
-        print(f"[server.py] 从 config.json 读到默认 camera_id = {_default_camera_id}")
+        _raw_cid = cfg.get("default_camera_id", cfg.get("camera_id", 0))
+        try:
+            _default_camera_id = int(_raw_cid)
+        except (TypeError, ValueError):
+            # 字符串 = 相机友好名字片段（如 "HD"），MF 实时清单按名匹配（与 Windows 设置同源，不受枚举顺序影响）
+            _default_camera_id = str(_raw_cid).strip()
+        print(f"[server.py] 从 config.json 读到默认 camera_id = {_default_camera_id!r}")
         # 读取 Flask host / port
         try: _flask_host = str(cfg.get("flask_host", _flask_host)).strip() or "127.0.0.1"
         except Exception: pass
@@ -121,11 +126,15 @@ def run():
         if _run_thread is not None and _run_thread.is_alive():
             return jsonify({"detail": "已经在运行中，先调用 /stop 再启动"}), 400
 
-        # ----- 解析参数：camera_id / preview -----
+        # ----- 解析参数：camera_id / preview（支持 int 索引 或 str 相机名字片段） -----
         camera_id = _default_camera_id
         try:
             raw = request.args.get("camera_id", str(_default_camera_id))
-            camera_id = max(0, min(9, int(raw)))
+            try:
+                camera_id = max(0, min(9, int(raw)))
+            except (TypeError, ValueError):
+                # 非数字 = 按相机友好名字片段打开（MF 实时清单按名匹配，与 Windows 设置同源）
+                camera_id = raw.strip() if isinstance(raw, str) and raw.strip() else _default_camera_id
         except Exception:
             camera_id = _default_camera_id
         # 🔥 preview 默认值用 config.json 的 preview_default（而不是写死 True）
@@ -199,6 +208,41 @@ def stop():
 
 
 # =========================================================================
+# ③.5 GET /cameras —— 枚举系统相机清单（MF 统一索引 + DSHOW 参考），供选择摄像头
+#       对标 Windows 设置：MF 实时枚举为唯一索引源，按设备身份选择
+# =========================================================================
+@app.route("/cameras", methods=["GET"])
+def list_cameras():
+    """相机清单：
+    mf = Media Foundation 实时枚举——**统一索引源**（与 Windows 设置 / OpenCV MSMF 同源；
+    config.json 的 default_camera_id 和 /run?camera_id= 都用这里的 index 或名字）；
+    dshow = DirectShow 过滤器表，仅在 MSMF 失败时按 VID/PID 身份映射做备选后端，
+    其 index 与 MF 不一致且重插后可能残留陈旧项——⚠ 不要用 dshow 的 index 配置。"""
+    try:
+        mf = HT._list_mf_cameras()
+    except Exception as e:
+        mf, mf_err = [], repr(e)
+    else:
+        mf_err = None
+    try:
+        ds = HT._list_dshow_cameras()
+    except Exception as e:
+        ds, ds_err = [], repr(e)
+    else:
+        ds_err = None
+    return jsonify({
+        "ok": True,
+        "canonical_index": "mf",  # 统一索引源：配置/接口里的 camera_id 一律以 mf_cameras 的 index 为准
+        "count": len(mf),
+        "cameras": [{"index": i, "name": n, "device_path": p} for i, n, p in mf],
+        "mf_cameras": [{"index": i, "name": n, "device_path": p} for i, n, p in mf],
+        "dshow_cameras": [{"index": i, "name": n, "device_path": p} for i, n, p in ds],
+        "mf_error": mf_err, "dshow_error": ds_err,
+        "default_camera_id": _default_camera_id,
+    })
+
+
+# =========================================================================
 # ④ GET /status  —— 直接返回 status_store（简单 dict，不加锁）
 # =========================================================================
 @app.route("/status", methods=["GET"])
@@ -220,6 +264,10 @@ def status():
 # =========================================================================
 @app.route("/", methods=["GET"])
 def index():
+    # camera_id 可能是 int 或 str（名字片段），注入 JS 前转成 JS 字面量（字符串带引号）。
+    # 注意：onclick="..." 属性本身用双引号定界，字面量里的双引号必须转成 &quot; 实体，
+    # 否则渲染出 onclick="runCam("HD",...)" 会在属性边界截断 → 按钮点击 JS 语法错误无反应。
+    _cid_js = json.dumps(_default_camera_id, ensure_ascii=False).replace('"', "&quot;")
     html = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>HandDetecter 极简服务</title></head>
 <body style="font-family:-apple-system,'Microsoft YaHei',sans-serif;margin:24px">
@@ -230,13 +278,16 @@ def index():
   <li><b>POST /run?camera_id={_default_camera_id}&preview=1</b> → 启动识别（打开摄像头）</li>
   <li><b>POST /stop</b> → 停止识别（关闭摄像头+预览窗口）</li>
   <li><b>GET  /status</b> → 实时状态（FPS、手势、stretch模式、错误等）</li>
+  <li><b>GET  /cameras</b> → 枚举系统相机清单（index + 友好名，选摄像头前先点它）</li>
 </ul>
 <div id="st" style="background:#f5f5f5;padding:12px;border-radius:6px;white-space:pre-wrap;font-family:Consolas,monospace;font-size:13px">点击「刷新状态」查看</div>
 <br>
 <button onclick="r()">刷新状态</button>
 &nbsp;
-<button onclick="runCam({_default_camera_id}, true)">启动摄像头{_default_camera_id}（带预览）</button>
-<button onclick="runCam({_default_camera_id}, false)">启动摄像头{_default_camera_id}（无预览）</button>
+<button onclick="listCams()">列出摄像头（按名字选，不靠猜索引）</button>
+<br><br>
+<button onclick="runCam({_cid_js}, true)">启动摄像头{_default_camera_id}（带预览）</button>
+<button onclick="runCam({_cid_js}, false)">启动摄像头{_default_camera_id}（无预览）</button>
 &nbsp;
 <button onclick="stop()">停止</button>
 <script>
@@ -244,9 +295,20 @@ async function j(url, method='GET'){{
   return (await fetch(url,{{method}})).json();
 }}
 async function r(){{ document.getElementById('st').innerText = JSON.stringify(await j('/status'),null,2); }}
+async function listCams(){{
+  let d = await j('/cameras');
+  let msg = '【相机清单 MF 实时枚举（= Windows 设置/OpenCV MSMF 同源）】共 ' + d.count + ' 台，\\n' +
+    '配置 camera_id 一律用这套 index（或直接用名字）：\\n' +
+    (d.mf_cameras||[]).map(c => '  index=' + c.index + '  名字=' + c.name).join('\\n') +
+    '\\n\\n（内部参考，⚠ 不要用这里的 index 配置）DSHOW 过滤器表 ' + (d.dshow_cameras||[]).length + ' 台：\\n' +
+    (d.dshow_cameras||[]).map(c => '  dshow_index=' + c.index + '  名字=' + c.name).join('\\n') +
+    '\\n\\n当前 config 默认 camera_id=' + d.default_camera_id +
+    '；要用某台相机，把 config.json 的 default_camera_id 改成上面 MF 清单的 index（或名字片段，如 "HD"）后重启服务。';
+  alert(msg);
+}}
 async function runCam(cid, preview){{
   let p = preview ? '1' : '0';
-  alert(JSON.stringify(await j('/run?camera_id='+cid+'&preview='+p,'POST'),null,2));
+  alert(JSON.stringify(await j('/run?camera_id='+encodeURIComponent(cid)+'&preview='+p,'POST'),null,2));
   setTimeout(r,400);
 }}
 async function stop(){{ alert(JSON.stringify(await j('/stop','POST'),null,2)); setTimeout(r,400); }}

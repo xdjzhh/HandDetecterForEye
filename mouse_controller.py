@@ -127,6 +127,13 @@ ABS_LOCK_THRESH   = 5.6
 # pyautogui 安全设置
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.0
+
+# ⭐ OS 双击模式（OS_DOUBLE_CLICK=True）下，第二次点击坐标吸附到第一击：
+#   OS 双击位置容差只有 ±2px（SM_CXDOUBLECLK=4），两次手势落点漂移常达 10~30px 必然失败。
+#   真双击语义上就是"同一个目标连点两下"，因此 OS 双击时间窗内、落点漂移 ≤ 本阈值时，
+#   把第二击坐标强制吸到第一击精确像素（Δpos=0，稳过位置门槛）；超过阈值说明是两个不同
+#   目标的连续单击，不吸附。单位：屏幕像素。
+TAP_DBL_SNAP_PX = 60
 # ⭐ 2026-08-22 补充：显式锁死"动作内部最小耗时 / 最小休眠"为 0
 #   PAUSE=0 只保证"两个动作之间"不强制 sleep 0.1s；
 #   MINIMUM_DURATION（默认 0，已安全）是 moveTo/click 内部 duration 参数若 < MINIMUM_DURATION 则直接置 0（duration=0 → 无过渡，瞬时跳转）；
@@ -967,13 +974,56 @@ class MouseController:
         """
         from finger_tap_click_detector import E as _TE
         if screen_pt is None:
+            if tap_event in (_TE.TAP_CLICK, _TE.DOUBLE_TAP, _TE.LONG_DOWN):
+                print(f"[TAP-DIAG] ✗✗ 点击事件 ev={tap_event} 被丢弃：触发帧手不在画面(screen_pt=None)", flush=True)
             return
         ix, iy = int(screen_pt[0]), int(screen_pt[1])
 
         if tap_event == _TE.TAP_CLICK:
+            # ===== [CLICK-DIAG] 双击可行性诊断（OS 双击=时间+位置双门槛）=====
+            try:
+                import time as _t, ctypes as _ct
+                _now = _t.time()
+                _t0  = getattr(self, "_dbg_last_click_t", None)
+                _xy0 = getattr(self, "_dbg_last_click_xy", None)
+                _os_ms = _ct.windll.user32.GetDoubleClickTime()
+                _os_rect = _ct.windll.user32.GetSystemMetrics(36)  # SM_CXDOUBLECLK
+                if _t0 is not None and _xy0 is not None:
+                    _raw_ix, _raw_iy = ix, iy
+                    _gap_ms = (_now - _t0) * 1000.0
+                    _dpos = ((ix - _xy0[0]) ** 2 + (iy - _xy0[1]) ** 2) ** 0.5
+                    _time_ok = _gap_ms < _os_ms
+                    # 位置吸附：OS 双击窗内且漂移 ≤ TAP_DBL_SNAP_PX → 吸到第一击精确像素
+                    _snap_note = ""
+                    if _time_ok and _dpos <= TAP_DBL_SNAP_PX:
+                        ix, iy = _xy0
+                        _snap_note = f" [吸附 {_raw_ix},{_raw_iy}→({ix},{iy}) Δpos归零]"
+                    _pos_ok = _dpos <= _os_rect or _snap_note != ""
+                    _verdict = "✔OS将识别为双击" if (_time_ok and _pos_ok) else \
+                               ("✗间隔超%.0fms(实测%.0fms)" % (_os_ms, _gap_ms) if not _time_ok else "") + \
+                               ("✗位置漂移%.0fpx超吸附阈(容差%.0fpx)" % (_dpos, TAP_DBL_SNAP_PX) if not _pos_ok else "")
+                    print(f"[CLICK-DIAG] 第{getattr(self,'_dbg_click_n',1)+1}击 落点({_raw_ix},{_raw_iy}) "
+                          f"Δt={_gap_ms:6.0f}ms(限{_os_ms}) 漂移={_dpos:5.1f}px(吸附阈{TAP_DBL_SNAP_PX}) → {_verdict}{_snap_note}",
+                          flush=True)
+                else:
+                    print(f"[CLICK-DIAG] 第1击 ({ix},{iy})（下一次点击将打印间隔/落点差）", flush=True)
+                self._dbg_last_click_t = _now
+                self._dbg_last_click_xy = (ix, iy)
+                self._dbg_click_n = getattr(self, "_dbg_click_n", 0) + 1
+            except Exception:
+                pass
             # 食指"勾一下回弹" → 完整 click：mouseDown+mouseUp
+            # （即时模式=每次立刻 click，双击交给 OS 时间+位置双门槛判定）
             pyautogui.click(ix, iy, button="left")
             # 兜底保护：若因为历史遗留进入了drag状态，先释放
+            if self._drag_active:
+                try: pyautogui.mouseUp()
+                except Exception: pass
+            self._drag_active = False
+        elif tap_event == _TE.DOUBLE_TAP:
+            # 双击窗口内完成第二次"勾指回弹" → doubleClick
+            # 第一次单击挂起未发，所以物理点击恰好 2 次 = 原生双击（不会多出第 3 次点击）
+            pyautogui.doubleClick(ix, iy, button="left")
             if self._drag_active:
                 try: pyautogui.mouseUp()
                 except Exception: pass
