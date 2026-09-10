@@ -44,7 +44,7 @@ if os.path.exists(CONFIG_PATH):
         try:
             _default_camera_id = int(_raw_cid)
         except (TypeError, ValueError):
-            # 字符串 = 相机友好名字片段（如 "HD"），MF 实时清单按名匹配（与 Windows 设置同源，不受枚举顺序影响）
+            # 兼容：config 里写字符串时按相机友好名字片段匹配（MF 实时清单）；正式配置推荐用数字 index（见 /cameras）
             _default_camera_id = str(_raw_cid).strip()
         print(f"[server.py] 从 config.json 读到默认 camera_id = {_default_camera_id!r}")
         # 读取 Flask host / port
@@ -298,12 +298,12 @@ async function r(){{ document.getElementById('st').innerText = JSON.stringify(aw
 async function listCams(){{
   let d = await j('/cameras');
   let msg = '【相机清单 MF 实时枚举（= Windows 设置/OpenCV MSMF 同源）】共 ' + d.count + ' 台，\\n' +
-    '配置 camera_id 一律用这套 index（或直接用名字）：\\n' +
+    '配置 config.json 的 default_camera_id 一律用这里的 index：\\n' +
     (d.mf_cameras||[]).map(c => '  index=' + c.index + '  名字=' + c.name).join('\\n') +
     '\\n\\n（内部参考，⚠ 不要用这里的 index 配置）DSHOW 过滤器表 ' + (d.dshow_cameras||[]).length + ' 台：\\n' +
     (d.dshow_cameras||[]).map(c => '  dshow_index=' + c.index + '  名字=' + c.name).join('\\n') +
     '\\n\\n当前 config 默认 camera_id=' + d.default_camera_id +
-    '；要用某台相机，把 config.json 的 default_camera_id 改成上面 MF 清单的 index（或名字片段，如 "HD"）后重启服务。';
+    '；要用某台相机，把 config.json 的 default_camera_id 改成上面 MF 清单中该相机的 index 后重启服务。';
   alert(msg);
 }}
 async function runCam(cid, preview){{

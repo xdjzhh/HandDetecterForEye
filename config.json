@@ -1,7 +1,7 @@
 {
   "_comment_": "HandDetecter 服务配置文件 —— 所有参数用途如下；修改后重启服务生效。 唯一例外：default_camera_id 可在运行中通过 /run /select_camera 动态更新并自动持久化保存。",
-  "default_camera_id": "HD",
-  "_comment_default_camera_id": "/run 接口未传 camera_id 参数时使用的默认摄像头。 数字 = MF 实时枚举 index（与 Windows 设置同源，可用 GET /cameras 查询：当前外接 'Usb HD' 在 MF index=0、内置 'Integrated Webcam' 在 index=1）；字符串 = 相机友好名字片段（如 \"HD\" 匹配 'Usb HD'，不受换 USB 口/枚举顺序影响，推荐）。 ⚠ 不要用 DSHOW 的 index（与 MF 不一致且重插后可能残留）。",
+  "default_camera_id": 0,
+  "_comment_default_camera_id": "/run 接口未传 camera_id 参数时使用的默认摄像头。 值 = MF 实时枚举 index（与 Windows 设置同源，可用 GET /cameras 或网页「列出摄像头」按钮查看 index↔名字对应关系）：当前外接 'Usb HD' 在 index=0、内置 'Integrated Webcam' 在 index=1。 重插/换 USB 口后若启动的相机不对，先列出摄像头确认目标相机的当前 index，再改这里。",
   "flask_host": "127.0.0.1",
   "_comment_flask_host": "Flask 监听的 host IP： 127.0.0.1 = 仅本机浏览器可访问（安全默认）； 0.0.0.0 = 允许局域网内其他电脑/手机通过你的局域网 IP 访问（需关闭防火墙对应端口）",
   "flask_port": 8000,
