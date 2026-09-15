@@ -118,7 +118,8 @@ OS_DOUBLE_CLICK = False
 
 # ⭐ 诊断开关（2026-09-10 双击排查）：True 时每次勾按打印状态机转移行 [TAP-DIAG]
 #   ARM=起弯  TAP=点击发出  LONG=长按转换(双击被吞的头号嫌疑)  SPIKE=尖峰拒绝  NONE帧=掌心不稳被门控
-TAP_DIAG = True
+#   2026-09-15：日常使用默认关闭（控制台刷屏会拖慢主循环、影响鼠标流畅度）；排查点击问题时临时改 True
+TAP_DIAG = False
 
 # ⭐ 2026-08-22 差分点击新增常量
 DI_WINDOW = 5                 # 差分窗口：最近 5 帧 bend_ratio（30fps=167ms，刚好是"按下去"的动作时长）

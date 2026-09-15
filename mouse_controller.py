@@ -141,6 +141,9 @@ TAP_DBL_SNAP_PX = 60
 #   超过阈值说明手已移到别的图标 → 降级普通 click。阈值比 TAP_DBL_SNAP_PX 宽（慢节奏手漂更大，
 #   且桌面图标尺寸普遍 50~100px）。单位：屏幕像素。
 RESCUE_DBL_SNAP_PX = 100
+# ⭐ 点击诊断日志开关：True 时打印 [CLICK-DIAG]（双击间隔/漂移/吸附、补救双击判定）。
+#   2026-09-15：日常使用默认关闭（每次点击打印+flush 会在控制台 I/O 上阻塞主循环）；排查双击问题时临时改 True
+CLICK_DIAG = False
 # ⭐ 2026-08-22 补充：显式锁死"动作内部最小耗时 / 最小休眠"为 0
 #   PAUSE=0 只保证"两个动作之间"不强制 sleep 0.1s；
 #   MINIMUM_DURATION（默认 0，已安全）是 moveTo/click 内部 duration 参数若 < MINIMUM_DURATION 则直接置 0（duration=0 → 无过渡，瞬时跳转）；
@@ -982,7 +985,7 @@ class MouseController:
         from finger_tap_click_detector import E as _TE
         if screen_pt is None:
             if tap_event in (_TE.TAP_CLICK, _TE.DOUBLE_TAP, _TE.RESCUE_DBL_TAP, _TE.LONG_DOWN):
-                print(f"[TAP-DIAG] ✗✗ 点击事件 ev={tap_event} 被丢弃：触发帧手不在画面(screen_pt=None)", flush=True)
+                print(f"[点击异常] 事件 ev={tap_event} 被丢弃：触发帧手不在画面(screen_pt=None)")
             return
         ix, iy = int(screen_pt[0]), int(screen_pt[1])
 
@@ -1009,11 +1012,13 @@ class MouseController:
                     _verdict = "✔OS将识别为双击" if (_time_ok and _pos_ok) else \
                                ("✗间隔超%.0fms(实测%.0fms)" % (_os_ms, _gap_ms) if not _time_ok else "") + \
                                ("✗位置漂移%.0fpx超吸附阈(容差%.0fpx)" % (_dpos, TAP_DBL_SNAP_PX) if not _pos_ok else "")
-                    print(f"[CLICK-DIAG] 第{getattr(self,'_dbg_click_n',1)+1}击 落点({_raw_ix},{_raw_iy}) "
-                          f"Δt={_gap_ms:6.0f}ms(限{_os_ms}) 漂移={_dpos:5.1f}px(吸附阈{TAP_DBL_SNAP_PX}) → {_verdict}{_snap_note}",
-                          flush=True)
+                    if CLICK_DIAG:
+                        print(f"[CLICK-DIAG] 第{getattr(self,'_dbg_click_n',1)+1}击 落点({_raw_ix},{_raw_iy}) "
+                              f"Δt={_gap_ms:6.0f}ms(限{_os_ms}) 漂移={_dpos:5.1f}px(吸附阈{TAP_DBL_SNAP_PX}) → {_verdict}{_snap_note}",
+                              flush=True)
                 else:
-                    print(f"[CLICK-DIAG] 第1击 ({ix},{iy})（下一次点击将打印间隔/落点差）", flush=True)
+                    if CLICK_DIAG:
+                        print(f"[CLICK-DIAG] 第1击 ({ix},{iy})（下一次点击将打印间隔/落点差）", flush=True)
                 self._dbg_last_click_t = _now
                 self._dbg_last_click_xy = (ix, iy)
                 self._dbg_click_n = getattr(self, "_dbg_click_n", 0) + 1
@@ -1047,16 +1052,18 @@ class MouseController:
                 _dpos = 0.0
             if _xy0 is not None and _dpos <= RESCUE_DBL_SNAP_PX:
                 # 同一图标 → 吸附到 click#1 精确像素，原子双击打开
-                print(f"[CLICK-DIAG] 🔁 补救双击(慢节奏) 落点({ix},{iy}) 距click#1 {_dpos:.1f}px≤{RESCUE_DBL_SNAP_PX}px "
-                      f"→ doubleClick({_xy0[0]},{_xy0[1]}) 原子双击打开", flush=True)
+                if CLICK_DIAG:
+                    print(f"[CLICK-DIAG] 🔁 补救双击(慢节奏) 落点({ix},{iy}) 距click#1 {_dpos:.1f}px≤{RESCUE_DBL_SNAP_PX}px "
+                          f"→ doubleClick({_xy0[0]},{_xy0[1]}) 原子双击打开", flush=True)
                 pyautogui.doubleClick(_xy0[0], _xy0[1], button="left")
                 # 双击已由本次原子操作完成，清点击记录避免后续干扰
                 self._dbg_last_click_xy = None
                 self._dbg_last_click_t = None
             else:
                 # 手已移到别的图标 → 降级普通单击
-                print(f"[CLICK-DIAG] 补救第二击 落点({ix},{iy}) 距click#1 {_dpos:.1f}px>{RESCUE_DBL_SNAP_PX}px "
-                      f"→ 判定为不同目标，降级普通click", flush=True)
+                if CLICK_DIAG:
+                    print(f"[CLICK-DIAG] 补救第二击 落点({ix},{iy}) 距click#1 {_dpos:.1f}px>{RESCUE_DBL_SNAP_PX}px "
+                          f"→ 判定为不同目标，降级普通click", flush=True)
                 pyautogui.click(ix, iy, button="left")
                 self._dbg_last_click_t = time.time()
                 self._dbg_last_click_xy = (ix, iy)
