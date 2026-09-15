@@ -75,8 +75,39 @@ COOLDOWN_FRAMES  = 4
 #   第一次 Tap 松开后【不立即单击】，进入 WAIT_DBL 窗口：
 #     · 窗口内完成第二次 Tap → DOUBLE_TAP（只发一次 doubleClick，挂起的单击作废 → 物理点击恰好 2 次）
 #     · 窗口超时无第二次   → 补发 TAP_CLICK（单击延迟确认，杜绝双击同时出两个单击）
-DOUBLE_TAP_WINDOW_SEC     = 0.38  # 第一次Tap松开 → 第二次弯曲开始 的最大间隔（秒；人类快速双击≈0.15~0.30s）
+DOUBLE_TAP_WINDOW_SEC     = 0.38  # 趋势确认后，留给第二次完整 Tap（弯+回弹）的时间窗（秒）
 DOUBLE_TAP_COOLDOWN_FRAMES = 6    # 双击后的冷却帧数（比单击4帧略长，让伸直基线稳一下）
+# ⭐ 单击快速反应（2026-09-15 用户方案：别盲等，先探测"二次下弯趋势"）：
+#   第一次 Tap 回弹后不再固定等 0.38s，而是先用 TREND_WAIT_SEC 短窗探测第二击【下弯趋势】——
+#   低门限差分（完整按下门限的 TREND_DI_FRAC）+ bend_ratio 已离开伸直位 + 连续确认，
+#   不要求完整点击成立：
+#     · 短窗内出现趋势 → 判定双击意图，等待窗延长 DOUBLE_TAP_WINDOW_SEC 等第二击完成 → DOUBLE_TAP
+#     · 短窗内无趋势   → 立即补发 TAP_CLICK（单击延迟从 0.38s 压到 ~0.10s），随后照常进 RESCUE_DBL
+#   趋势偶尔漏判也无害：第二击仍落在 2.5s 补救窗内 → 原子 doubleClick 兜底。
+TREND_WAIT_SEC       = 0.10   # 首次回弹 → 探测到二次下弯趋势 的最长时间（秒；30fps≈3帧观察窗）
+TREND_DI_FRAC        = 0.40   # 趋势差分门限 = TAP_DOWN_DI_SUM 的比例（四成累计降幅+离开伸直位即算有趋势）
+TREND_MAX_RATIO      = 0.95   # 且 bend_ratio 低于此值（确实离开伸直位，排除回弹尾段 EMA 锯齿）
+TREND_CONFIRM_FRAMES = 2      # 连续满足的帧数（防单帧噪声误延长；0.10s窗内须在头2帧就出现趋势）
+# ⭐ 双击补救窗口（2026-09-10 修复"慢节奏双击文件变成重命名"）：
+#   真机实测体感勾指的"双击"两次间隔长达 1.5~3.3s（手要复位再勾），远超 Windows 双击窗 500ms。
+#   关键认知：doubleClick() 是后台原子指令，内部两次点击间隔几十毫秒由代码控制，
+#   与用户手指实际间隔无关——OS 必然识别为双击。所以只要识别出"双击意图"就直接发 doubleClick，
+#   绝不能发两次独立 click（资源管理器对"选中后慢速再点文件名"的语义=重命名）。
+#   流程：WAIT_DBL 0.38s 超时 → 立即补发 click#1（单击响应不受影响）→ 进入 RESCUE_DBL 补救窗：
+#     窗内第二击 Tap 回弹 → 发 RESCUE_DBL_TAP 事件，mouse_controller 按【位置门控】处理：
+#       · 落点与 click#1 同图标(≤RESCUE_DBL_SNAP_PX) → 原子 doubleClick()（OS 必判双击打开）
+#       · 落点已在别的图标上(>门控) → 降级为普通 click（点别的东西不受影响）
+#   窗口取 2.5s（用户指定 2026-09-10）：覆盖大多数自然节奏的慢双击；注意真机曾测到 3.3s 的
+#   更慢节奏，超过 2.5s 的第二击会被当成两次独立单击（窗口期间光标移动/其他手势均不受影响）。
+#   超时无第二击 = 真·单击，回 IDLE。
+RESCUE_DBL_WINDOW_SEC     = 2.5   # 进入 RESCUE 状态 → 第二击弯曲开始 的最大间隔（秒）
+# ⭐ 等待双击期间的"丢手宽限"（2026-09-10 真机修复）：
+#   WAIT_DBL/RESCUE_DBL 等待第二击时，手要复位/移动，MediaPipe 极易短暂丢帧或触发掌心不稳门控
+#   （index_bend=None）。旧逻辑一帧 None 就把整个等待窗口作废回 IDLE → 第二击被当成全新第一击，
+#   慢双击永远配不上对。真机实测等待窗长达数秒，要求每帧都追踪到手不现实。
+#   改为：连续丢手 ≤ 本宽限 → 保留状态/窗口/deadline（期间不更新基线、不清窗口）；
+#   超过宽限仍无手（手真的离开了）→ 窗口作废回 IDLE。
+NONE_GRACE_SEC            = 1.0   # WAIT_DBL/RESCUE_DBL 中连续 bend=None 的最大保留时间（秒）
 # ⭐ 实验开关（2026-09-10）：双击判定归属
 #   True  = 每次勾按【立即】click()，单击零延迟；快速连勾两次 = 两组 down/up，
 #           由 Windows 双击时间（默认500ms/位置容差）自然识别为双击（和物理鼠标行为完全一致；
@@ -193,6 +224,7 @@ class _S:
     COOLDOWN    = 4  # 冷却 → 映射 "COOL"（_STATE_NAMES[4]）
     TAPPED      = 5  # tap已触发（1帧瞬态，立刻入COOLDOWN；_STATE_NAMES无映射=不会出现在日志，安全）
     WAIT_DBL    = 6  # 第一次Tap完成、单击挂起，等待第二次Tap构成双击（双击窗口）
+    RESCUE_DBL  = 7  # 单击已补发(click#1已送达)，补救窗内等第二击：窗内Tap回弹立即发单击(click#2追加双击)
 
 class E:
     NONE       = 0
@@ -200,7 +232,8 @@ class E:
     LONG_DOWN  = 2   # 长按开始：mouseDown，之后每帧 DRAG_MOVE
     LONG_UP    = 3   # 长按结束：mouseUp
     DRAG_MOVE  = 4   # 长按中持续移动
-    DOUBLE_TAP = 5   # 双击：双击窗口内完成第二次 Tap（mouse doubleClick，单击不补发）
+    DOUBLE_TAP = 5   # 双击窗口内完成第二次 Tap（原子 doubleClick，单击不补发）
+    RESCUE_DBL_TAP = 6  # 补救窗口内第二击 Tap（mouse_controller 按位置门控：同图标→原子doubleClick打开，异处→普通click）
 
 
 class FingerTapClickDetector:
@@ -232,7 +265,16 @@ class FingerTapClickDetector:
         # ⭐ 双击判定状态
         self._double_candidate = False  # 当前这段弯曲是否始于双击窗口内（=第二次Tap候选）
         self._tap_pending = False       # WAIT_DBL 中是否挂着一个待确认的单击
-        self._wait_deadline = 0.0       # WAIT_DBL 超时时刻（time.time()）
+        self._wait_deadline = 0.0       # WAIT_DBL 超时时刻（time.time()；趋势确认后=完整第二击截止）
+        # ⭐ 二次下弯趋势探测（首次 Tap 回弹后的短窗，无趋势立即补发单击）
+        self._wait_trend_seen = False   # 本等待窗内是否已确认二次下弯趋势（确认后延长等完整第二击）
+        self._wait_trend_frames = 0     # 连续满足趋势条件的帧数
+        self._wait_trend_deadline = 0.0 # 趋势探测短窗截止时刻（time.time()）
+        # ⭐ 双击补救状态（单击补发后的第二击追击）
+        self._rescue_candidate = False  # 当前这段弯曲是否始于补救窗口内（=双击第二击，回弹立即单击）
+        self._rescue_deadline = 0.0     # RESCUE_DBL 超时时刻（time.time()）
+        self._cooldown_next = _S.IDLE   # COOLDOWN 结束后转入的状态（补发单击后转 RESCUE_DBL）
+        self._none_grace_t = 0.0        # WAIT/RESCUE 等待中连续 bend=None 段的起始时刻（0=当前有手）
         # ⭐ TAP-DIAG 诊断
         self._dbg_arm_t = None          # 最近一次 ARMED 时刻
         self._dbg_none_in_tap = 0       # 当前 ARM/HOLD 段内 bend=None（掌心不稳门控）帧数
@@ -266,6 +308,14 @@ class FingerTapClickDetector:
         self._double_candidate = False
         self._tap_pending = False
         self._wait_deadline = 0.0
+        self._wait_trend_seen = False
+        self._wait_trend_frames = 0
+        self._wait_trend_deadline = 0.0
+        # 补救状态同步清空
+        self._rescue_candidate = False
+        self._rescue_deadline = 0.0
+        self._cooldown_next = _S.IDLE
+        self._none_grace_t = 0.0
         # 计数器保留（让 UI 统计不丢），若想清空可自行注释放开：
         # self.tap_count = 0
         # self.long_count = 0
@@ -337,9 +387,16 @@ class FingerTapClickDetector:
         if self.state == _S.COOLDOWN:
             self._cooldown_frames -= 1
             if self._cooldown_frames <= 0:
-                self.state = _S.IDLE
+                # 补发单击后需转入补救窗口 RESCUE_DBL（_enter_cooldown 时指定）；其余回 IDLE
+                self.state = self._cooldown_next
+                self._cooldown_next = _S.IDLE
                 self._bend_hold_frames = 0
                 self._armed_by_delta = False
+                if self.state == _S.RESCUE_DBL:
+                    # ⭐ 补救窗口从【真正进入 RESCUE 状态】起算（cooldown 墙钟不占补救时间，
+                    #   否则 4 帧冷却会吃掉大半个窗口，第二击弯下时已超时回 IDLE）
+                    self._rescue_deadline = time.time() + RESCUE_DBL_WINDOW_SEC
+                    self._rescue_candidate = False
             self._update_baseline(bend, can_update=True)
             return E.NONE
 
@@ -354,14 +411,49 @@ class FingerTapClickDetector:
                 if self._dbg_none_in_tap <= 3 or self._dbg_none_in_tap % 10 == 0:
                     self._diag(f"⚠ bend=None(掌心不稳门控) 状态={self.state} 累计{self._dbg_none_in_tap}帧")
                 # 只是中间态，不算
-            elif self.state == _S.WAIT_DBL:
-                # 手丢失 = 双击窗口无意义（也没有可点击的有效位置）→ 挂起的单击作废
-                self.state = _S.IDLE
-                self._tap_pending = False
-                self._double_candidate = False
-                self._wait_deadline = 0.0
-                self._bend_hold_frames = 0
-                self._bend_total_frames = 0
+            elif self.state in (_S.WAIT_DBL, _S.RESCUE_DBL):
+                # ⭐ 丢手宽限：等待第二击期间短暂丢帧（手复位/移动时 MediaPipe 丢帧、掌心不稳门控）
+                #   不立即作废窗口——真机慢双击间隔 1.5~3.3s，窗内要求每帧追踪到手不现实。
+                _now_none = time.time()
+                if self._none_grace_t == 0.0:
+                    self._none_grace_t = _now_none
+                if _now_none - self._none_grace_t > NONE_GRACE_SEC:
+                    # 连续丢手超宽限（手真的离开画面）→ 窗口作废
+                    self._diag(f"⚠ 连续丢手>{NONE_GRACE_SEC:.1f}s 状态={self.state} → 双击/补救窗口作废")
+                    self.state = _S.IDLE
+                    self._tap_pending = False
+                    self._double_candidate = False
+                    self._rescue_candidate = False
+                    self._wait_deadline = 0.0
+                    self._rescue_deadline = 0.0
+                    self._none_grace_t = 0.0
+                    self._bend_hold_frames = 0
+                    self._bend_total_frames = 0
+                    return E.NONE
+                # 宽限内：墙钟 deadline 照常生效——None 帧只屏蔽"弯曲触发"，不冻结时间：
+                #   ① WAIT_DBL 到点 → click#1 照样补发（单击不丢不延迟，hands_tasks 掌心门控丢手时
+                #      手仍在画面、位置有效；手完全消失则 controller 层丢弃该事件）后进补救窗；
+                #      趋势尚未确认时用短窗截止（无趋势快速补发），确认后用完整窗截止。
+                #   ② RESCUE_DBL 到点 → 真单击，回 IDLE。
+                _wait_eff_dl = self._wait_deadline if self._wait_trend_seen else self._wait_trend_deadline
+                if self.state == _S.WAIT_DBL and _now_none > _wait_eff_dl:
+                    self._tap_pending = False
+                    self._double_candidate = False
+                    self._rescue_candidate = False
+                    self.event_this_frame = E.TAP_CLICK
+                    self.tap_count += 1
+                    self.last_tap_time = _now_none
+                    _why = ("趋势已确认,完整窗超时" if self._wait_trend_seen
+                            else f"趋势短窗{TREND_WAIT_SEC:.2f}s内丢手无趋势→立即补发")
+                    self._diag(f"③ 单击补发({_why}) → "
+                               f"cooldown后开补救窗口{RESCUE_DBL_WINDOW_SEC:.1f}s")
+                    self._enter_cooldown(next_state=_S.RESCUE_DBL)
+                    return self.event_this_frame
+                if self.state == _S.RESCUE_DBL and _now_none > self._rescue_deadline:
+                    self.state = _S.IDLE
+                    self._rescue_candidate = False
+                    self._rescue_deadline = 0.0
+                return E.NONE
             elif self.state == _S.PRESSED:
                 self.event_this_frame = E.LONG_UP  # 手丢了 = 释放
                 self._enter_cooldown()
@@ -372,6 +464,7 @@ class FingerTapClickDetector:
             return self.event_this_frame
 
         # ---- 有手：平滑 bend ----
+        self._none_grace_t = 0.0  # 恢复追踪：清零丢手宽限计时
         prev_b = self._smoothed_bend
         if self._smoothed_bend is None:
             self._smoothed_bend = float(bend)
@@ -447,27 +540,76 @@ class FingerTapClickDetector:
                 self._baseline = BASELINE_ALPHA_FAST * B + (1 - BASELINE_ALPHA_FAST) * self._baseline
 
         elif self.state == _S.WAIT_DBL:
-            # 第一次 Tap 已完成（单击挂起、不立即触发），等第二次 Tap 构成双击
+            # 第一次 Tap 已完成（单击挂起、不立即触发）：先用短窗探测"二次下弯趋势"，
+            #   有趋势→延长等完整第二击(DOUBLE_TAP)；无趋势→立即补发单击（单击快速反应）。
             self._update_baseline(B, can_update=True)
             if B > self._baseline * 0.97:
                 self._baseline = BASELINE_ALPHA_FAST * B + (1 - BASELINE_ALPHA_FAST) * self._baseline
+            _now = time.time()
+            _fire_reason = None  # 本帧需要补发单击的原因（None=不补发）
             if down_trigger:
-                # 第二次弯曲在窗口内开始 → 走常规 ARMED/HOLD，标记为双击候选
+                # 完整按下判据直接成立（趋势自然算已确认）→ 走常规 ARMED/HOLD，标记双击候选
+                self._wait_trend_seen = True
                 self.state = _S.BEND_ARMED
                 self._bend_hold_frames = 1
                 self._bend_total_frames = 1
                 self._stable_frames = 0
                 self._double_candidate = True
                 self._armed_by_delta = bool(down_delta and not down_abs)
-            elif time.time() > self._wait_deadline:
-                # 窗口超时仍无第二次弯曲 → 确认单击，补发 TAP_CLICK
+            elif not self._wait_trend_seen:
+                # ---- 趋势探测短窗：低门限差分 + 已离开伸直位 + 连续确认（不要求完整点击）----
+                _trend_thr = TREND_DI_FRAC * self._p["TAP_DOWN_DI_SUM"]
+                trend_down = (di_sum_down >= _trend_thr) and (bend_ratio <= TREND_MAX_RATIO)
+                if trend_down:
+                    self._wait_trend_frames += 1
+                    if self._wait_trend_frames >= TREND_CONFIRM_FRAMES:
+                        # 二次下弯趋势确认 → 双击意图，延长窗口等完整第二击
+                        self._wait_trend_seen = True
+                        self._wait_deadline = _now + DOUBLE_TAP_WINDOW_SEC
+                        self._diag(f"⓪ 探测到二次下弯趋势 ratio={bend_ratio:.3f} "
+                                   f"Σ下={di_sum_down:.3f}≥趋势阈{_trend_thr:.3f} "
+                                   f"→ 延长{DOUBLE_TAP_WINDOW_SEC:.2f}s等完整第二击")
+                else:
+                    self._wait_trend_frames = 0
+                if not self._wait_trend_seen and _now > self._wait_trend_deadline:
+                    # 短窗内无二次下弯趋势 → 立即补发单击（0.38s→~0.16s 的快速反应）
+                    _fire_reason = f"趋势短窗{TREND_WAIT_SEC:.2f}s内无二次下弯→立即补发"
+            elif _now > self._wait_deadline:
+                # 已确认趋势但第二击未在完整窗内完成 → 补发单击，后续 RESCUE_DBL 补救窗兜底
+                _fire_reason = f"趋势后{DOUBLE_TAP_WINDOW_SEC:.2f}s第二击未完成→补发"
+            if _fire_reason is not None:
+                # 确认单击，补发 TAP_CLICK（click#1 送达），cooldown 后进入 RESCUE_DBL 补救窗
                 self._tap_pending = False
                 self._double_candidate = False
+                self._rescue_candidate = False
                 self.event_this_frame = E.TAP_CLICK
                 self.tap_count += 1
-                self.last_tap_time = time.time()
-                self._enter_cooldown()
+                self.last_tap_time = _now
+                self._diag(f"③ 单击补发({_fire_reason}) → "
+                           f"cooldown后开补救窗口{RESCUE_DBL_WINDOW_SEC:.1f}s，窗内第二击将按位置门控判双击/单击")
+                self._enter_cooldown(next_state=_S.RESCUE_DBL)
                 return self.event_this_frame
+
+        elif self.state == _S.RESCUE_DBL:
+            # click#1 已补发送达；补救窗内等第二击弯曲：窗内开始的 Tap 回弹时立即发 click#2
+            self._update_baseline(B, can_update=True)
+            if B > self._baseline * 0.97:
+                self._baseline = BASELINE_ALPHA_FAST * B + (1 - BASELINE_ALPHA_FAST) * self._baseline
+            if down_trigger:
+                # 第二击弯曲在补救窗内开始 → 走常规 ARMED/HOLD，标记补救候选（回弹立即单击）
+                self.state = _S.BEND_ARMED
+                self._bend_hold_frames = 1
+                self._bend_total_frames = 1
+                self._stable_frames = 0
+                self._rescue_candidate = True
+                self._double_candidate = False
+                self._armed_by_delta = bool(down_delta and not down_abs)
+                self._diag(f"④ 补救窗口内捕获第二击弯曲 → 回弹将按位置门控发双击(同图标)/单击(异处)")
+            elif time.time() > self._rescue_deadline:
+                # 补救窗超时仍无第二击 = 真·单击
+                self.state = _S.IDLE
+                self._rescue_candidate = False
+                self._rescue_deadline = 0.0
 
         elif self.state == _S.BEND_ARMED:
             # ARMED 的下一帧：仍需满足"还没回到伸直"（不能刚一帧就直接弹回去=尖峰）
@@ -480,11 +622,15 @@ class FingerTapClickDetector:
             else:
                 # 第2帧就不满足了 → 单帧尖峰
                 self._diag(f"✗ 尖峰拒绝(第2帧未保持弯曲) ratio={bend_ratio:.3f} Σ下={di_sum_down:.3f} "
-                           f"{'双击候选→回WAIT' if self._double_candidate else '→IDLE'}")
+                           f"{'双击候选→回WAIT' if self._double_candidate else ('补救候选→回RESCUE' if self._rescue_candidate else '→IDLE')}")
                 if self._double_candidate:
                     # 双击窗口内的第二次弯曲只是尖峰 → 回 WAIT_DBL 继续等（窗口到期自动补单击）
                     self.state = _S.WAIT_DBL
                     self._double_candidate = False
+                elif self._rescue_candidate:
+                    # 补救窗口内的第二击只是尖峰 → 回 RESCUE_DBL 继续等（窗口到期回 IDLE）
+                    self.state = _S.RESCUE_DBL
+                    self._rescue_candidate = False
                 else:
                     self.state = _S.IDLE
                 self._bend_hold_frames = 0
@@ -523,12 +669,26 @@ class FingerTapClickDetector:
                     self.double_count += 1
                     self.last_double_time = time.time()
                     self._enter_cooldown(DOUBLE_TAP_COOLDOWN_FRAMES)
+                elif is_tap and self._rescue_candidate:
+                    # ⭐ 补救窗口内的第二击 Tap：发 RESCUE_DBL_TAP，由 mouse_controller 按位置门控：
+                    #   落点仍在 click#1 同一图标上 → 原子 doubleClick（几十ms 内两次点击，OS 必判双击打开，
+                    #   彻底规避"选中后慢节奏再点=重命名"）；落点已移到别处 → 降级普通 click。
+                    self._rescue_candidate = False
+                    self._rescue_deadline = 0.0
+                    self.event_this_frame = E.RESCUE_DBL_TAP
+                    self._diag(f"⑤ 补救第二击捕获(段长{self._bend_total_frames}帧≈{_seg_ms:.0f}ms) "
+                               f"→ 交mouse_controller按位置门控:同图标=doubleClick打开/异处=普通click")
+                    self._enter_cooldown()
                 elif is_tap:
                     # 第一次 Tap：不立即单击 → 进双击窗口等第二次（超时在 WAIT_DBL 补发单击）
                     self.state = _S.WAIT_DBL
                     self._tap_pending = True
                     self._double_candidate = False
                     self._wait_deadline = time.time() + DOUBLE_TAP_WINDOW_SEC
+                    # ⭐ 趋势探测短窗：TREND_WAIT_SEC 内看不到二次下弯趋势 → 立即补发单击
+                    self._wait_trend_seen = False
+                    self._wait_trend_frames = 0
+                    self._wait_trend_deadline = time.time() + TREND_WAIT_SEC
                     self._bend_hold_frames = 0
                     self._bend_total_frames = 0
                     self._stable_frames = 0
@@ -539,10 +699,12 @@ class FingerTapClickDetector:
                             self._bend_ratio_hist.append(
                                 self._smoothed_bend / max(self._baseline, 1e-6))
                 else:
-                    # 真·超长按住后才松手 → 作为 LONG_UP 释放；若此前挂着单击/双击候选，
+                    # 真·超长按住后才松手 → 作为 LONG_UP 释放；若此前挂着单击/双击/补救候选，
                     #   拖拽语义优先，挂起的单击作废（避免 click+mouseDown 连在同一点）
                     self._tap_pending = False
                     self._double_candidate = False
+                    self._rescue_candidate = False
+                    self._rescue_deadline = 0.0
                     self.event_this_frame = E.LONG_UP
                     self.last_long_time = time.time()
                     self._enter_cooldown()
@@ -572,9 +734,11 @@ class FingerTapClickDetector:
                            f"≈{(time.time()-self._dbg_arm_t)*1000.0:.0f}ms None门控{self._dbg_none_in_tap}帧 "
                            f"ratio={bend_ratio:.3f} Σ上={di_sum_up:.3f}(需{self._p['TAP_UP_DI_SUM']}) "
                            f"→ 双击被吞：两次弯曲被合成一段按住")
-                # 第二次弯曲演变为长按拖拽 → 挂起的单击作废（拖拽语义优先）
+                # 第二次弯曲演变为长按拖拽 → 挂起的单击/补救候选作废（拖拽语义优先）
                 self._tap_pending = False
                 self._double_candidate = False
+                self._rescue_candidate = False
+                self._rescue_deadline = 0.0
 
         elif self.state == _S.PRESSED:
             if up_trigger:
@@ -598,15 +762,19 @@ class FingerTapClickDetector:
         if b > self._baseline * 0.95:
             self._baseline = BASELINE_ALPHA_IDLE * b + (1.0 - BASELINE_ALPHA_IDLE) * self._baseline
 
-    def _enter_cooldown(self, frames: int | None = None):
+    def _enter_cooldown(self, frames: int | None = None, next_state: int | None = None):
         self.state = _S.COOLDOWN
         self._cooldown_frames = int(frames) if frames is not None else self._p["COOLDOWN_FRAMES"]
+        # COOLDOWN 结束后转入的状态：默认 IDLE；补发单击后传 RESCUE_DBL 进入双击补救窗口
+        self._cooldown_next = next_state if next_state is not None else _S.IDLE
         self._bend_hold_frames = 0
         self._bend_total_frames = 0
         self._stable_frames = 0
         self._armed_by_delta = False
         self._tap_pending = False
         self._double_candidate = False
+        self._rescue_candidate = False
+        # 注意：_rescue_deadline 不在此清——补发单击后靠它在 RESCUE_DBL 状态判超时
         self._wait_deadline = 0.0
         # ⭐ 冷却时不清空 bend_ratio_hist（保留弯曲尾部的差分，让"连点"的第二次 tap 也能被差分准确识别）
         #   但要手动 push 一个"当前伸直值"，让下一帧 IDLE 阶段的 ΣΔ 不会被上一个 tap 的尾巴误触发
@@ -633,9 +801,14 @@ class FingerTapClickDetector:
             "tap_count":      self.tap_count,
             "long_count":     self.long_count,
             "double_count":   self.double_count,
-            # 双击窗口剩余秒数（WAIT_DBL 中 >0；其余状态=0）
-            "dbl_window_left": round(max(0.0, self._wait_deadline - time.time()), 3)
+            # 双击窗口剩余秒数（WAIT_DBL 中 >0；其余状态=0）：趋势确认前=短窗剩余，确认后=完整窗剩余
+            "dbl_window_left": round(max(0.0, (self._wait_deadline if self._wait_trend_seen
+                                               else self._wait_trend_deadline) - time.time()), 3)
                                 if self.state == _S.WAIT_DBL else 0.0,
+            "dbl_trend_seen": self._wait_trend_seen,
+            # 补救窗口剩余秒数（RESCUE_DBL 中 >0；其余状态=0）
+            "rescue_window_left": round(max(0.0, self._rescue_deadline - time.time()), 3)
+                                if self.state == _S.RESCUE_DBL else 0.0,
             # ⭐ 差分点击新增字段（给 UI 条/调试）
             "bend_ratio":     round(
                 (self._smoothed_bend / max(self._baseline, 1e-6)) if (self._baseline is not None and self._smoothed_bend is not None) else 0.0,

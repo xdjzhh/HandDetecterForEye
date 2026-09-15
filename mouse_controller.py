@@ -134,6 +134,13 @@ pyautogui.PAUSE = 0.0
 #   把第二击坐标强制吸到第一击精确像素（Δpos=0，稳过位置门槛）；超过阈值说明是两个不同
 #   目标的连续单击，不吸附。单位：屏幕像素。
 TAP_DBL_SNAP_PX = 60
+# ⭐ 慢节奏双击补救（OS_DOUBLE_CLICK=False 延迟模式）的位置门控阈值：
+#   体感勾指"双击"实测间隔 1.5~3.3s，远超 OS 500ms 双击窗，补发 click#1 后第二击若发普通 click，
+#   资源管理器会把"选中后慢速再点文件名"判为重命名。补救窗口内第二击落点距 click#1 ≤ 本阈值时
+#   判定为"同一图标双击意图"→ 原子 doubleClick（内部两次点击几十ms，OS 必判双击打开）并吸附坐标；
+#   超过阈值说明手已移到别的图标 → 降级普通 click。阈值比 TAP_DBL_SNAP_PX 宽（慢节奏手漂更大，
+#   且桌面图标尺寸普遍 50~100px）。单位：屏幕像素。
+RESCUE_DBL_SNAP_PX = 100
 # ⭐ 2026-08-22 补充：显式锁死"动作内部最小耗时 / 最小休眠"为 0
 #   PAUSE=0 只保证"两个动作之间"不强制 sleep 0.1s；
 #   MINIMUM_DURATION（默认 0，已安全）是 moveTo/click 内部 duration 参数若 < MINIMUM_DURATION 则直接置 0（duration=0 → 无过渡，瞬时跳转）；
@@ -974,7 +981,7 @@ class MouseController:
         """
         from finger_tap_click_detector import E as _TE
         if screen_pt is None:
-            if tap_event in (_TE.TAP_CLICK, _TE.DOUBLE_TAP, _TE.LONG_DOWN):
+            if tap_event in (_TE.TAP_CLICK, _TE.DOUBLE_TAP, _TE.RESCUE_DBL_TAP, _TE.LONG_DOWN):
                 print(f"[TAP-DIAG] ✗✗ 点击事件 ev={tap_event} 被丢弃：触发帧手不在画面(screen_pt=None)", flush=True)
             return
         ix, iy = int(screen_pt[0]), int(screen_pt[1])
@@ -1024,6 +1031,35 @@ class MouseController:
             # 双击窗口内完成第二次"勾指回弹" → doubleClick
             # 第一次单击挂起未发，所以物理点击恰好 2 次 = 原生双击（不会多出第 3 次点击）
             pyautogui.doubleClick(ix, iy, button="left")
+            if self._drag_active:
+                try: pyautogui.mouseUp()
+                except Exception: pass
+            self._drag_active = False
+        elif tap_event == _TE.RESCUE_DBL_TAP:
+            # 慢节奏双击补救：补发 click#1 后 3.0s 补救窗内的第二击（真机两次勾指间隔 1.5~3.3s）。
+            # 位置门控：落点与 click#1 ≤ RESCUE_DBL_SNAP_PX = 同一图标双击意图 → 原子 doubleClick
+            # （内部两次点击间隔几十ms，OS 必判双击打开，规避"选中后慢点击=重命名"）；
+            # 落点已移到别处 = 普通单击别的图标。
+            _xy0 = getattr(self, "_dbg_last_click_xy", None)
+            if _xy0 is not None:
+                _dpos = ((ix - _xy0[0]) ** 2 + (iy - _xy0[1]) ** 2) ** 0.5
+            else:
+                _dpos = 0.0
+            if _xy0 is not None and _dpos <= RESCUE_DBL_SNAP_PX:
+                # 同一图标 → 吸附到 click#1 精确像素，原子双击打开
+                print(f"[CLICK-DIAG] 🔁 补救双击(慢节奏) 落点({ix},{iy}) 距click#1 {_dpos:.1f}px≤{RESCUE_DBL_SNAP_PX}px "
+                      f"→ doubleClick({_xy0[0]},{_xy0[1]}) 原子双击打开", flush=True)
+                pyautogui.doubleClick(_xy0[0], _xy0[1], button="left")
+                # 双击已由本次原子操作完成，清点击记录避免后续干扰
+                self._dbg_last_click_xy = None
+                self._dbg_last_click_t = None
+            else:
+                # 手已移到别的图标 → 降级普通单击
+                print(f"[CLICK-DIAG] 补救第二击 落点({ix},{iy}) 距click#1 {_dpos:.1f}px>{RESCUE_DBL_SNAP_PX}px "
+                      f"→ 判定为不同目标，降级普通click", flush=True)
+                pyautogui.click(ix, iy, button="left")
+                self._dbg_last_click_t = time.time()
+                self._dbg_last_click_xy = (ix, iy)
             if self._drag_active:
                 try: pyautogui.mouseUp()
                 except Exception: pass

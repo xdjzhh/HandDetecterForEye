@@ -1544,8 +1544,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 print(f"  [ERROR] top-band tap log 异常：{_tap_log_e!r}\n{_tb.format_exc()}", flush=True)
 
             if not disable_click_for_stretch_global and stretch.state != _DS.SCALING:
-                # 1=单击(窗口超时补发) 2=长按按下 5=双击：都要求鼠标钉在当前位置完成动作
-                if tap_event in (1, 2, 5):
+                # 1=单击(窗口超时补发) 2=长按按下 5=双击(快速原子) 6=慢节奏补救双击：都要求鼠标钉在当前位置完成动作
+                if tap_event in (1, 2, 5, 6):
                     # freeze_for_click 冻结位置 = 同帧 move_only 输出位置（smoother 已被冻结，后续几帧都返回相同像素点）
                     mouse._smoother.freeze_for_click()
                 if tap_event != 0:
