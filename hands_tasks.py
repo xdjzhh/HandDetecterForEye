@@ -717,6 +717,12 @@ def _open_backend_once(cid, be, be_name, round_idx, target_w, target_h, _mjpg, a
                 except Exception: pass
             return None, None
 
+        # ---- 低延迟：驱动缓冲队列压到 1 帧（2026-09-15）----
+        #   不设置时部分驱动（尤其 MSMF）会缓存 2~N 帧旧帧，cap.read() 拿到的是旧画面 → 鼠标位置整体慢半拍（~33ms+/帧）。
+        #   DSHOW 普遍支持该属性；MSMF 部分驱动静默不接受 → set 无效但无害，预热多读几帧也能排空旧帧。
+        try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception: pass
+
         # ---- 媒体类型协商：先 MJPG，再分辨率、帧率 ----
         try: cap.set(cv2.CAP_PROP_FOURCC, _mjpg)
         except Exception: pass
@@ -741,8 +747,10 @@ def _open_backend_once(cid, be, be_name, round_idx, target_w, target_h, _mjpg, a
         # ---- 预热 + 黑帧检测 ----
         ok_w, n_read, n_nonblack, w_ms, last_mean = _warmup_capture(cap)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        try: _buf_n = int(cap.get(cv2.CAP_PROP_BUFFERSIZE) or 0)
+        except Exception: _buf_n = -1
         attempts.append(
-            f"[{name}#轮{round_idx}]({_tag}) open=OK {aw}×{ah}@{afps:.0f}fps "
+            f"[{name}#轮{round_idx}]({_tag}) open=OK {aw}×{ah}@{afps:.0f}fps buf={_buf_n} "
             f"预热:读{n_read}帧/非黑{n_nonblack}/末帧亮度{last_mean:.0f} "
             f"预热{w_ms:.0f}ms/总{elapsed_ms:.0f}ms → {'✔采用' if ok_w else '✗全黑或死帧，弃用'}"
         )
