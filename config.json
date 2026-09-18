@@ -8,6 +8,8 @@
   "_comment_flask_port": "Flask HTTP 服务监听的端口号（默认 8000，若被占用则改为其他未占用端口如 8001/9000）",
   "preview_default": true,
   "_comment_preview_default": "/run 接口未传 preview 参数时的默认预览行为： true = 弹出 OpenCV 预览窗观察手势识别 UI（适合调试）； false = 纯后台识别无窗口，节省 GPU/CPU 资源（适合后台挂着用）",
+  "log_enabled": true,
+  "_comment_log_enabled": "日志总开关（修改后重启服务生效）： true = 所有日志在输出到终端的同时写入项目 logs/handdetecter_YYYY-MM-DD.log（按天切分、保留7天、跨天自动换文件）； false = 静默模式，stdout 日志既不打印也不写文件（stderr 错误/崩溃堆栈仍直达终端，不会被吞）",
   "server_argv": [
     "--use-tasks",
     "--roi-scale",

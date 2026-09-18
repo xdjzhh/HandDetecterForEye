@@ -566,6 +566,239 @@ class ARSmoother:
 
 
 # ============================================================================
+# 双指右键：落点目标探测（MSAA / oleacc，纯 ctypes，零额外依赖）
+#   判定屏幕坐标下是否是"文件/应用/图标/按钮"等具名可选项：
+#     · 有目标 → 先左键单击选中，再弹右键菜单（保证菜单属于该目标）
+#     · 无目标 → 直接空右键（桌面/文件夹/窗口空白处的右键菜单）
+# ============================================================================
+import ctypes
+from ctypes import wintypes
+
+# MSAA accRole 中视为"可选目标"的角色（文件项/应用/图标/按钮/链接/单元格…）
+_MSAA_TARGET_ROLES = {
+    12,  # MENUITEM      菜单项
+    22,  # TOOLBAR       工具栏（上面的按钮 MSAA 有时不展开）
+    29,  # CELL          表格/列表单元格（资源管理器详细视图）
+    30,  # LINK          链接
+    34,  # LISTITEM      列表项（桌面图标/资源管理器文件 = 它）
+    36,  # OUTLINEITEM   树项
+    37,  # PAGETAB       标签页
+    40,  # GRAPHIC       图形（部分图标视图）
+    41,  # STATICTEXT    静态文本/标签（左键选中再右键安全）
+    42,  # TEXT          可编辑文本（左键落光标，右键弹编辑菜单）
+    43,  # PUSHBUTTON    按钮（任务栏应用按钮/开始磁贴）
+    44,  # CHECKBUTTON
+    45,  # RADIOBUTTON
+    46,  # COMBOBOX
+    47,  # DROPLIST
+    49,  # DIAL
+    51,  # SLIDER
+    52,  # SPINBUTTON
+    56, 57, 58,  # BUTTONDROPDOWN / BUTTONMENU / BUTTONDROPDOWNGRID
+}
+# 这些窗口类上"原生右键本身就正确"，左键先点反而坏事（任务栏：激活/最小化；开始键：打开开始菜单）
+_MSAA_SKIP_SELECT_CLASSES = {"MSTaskListWClass", "Start", "TrayNotifyWnd", "TrayClockWClass"}
+_MSAA_ROLE_NAMES = {
+    9: "WINDOW", 10: "CLIENT", 12: "MENUITEM", 14: "APPLICATION", 16: "PANE",
+    20: "GROUPING", 22: "TOOLBAR", 29: "CELL", 30: "LINK", 33: "LIST",
+    34: "LISTITEM", 36: "OUTLINEITEM", 37: "PAGETAB", 40: "GRAPHIC",
+    41: "STATICTEXT", 42: "TEXT", 43: "BUTTON", 44: "CHECKBUTTON",
+    45: "RADIOBUTTON", 46: "COMBOBOX", 47: "DROPLIST", 59: "WHITESPACE",
+}
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_byte * 8)]
+
+
+class _VARUNION(ctypes.Union):
+    # 真实 VARIANT 联合含 VT_DECIMAL，64 位下宽度必须是 16 字节（否则整个 VARIANT 24→16，
+    # AccessibleObjectFromPoint 会直接 E_INVALIDARG 0x80070057）
+    _fields_ = [("lVal", ctypes.c_long),
+                ("llVal", ctypes.c_longlong),
+                ("pdispVal", ctypes.c_void_p),
+                ("bstrVal", ctypes.c_void_p),
+                ("_decimal", ctypes.c_byte * 16)]
+
+
+class _VARIANT(ctypes.Structure):
+    # 64 位布局：vt 等 8 字节头 + 16 字节联合（共 24 字节）
+    _fields_ = [("vt", ctypes.c_ushort),
+                ("wReserved1", ctypes.c_ushort),
+                ("wReserved2", ctypes.c_ushort),
+                ("wReserved3", ctypes.c_ushort),
+                ("u", _VARUNION)]
+
+
+_IID_IACCESSIBLE = _GUID(0x618736E0, 0x3C3D, 0x11CF,
+                         (ctypes.c_byte * 8)(0x81, 0x0C, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71))
+_VT_I4, _VT_DISPATCH = 3, 9
+_probe_inited = False
+
+
+def _init_msaa_prototypes():
+    """绑定一次函数原型（进程内复用）。"""
+    global _probe_inited
+    if _probe_inited:
+        return
+    oleacc = ctypes.windll.oleacc
+    oleacc.AccessibleObjectFromPoint.argtypes = [
+        wintypes.POINT, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(_VARIANT)]
+    oleacc.AccessibleObjectFromPoint.restype = ctypes.c_long
+    user32 = ctypes.windll.user32
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.WindowFromPoint.restype = ctypes.c_void_p
+    user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    oleaut32 = ctypes.windll.oleaut32
+    oleaut32.SysFreeString.argtypes = [ctypes.c_void_p]
+    oleaut32.SysFreeString.restype = None
+    _probe_inited = True
+
+
+def _vtbl_fn(vtbl_ptr, idx, restype, *argtypes):
+    proto = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
+    slot = ctypes.cast(vtbl_ptr, ctypes.POINTER(ctypes.c_void_p))[idx]
+    return proto(slot)
+
+
+def probe_ui_target(x: int, y: int) -> tuple[bool, str]:
+    """探测屏幕 (x,y) 下是否为具名可选目标。返回 (has_target, 描述串)。任何失败都安全降级为 False。"""
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        return False, "MSAA 探测仅支持 64 位 Python → 按空右键处理"
+    try:
+        _init_msaa_prototypes()
+        user32 = ctypes.windll.user32
+        oleacc = ctypes.windll.oleacc
+        oleaut32 = ctypes.windll.oleaut32
+        pt = wintypes.POINT(int(x), int(y))
+
+        cls = ""
+        hwnd = user32.WindowFromPoint(pt)
+        if hwnd:
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, buf, 256)
+            cls = buf.value
+
+        pacc = ctypes.c_void_p()
+        vchild = _VARIANT()
+        hr = oleacc.AccessibleObjectFromPoint(pt, ctypes.byref(pacc), ctypes.byref(vchild))
+        if hr != 0 or not pacc.value:
+            return False, f"无对象(hr=0x{hr & 0xFFFFFFFF:08X}) class='{cls}'"
+
+        p_use = pacc
+        var_use = vchild
+        p_extra = None
+        try:
+            # child 返回的是 IDispatch（子窗口独立可访问对象）→ QI 成 IAccessible，child 改 SELF
+            if vchild.vt == _VT_DISPATCH and vchild.u.pdispVal:
+                p_disp = ctypes.c_void_p(vchild.u.pdispVal)
+                vt_disp = ctypes.cast(p_disp.value, ctypes.POINTER(ctypes.c_void_p))[0]
+                qi = _vtbl_fn(vt_disp, 0, ctypes.c_long,
+                              ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p))
+                p_extra = ctypes.c_void_p()
+                if qi(p_disp, ctypes.byref(_IID_IACCESSIBLE), ctypes.byref(p_extra)) != 0 \
+                        or not p_extra.value:
+                    return False, f"子对象 QI 失败 class='{cls}'"
+                p_use = p_extra
+                var_use = _VARIANT()
+                var_use.vt = _VT_I4
+                var_use.u.lVal = 0   # CHILDID_SELF
+
+            vt = ctypes.cast(p_use.value, ctypes.POINTER(ctypes.c_void_p))[0]
+            # IAccessible::get_accName(idx=10) / get_accRole(idx=13)，VARIANT 按值传
+            fn_name = _vtbl_fn(vt, 10, ctypes.c_long, _VARIANT, ctypes.POINTER(ctypes.c_void_p))
+            fn_role = _vtbl_fn(vt, 13, ctypes.c_long, _VARIANT, ctypes.POINTER(_VARIANT))
+
+            bstr = ctypes.c_void_p()
+            name = ""
+            if fn_name(p_use, var_use, ctypes.byref(bstr)) == 0 and bstr.value:
+                name = ctypes.wstring_at(bstr.value)
+                oleaut32.SysFreeString(bstr)
+
+            role = 0
+            role_var = _VARIANT()
+            if fn_role(p_use, var_use, ctypes.byref(role_var)) == 0 and role_var.vt == _VT_I4:
+                role = int(role_var.u.lVal)
+        finally:
+            try:
+                rel = _vtbl_fn(ctypes.cast(pacc.value, ctypes.POINTER(ctypes.c_void_p))[0],
+                               2, ctypes.c_ulong)
+                rel(pacc)
+            except Exception:
+                pass
+            if p_extra is not None and p_extra.value:
+                try:
+                    rel = _vtbl_fn(ctypes.cast(p_extra.value, ctypes.POINTER(ctypes.c_void_p))[0],
+                                   2, ctypes.c_ulong)
+                    rel(p_extra)
+                except Exception:
+                    pass
+
+        role_txt = _MSAA_ROLE_NAMES.get(role, f"role{role}")
+        desc = f"{role_txt} name='{name.strip()[:40]}' class='{cls}'"
+        has_target = bool(name.strip()) and role in _MSAA_TARGET_ROLES
+        if has_target and cls in _MSAA_SKIP_SELECT_CLASSES:
+            return False, f"{desc}（任务栏/开始键：原生右键即可，跳过选中）"
+        return has_target, desc
+    except Exception as e:
+        return False, f"MSAA 探测异常({e!r}) → 按空右键处理"
+
+
+# ============================================================================
+# 双指右键：极速 选中+右键 序列（Win32 SendInput 批量发事件，左选→右键 中间零额外延迟）
+#   pyautogui 的 mouseDown/mouseUp 逐次调用有 Python 层开销，且旧方案有 20~60ms sleep；
+#   这里把 left-down / left-up / right-down / right-up 四个 MOUSEINPUT 一次性 SendInput，
+#   操作系统按队列顺序处理，左选与右键之间仅隔 OS 消息派发的亚毫秒级延迟。
+# ============================================================================
+_MOUSEEVENTF_LEFTDOWN  = 0x0002
+_MOUSEEVENTF_LEFTUP    = 0x0004
+_MOUSEEVENTF_RIGHTDOWN = 0x0008
+_MOUSEEVENTF_RIGHTUP   = 0x0010
+_INPUT_MOUSE = 0
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong),
+                ("union", _INPUT_UNION)]
+
+
+def _fast_click_sequence(x: int, y: int, select_first: bool) -> None:
+    """极速：SetCursorPos 定位 → 一次 SendInput 批量发全部事件。
+    select_first=True  →  left-down, left-up, right-down, right-up  （选中目标再右键）
+    select_first=False →  right-down, right-up                     （空白处空右键）
+    所有事件塞在同一个 SendInput 调用里，OS 按队列顺序处理，左选与右键之间无任何 Python 层延迟。"""
+    user32 = ctypes.windll.user32
+    user32.SetCursorPos(int(x), int(y))
+    flags = []
+    if select_first:
+        flags += [_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP]
+    flags += [_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP]
+    n = len(flags)
+    arr = (_INPUT * n)()
+    for k, fl in enumerate(flags):
+        arr[k].type = _INPUT_MOUSE
+        arr[k].union.mi.dwFlags = fl
+    user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(_INPUT))
+
+
+# ============================================================================
 class MouseController:
     def __init__(self, screen_size=None, cursor_mode: str = CURSOR_MODE_SMOOTH,
                  roi_scale: float = DEFAULT_ROI_SCALE,
@@ -984,12 +1217,39 @@ class MouseController:
         """
         from finger_tap_click_detector import E as _TE
         if screen_pt is None:
-            if tap_event in (_TE.TAP_CLICK, _TE.DOUBLE_TAP, _TE.RESCUE_DBL_TAP, _TE.LONG_DOWN):
+            if tap_event in (_TE.TAP_CLICK, _TE.DOUBLE_TAP, _TE.RESCUE_DBL_TAP,
+                             _TE.RIGHT_TAP, _TE.LONG_DOWN):
                 print(f"[点击异常] 事件 ev={tap_event} 被丢弃：触发帧手不在画面(screen_pt=None)")
             return
         ix, iy = int(screen_pt[0]), int(screen_pt[1])
 
-        if tap_event == _TE.TAP_CLICK:
+        if tap_event == _TE.RIGHT_TAP:
+            # 食中双指并拢勾按回弹 → 右键单击（独立分支：不写入左键双击诊断簿记，
+            # 避免右键污染 click#1 坐标导致后续左键双击吸附/补救误判）
+            #
+            # ⭐ 2026-09-16 落点感知：光标下若有文件/应用/图标 → 先左键单击选中目标再弹右键，
+            #   保证右键菜单属于该目标；空白处（无具名可选对象）→ 直接空右键弹空白菜单。
+            # ⭐ 2026-09-17 极速：用 Win32 SendInput 把 左选+右键 全部事件塞进一次调用，
+            #   左选与右键之间无 Python 层延迟、无 sleep（OS 消息队列顺序派发，选中态即时落账）。
+            _t0 = time.time()
+            has_target, target_desc = probe_ui_target(ix, iy)
+            _probe_ms = (time.time() - _t0) * 1000.0
+            try:
+                _fast_click_sequence(ix, iy, select_first=has_target)
+            except Exception:
+                try:
+                    pyautogui.mouseDown(ix, iy, button="right")
+                    pyautogui.mouseUp(button="right")
+                except Exception:
+                    pass
+            _total_ms = (time.time() - _t0) * 1000.0
+            print(f"[右键] ({ix},{iy}) → {'★有目标：已选中→右键' if has_target else '○空白：直接空右键'} "
+                  f"| probe={_probe_ms:.0f}ms total={_total_ms:.0f}ms | {target_desc}", flush=True)
+            if self._drag_active:
+                try: pyautogui.mouseUp()
+                except Exception: pass
+            self._drag_active = False
+        elif tap_event == _TE.TAP_CLICK:
             # ===== [CLICK-DIAG] 双击可行性诊断（OS 双击=时间+位置双门槛）=====
             try:
                 import time as _t, ctypes as _ct

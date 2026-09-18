@@ -101,13 +101,10 @@ TREND_CONFIRM_FRAMES = 2      # 连续满足的帧数（防单帧噪声误延长
 #   更慢节奏，超过 2.5s 的第二击会被当成两次独立单击（窗口期间光标移动/其他手势均不受影响）。
 #   超时无第二击 = 真·单击，回 IDLE。
 RESCUE_DBL_WINDOW_SEC     = 2.5   # 进入 RESCUE 状态 → 第二击弯曲开始 的最大间隔（秒）
-# ⭐ 等待双击期间的"丢手宽限"（2026-09-10 真机修复）：
-#   WAIT_DBL/RESCUE_DBL 等待第二击时，手要复位/移动，MediaPipe 极易短暂丢帧或触发掌心不稳门控
-#   （index_bend=None）。旧逻辑一帧 None 就把整个等待窗口作废回 IDLE → 第二击被当成全新第一击，
-#   慢双击永远配不上对。真机实测等待窗长达数秒，要求每帧都追踪到手不现实。
-#   改为：连续丢手 ≤ 本宽限 → 保留状态/窗口/deadline（期间不更新基线、不清窗口）；
-#   超过宽限仍无手（手真的离开了）→ 窗口作废回 IDLE。
-NONE_GRACE_SEC            = 1.0   # WAIT_DBL/RESCUE_DBL 中连续 bend=None 的最大保留时间（秒）
+# ⭐ 等待双击期间的 bend=None（丢帧/掌心不稳门控）处理：
+#   2026-09-17 用户拍板【取消丢手宽限】（曾有 NONE_GRACE_SEC=1.0s 保留窗口的方案，已删除）：
+#   WAIT_DBL/RESCUE_DBL 中一旦 bend=None → 立即结束序列（WAIT 立即补发挂起的 click#1 回 IDLE，
+#   不再开 RESCUE；RESCUE 直接回 IDLE）。手完全消失时 screen_pt=None，事件在 mouse_controller 层丢弃。
 # ⭐ 实验开关（2026-09-10）：双击判定归属
 #   True  = 每次勾按【立即】click()，单击零延迟；快速连勾两次 = 两组 down/up，
 #           由 Windows 双击时间（默认500ms/位置容差）自然识别为双击（和物理鼠标行为完全一致；
@@ -120,6 +117,48 @@ OS_DOUBLE_CLICK = False
 #   ARM=起弯  TAP=点击发出  LONG=长按转换(双击被吞的头号嫌疑)  SPIKE=尖峰拒绝  NONE帧=掌心不稳被门控
 #   2026-09-15：日常使用默认关闭（控制台刷屏会拖慢主循环、影响鼠标流畅度）；排查点击问题时临时改 True
 TAP_DIAG = False
+
+# ⭐ 真机测量（2026-09-17）：纯内存计数 + 周期摘要，【不参与任何判定逻辑】（零风险）。
+#   每 TAP_STATS_PRINT_SEC 秒打印一行 [TAP-STAT]：帧率/None占比/ARM入口占比/尖峰拒绝/
+#   点击段内None/首击/单击送达/双击/趋势确认/补救/长按/丢手杀等待次数/回弹与送达延迟分布。
+#   用途：拿真机分布数据决定后续"墙钟化/丢手宽限/自适应平滑"的参数，不盲调。
+TAP_STATS = True
+TAP_STATS_PRINT_SEC = 20.0   # 摘要打印周期（秒）；仅时间判断+一行 print，不拖主循环
+
+# ⭐ 双指并拢右键手势（2026-09-16，食+中并拢同时勾按=鼠标右键）：
+#   2026-09-17 v7（用户拍板：分阶段阈值 + 起势顺序门）：
+#     真机深弯实测：起势帧 TIP≈0.5；勾到 HOLD 帧 DIP≈0.95、TIP≈1.33（深弯遮挡越靠指尖失真越大）。
+#     → 两排阈值分阶段使用：
+#       · 起势（IDLE，手指尚高、无遮挡）：TIP ≤ TIP_ENTRY_R(0.80) —— 指尖先并拢才准起势；
+#       · 手势中（ARMED/HOLD/PRESSED，深弯遮挡）：改看 DIP ≤ DIP_HOLD_R(1.30)，
+#         TIP 再炸也不解散（用户真机值 DIP 0.947 放行）。
+#     → 起势顺序门（修"单击灵敏度下降"）：
+#       单指点击时中指蜷在掌心，食指勾【到底】时指尖才扫近中指尖（TIP 瞬间 ≤0.8），
+#       若此时即起弯会 freeze_left + cancel_in_progress 掐断正在识别的左键 → 单击被吞。
+#       真右键 = 先举着并拢手（高 bend）持续 ≥3 帧，再勾；单指点击 = 先弯到底才碰巧并拢。
+#       故要求：bend ≥ ENTRY_BEND(0.55，不要求伸直) 的 TIP 并拢帧连续 ≥ ENTRY_FRAMES(3) 帧，
+#       才允许进 ARMED。资格取得后下弯帧不再要求 bend 线；指尖张开立即清零重来。
+#     ⭐ 左键参数从未修改：单击变迟钝的唯一通道是右指检测器误 ARM 后的 freeze/cancel，本门修复。
+TWO_FINGER_TIP_ENTRY_R = 0.80   # 起势：TIP排/米制掌宽 ≤ 此值（实测起势帧 0.34~0.66）
+TWO_FINGER_DIP_HOLD_R = 1.30    # 手势中：DIP排/米制掌宽 ≤ 此值（深弯 TIP 失真，实测 DIP≤0.95）
+TWO_FINGER_ENTRY_BEND = 0.55    # 起势资格帧的最低合成 bend（0.55=明显尚未深弯，微弯悬停可过）
+TWO_FINGER_ENTRY_FRAMES = 3     # 高 bend 指尖并拢连续帧数（30fps≈0.1s）才允许 ARMED
+#   双指右键不做双击语义：弯曲/回弹判据【逐条照搬左键 FingerTapClickDetector 模板】（2026-09-17 重构）：
+#     · 唯一输入是"双指单元合成 bend"（四关节中点代入与左键相同的关节角公式）→ 单条 r 序列；
+#       下游 down/up 差分、尖峰确认、短按窗、长按帧全部直接跑左键同一套 resolve_tap_params 公式；
+#     · 松开 = 回弹变化量 Σ↑达标 OR r 回伸直线（与左键同为"变化量优先"）；
+#     · 右键额外门控：起势 TIP 并拢 + 先并拢顺序门；手势中 DIP 连续失效 2 帧才作废（去抖）。
+#       同步性由四排物理间距直接保证，不需要 min(ri,rm) 软地板 / 落后指等待。
+#   ARMED/HOLD 中 bend=None（丢手/掌心不稳门控）的连续帧上限：30fps≈0.4s，超过作废。
+TWO_FINGER_NONE_GRACE_FRAMES = 12
+# 手势进行中 together 连续失效多少帧才判定为"张开/不同步作废"（1 帧抖动容忍）
+TWO_FINGER_GAP_BREAK_FRAMES = 2
+
+# ⭐ 双指右键手势诊断开关（2026-09-16 识别困难排查）：True 时打印
+#   · [2F-DIAG-HB] 每 30 有效帧一行心跳：gap 并拢度/together/ri/rm/r/阈值/状态
+#   · [2F-DIAG]    关键事件：起弯被拦原因、ARMED 确认/拒绝、HOLD 释放/作废、长按静默、丢帧宽限、触发
+#   识别手感调好后可改 False（与 TAP_DIAG 同样的临时排查用途）。
+TWO_FINGER_DIAG = True
 
 # ⭐ 2026-08-22 差分点击新增常量
 DI_WINDOW = 5                 # 差分窗口：最近 5 帧 bend_ratio（30fps=167ms，刚好是"按下去"的动作时长）
@@ -235,6 +274,7 @@ class E:
     DRAG_MOVE  = 4   # 长按中持续移动
     DOUBLE_TAP = 5   # 双击窗口内完成第二次 Tap（原子 doubleClick，单击不补发）
     RESCUE_DBL_TAP = 6  # 补救窗口内第二击 Tap（mouse_controller 按位置门控：同图标→原子doubleClick打开，异处→普通click）
+    RIGHT_TAP    = 7   # 双指并拢（食+中）同时弯曲回弹 → 鼠标右键单击（无双击语义，每次手势恰好1次右键）
 
 
 class FingerTapClickDetector:
@@ -275,10 +315,28 @@ class FingerTapClickDetector:
         self._rescue_candidate = False  # 当前这段弯曲是否始于补救窗口内（=双击第二击，回弹立即单击）
         self._rescue_deadline = 0.0     # RESCUE_DBL 超时时刻（time.time()）
         self._cooldown_next = _S.IDLE   # COOLDOWN 结束后转入的状态（补发单击后转 RESCUE_DBL）
-        self._none_grace_t = 0.0        # WAIT/RESCUE 等待中连续 bend=None 段的起始时刻（0=当前有手）
         # ⭐ TAP-DIAG 诊断
         self._dbg_arm_t = None          # 最近一次 ARMED 时刻
         self._dbg_none_in_tap = 0       # 当前 ARM/HOLD 段内 bend=None（掌心不稳门控）帧数
+
+        # ⭐ 真机测量（2026-09-17）：纯观测计数，reset() 不清（保留整段会话的统计），绝不参与判定
+        self._st = {
+            "frames": 0, "none": 0,             # update 调用总数 / bend=None 帧数
+            "arm_delta": 0, "arm_abs": 0,       # 起弯次数（差分入口 / 绝对入口）
+            "spike": 0,                         # ARMED 第2帧尖峰拒绝次数
+            "none_ah_frames": 0, "none_ah_seg": 0,  # 点击段(ARM/HOLD)内 None 总帧 / 含 None 的段数
+            "first_tap": 0,                     # 首击回弹进 WAIT_DBL 次数
+            "click": 0,                         # TAP_CLICK 实际发出次数（含超时补发/丢手立即补发）
+            "dbl": 0,                           # DOUBLE_TAP（窗口内第二击原子双击）
+            "trend": 0,                         # WAIT_DBL 中二次下弯趋势确认次数
+            "rescue_tap": 0,                    # RESCUE 补救窗内第二击次数
+            "long": 0,                          # LONG_DOWN 次数
+            "wait_none_cancel": 0,              # WAIT_DBL 遇 None 立即结束次数（原宽限方案已删）
+            "rescue_none_cancel": 0,            # RESCUE_DBL 遇 None 立即结束次数
+        }
+        self._gest_ms: deque = deque(maxlen=200)   # ARM→回弹识别耗时（检测链响应）
+        self._click_ms: deque = deque(maxlen=200)  # ARM→TAP_CLICK 实际送达（含双击等待，用户感知延迟）
+        self._stats_last_t = 0.0
 
         self.tap_count = 0
         self.long_count = 0
@@ -316,13 +374,32 @@ class FingerTapClickDetector:
         self._rescue_candidate = False
         self._rescue_deadline = 0.0
         self._cooldown_next = _S.IDLE
-        self._none_grace_t = 0.0
         # 计数器保留（让 UI 统计不丢），若想清空可自行注释放开：
+        # 注：_st/_gest_ms/_click_ms 真机测量计数同样不在 reset() 清空（整段会话累计观测）。
         # self.tap_count = 0
         # self.long_count = 0
         # self.double_count = 0
         # self.last_tap_time = None
         # self.last_long_time = None
+
+    # ---------------------- 双指右键抢占：静默取消"正在进行的弯曲段"，不发任何事件 ----------------------
+    def cancel_in_progress(self) -> None:
+        """双指并拢右键手势确认占用本帧手势时调用（hands_tasks 仲裁）：
+        若食指已先 1~2 帧起弯进入 ARMED/HOLD，直接丢弃这段、回 IDLE，绝不补发单击，
+        保证"双指右键"和"食指左键"物理互斥（不会同一个动作左右键一起响）。
+        注意：只清进行中的弯曲段；WAIT_DBL 里挂起的"上一次已完成 Tap"不受影响（那是早先独立动作）。
+        """
+        if self.state in (_S.BEND_ARMED, _S.BEND_HOLD):
+            self.state = _S.IDLE
+            self.event_this_frame = E.NONE
+            self._bend_hold_frames = 0
+            self._bend_total_frames = 0
+            self._stable_frames = 0
+            self._armed_by_delta = False
+            self._di_sum_neg_now = 0.0
+            self._di_sum_pos_now = 0.0
+            # 差分队列清掉这段弯曲残留，避免手势结束恢复喂帧时被旧尾巴误触发
+            self._bend_ratio_hist.clear()
 
     # 便捷属性（返回用户友好的 hardness/speed 百分比，供 UI 展示）
     @property
@@ -374,6 +451,57 @@ class FingerTapClickDetector:
             except Exception:
                 pass
 
+    # ---------------------- 真机测量（纯观测，不参与判定）----------------------
+    @staticmethod
+    def _pctle(q: deque, frac: float) -> float | None:
+        if not q:
+            return None
+        s = sorted(q)
+        return s[min(len(s) - 1, int(round(frac * (len(s) - 1))))]
+
+    def _arm_stats(self, by_delta: bool) -> None:
+        self._st["arm_delta" if by_delta else "arm_abs"] += 1
+
+    def _record_gest_ms(self) -> None:
+        """ARM → 本帧回弹识别 的耗时（检测链响应速度）。"""
+        if self._dbg_arm_t:
+            self._gest_ms.append((time.time() - self._dbg_arm_t) * 1000.0)
+
+    def _record_click_ms(self) -> None:
+        """ARM → TAP_CLICK 实际发出 的耗时（延迟双击模式下含等待，= 用户感知单击延迟）。"""
+        if self._dbg_arm_t:
+            self._click_ms.append((time.time() - self._dbg_arm_t) * 1000.0)
+
+    def _stats_maybe_print(self) -> None:
+        if not TAP_STATS:
+            return
+        now = time.time()
+        if self._stats_last_t == 0.0:
+            self._stats_last_t = now
+            return
+        if now - self._stats_last_t < TAP_STATS_PRINT_SEC:
+            return
+        self._stats_last_t = now
+        s = self._st
+        arms = s["arm_delta"] + s["arm_abs"]
+        none_pct = 100.0 * s["none"] / max(1, s["frames"])
+
+        def _dist(q: deque) -> str:
+            if not q:
+                return "avg- p90-"
+            avg = sum(q) / len(q)
+            return f"avg{avg:.0f} p90{self._pctle(q, 0.9):.0f}ms"
+
+        print(
+            f"[TAP-STAT] 帧{s['frames']} None{s['none']}({none_pct:.1f}%) "
+            f"ARM{arms}(差分{s['arm_delta']}/绝对{s['arm_abs']}) 尖峰拒{s['spike']} "
+            f"点击段None{s['none_ah_frames']}帧/{s['none_ah_seg']}段 | "
+            f"首击{s['first_tap']} 单击发出{s['click']} 双击{s['dbl']} "
+            f"趋势确认{s['trend']} 补救击{s['rescue_tap']} 长按{s['long']} | "
+            f"丢手杀等待{s['wait_none_cancel']}/补救{s['rescue_none_cancel']} | "
+            f"回弹 {_dist(self._gest_ms)} | 送达 {_dist(self._click_ms)}",
+            flush=True)
+
     # ---------------------- 主入口 ----------------------
     def update(self, bend: float | None) -> int:
         """
@@ -383,6 +511,12 @@ class FingerTapClickDetector:
             E.{NONE,TAP_CLICK,LONG_DOWN,LONG_UP,DRAG_MOVE} 本帧事件
         """
         self.event_this_frame = E.NONE
+
+        # ⭐ 真机测量：帧计数（纯观测）+ 周期摘要（到点才打印一行，不影响任何判定分支）
+        self._st["frames"] += 1
+        if bend is None:
+            self._st["none"] += 1
+        self._stats_maybe_print()
 
         # ---- 冷却 ----
         if self.state == _S.COOLDOWN:
@@ -408,52 +542,39 @@ class FingerTapClickDetector:
             self._di_sum_neg_now = 0.0
             self._di_sum_pos_now = 0.0
             if self.state in (_S.BEND_HOLD, _S.BEND_ARMED):
+                if self._dbg_none_in_tap == 0:
+                    self._st["none_ah_seg"] += 1      # 本段第一次 None = 又一个受门控影响的点击段
                 self._dbg_none_in_tap += 1
+                self._st["none_ah_frames"] += 1
                 if self._dbg_none_in_tap <= 3 or self._dbg_none_in_tap % 10 == 0:
                     self._diag(f"⚠ bend=None(掌心不稳门控) 状态={self.state} 累计{self._dbg_none_in_tap}帧")
-                # 只是中间态，不算
-            elif self.state in (_S.WAIT_DBL, _S.RESCUE_DBL):
-                # ⭐ 丢手宽限：等待第二击期间短暂丢帧（手复位/移动时 MediaPipe 丢帧、掌心不稳门控）
-                #   不立即作废窗口——真机慢双击间隔 1.5~3.3s，窗内要求每帧追踪到手不现实。
-                _now_none = time.time()
-                if self._none_grace_t == 0.0:
-                    self._none_grace_t = _now_none
-                if _now_none - self._none_grace_t > NONE_GRACE_SEC:
-                    # 连续丢手超宽限（手真的离开画面）→ 窗口作废
-                    self._diag(f"⚠ 连续丢手>{NONE_GRACE_SEC:.1f}s 状态={self.state} → 双击/补救窗口作废")
-                    self.state = _S.IDLE
-                    self._tap_pending = False
-                    self._double_candidate = False
-                    self._rescue_candidate = False
-                    self._wait_deadline = 0.0
-                    self._rescue_deadline = 0.0
-                    self._none_grace_t = 0.0
-                    self._bend_hold_frames = 0
-                    self._bend_total_frames = 0
-                    return E.NONE
-                # 宽限内：墙钟 deadline 照常生效——None 帧只屏蔽"弯曲触发"，不冻结时间：
-                #   ① WAIT_DBL 到点 → click#1 照样补发（单击不丢不延迟，hands_tasks 掌心门控丢手时
-                #      手仍在画面、位置有效；手完全消失则 controller 层丢弃该事件）后进补救窗；
-                #      趋势尚未确认时用短窗截止（无趋势快速补发），确认后用完整窗截止。
-                #   ② RESCUE_DBL 到点 → 真单击，回 IDLE。
-                _wait_eff_dl = self._wait_deadline if self._wait_trend_seen else self._wait_trend_deadline
-                if self.state == _S.WAIT_DBL and _now_none > _wait_eff_dl:
-                    self._tap_pending = False
-                    self._double_candidate = False
-                    self._rescue_candidate = False
-                    self.event_this_frame = E.TAP_CLICK
-                    self.tap_count += 1
-                    self.last_tap_time = _now_none
-                    _why = ("趋势已确认,完整窗超时" if self._wait_trend_seen
-                            else f"趋势短窗{TREND_WAIT_SEC:.2f}s内丢手无趋势→立即补发")
-                    self._diag(f"③ 单击补发({_why}) → "
-                               f"cooldown后开补救窗口{RESCUE_DBL_WINDOW_SEC:.1f}s")
-                    self._enter_cooldown(next_state=_S.RESCUE_DBL)
-                    return self.event_this_frame
-                if self.state == _S.RESCUE_DBL and _now_none > self._rescue_deadline:
-                    self.state = _S.IDLE
-                    self._rescue_candidate = False
-                    self._rescue_deadline = 0.0
+                # 只是中间态，不算（不推进、不判回弹）
+            elif self.state == _S.WAIT_DBL:
+                # ⭐ 2026-09-17 取消丢手宽限：挂着 click#1 时遇 None（丢帧/掌心不稳门控）→
+                #   立即补发单击结束序列，cooldown 后直接回 IDLE（不开 RESCUE：补救窗同样遇 None 即结束）。
+                #   掌心门控丢手时手仍在画面、screen_pt 有效；手完全消失则事件在 controller 层丢弃。
+                self._st["wait_none_cancel"] += 1
+                self._tap_pending = False
+                self._double_candidate = False
+                self._rescue_candidate = False
+                self._wait_deadline = 0.0
+                self._wait_trend_deadline = 0.0
+                self._wait_trend_seen = False
+                self._wait_trend_frames = 0
+                self.event_this_frame = E.TAP_CLICK
+                self.tap_count += 1
+                self.last_tap_time = time.time()
+                self._st["click"] += 1
+                self._record_click_ms()
+                self._diag("③ 单击补发(等待双击中遇None→无宽限立即补发) → cooldown回IDLE")
+                self._enter_cooldown()   # next_state 默认 IDLE
+                return self.event_this_frame
+            elif self.state == _S.RESCUE_DBL:
+                # click#1 已送达；遇 None 立即结束补救序列（真单击），回 IDLE
+                self._st["rescue_none_cancel"] += 1
+                self.state = _S.IDLE
+                self._rescue_candidate = False
+                self._rescue_deadline = 0.0
                 return E.NONE
             elif self.state == _S.PRESSED:
                 self.event_this_frame = E.LONG_UP  # 手丢了 = 释放
@@ -465,7 +586,6 @@ class FingerTapClickDetector:
             return self.event_this_frame
 
         # ---- 有手：平滑 bend ----
-        self._none_grace_t = 0.0  # 恢复追踪：清零丢手宽限计时
         prev_b = self._smoothed_bend
         if self._smoothed_bend is None:
             self._smoothed_bend = float(bend)
@@ -532,10 +652,10 @@ class FingerTapClickDetector:
                 self._double_candidate = False
                 self._dbg_arm_t = time.time()
                 self._dbg_none_in_tap = 0
-                self._diag(f"① ARM 起弯 ratio={bend_ratio:.3f} Σ下={di_sum_down:.3f}/Σ上={di_sum_up:.3f} "
-                           f"入口={'差分' if (down_delta and not down_abs) else '绝对'}")
-                # ⭐ 标记这次进入方式（决定 EXIT 判据的优先级）
                 self._armed_by_delta = bool(down_delta and not down_abs)  # 纯差分进入 = True；兜底或同时 = False 归绝对
+                self._arm_stats(self._armed_by_delta)
+                self._diag(f"① ARM 起弯 ratio={bend_ratio:.3f} Σ下={di_sum_down:.3f}/Σ上={di_sum_up:.3f} "
+                           f"入口={'差分' if self._armed_by_delta else '绝对'}")
             elif B > self._baseline * 0.97:
                 # 非常接近伸直 → 快速更新基线，避免基线长期滞后用户真实伸直姿态变化
                 self._baseline = BASELINE_ALPHA_FAST * B + (1 - BASELINE_ALPHA_FAST) * self._baseline
@@ -557,6 +677,9 @@ class FingerTapClickDetector:
                 self._stable_frames = 0
                 self._double_candidate = True
                 self._armed_by_delta = bool(down_delta and not down_abs)
+                self._arm_stats(self._armed_by_delta)
+                self._dbg_arm_t = time.time()   # 第二击段耗时从第二击起弯算（click#1 延迟已在补发前记完）
+                self._dbg_none_in_tap = 0
             elif not self._wait_trend_seen:
                 # ---- 趋势探测短窗：低门限差分 + 已离开伸直位 + 连续确认（不要求完整点击）----
                 _trend_thr = TREND_DI_FRAC * self._p["TAP_DOWN_DI_SUM"]
@@ -566,6 +689,7 @@ class FingerTapClickDetector:
                     if self._wait_trend_frames >= TREND_CONFIRM_FRAMES:
                         # 二次下弯趋势确认 → 双击意图，延长窗口等完整第二击
                         self._wait_trend_seen = True
+                        self._st["trend"] += 1
                         self._wait_deadline = _now + DOUBLE_TAP_WINDOW_SEC
                         self._diag(f"⓪ 探测到二次下弯趋势 ratio={bend_ratio:.3f} "
                                    f"Σ下={di_sum_down:.3f}≥趋势阈{_trend_thr:.3f} "
@@ -586,6 +710,8 @@ class FingerTapClickDetector:
                 self.event_this_frame = E.TAP_CLICK
                 self.tap_count += 1
                 self.last_tap_time = _now
+                self._st["click"] += 1
+                self._record_click_ms()
                 self._diag(f"③ 单击补发({_fire_reason}) → "
                            f"cooldown后开补救窗口{RESCUE_DBL_WINDOW_SEC:.1f}s，窗内第二击将按位置门控判双击/单击")
                 self._enter_cooldown(next_state=_S.RESCUE_DBL)
@@ -605,6 +731,9 @@ class FingerTapClickDetector:
                 self._rescue_candidate = True
                 self._double_candidate = False
                 self._armed_by_delta = bool(down_delta and not down_abs)
+                self._arm_stats(self._armed_by_delta)
+                self._dbg_arm_t = time.time()   # 补救第二击段耗时从本击起弯算
+                self._dbg_none_in_tap = 0
                 self._diag(f"④ 补救窗口内捕获第二击弯曲 → 回弹将按位置门控发双击(同图标)/单击(异处)")
             elif time.time() > self._rescue_deadline:
                 # 补救窗超时仍无第二击 = 真·单击
@@ -622,6 +751,7 @@ class FingerTapClickDetector:
                     self.state = _S.BEND_HOLD
             else:
                 # 第2帧就不满足了 → 单帧尖峰
+                self._st["spike"] += 1
                 self._diag(f"✗ 尖峰拒绝(第2帧未保持弯曲) ratio={bend_ratio:.3f} Σ下={di_sum_down:.3f} "
                            f"{'双击候选→回WAIT' if self._double_candidate else ('补救候选→回RESCUE' if self._rescue_candidate else '→IDLE')}")
                 if self._double_candidate:
@@ -658,6 +788,9 @@ class FingerTapClickDetector:
                     self.event_this_frame = E.TAP_CLICK
                     self.tap_count += 1
                     self.last_tap_time = time.time()
+                    self._st["click"] += 1
+                    self._record_gest_ms()
+                    self._record_click_ms()
                     self._diag(f"② TAP点击发出(即时) 段长{self._bend_total_frames}帧≈{_seg_ms:.0f}ms "
                                f"None门控{_none_n}帧 ratio={bend_ratio:.3f}")
                     self._enter_cooldown()
@@ -669,6 +802,8 @@ class FingerTapClickDetector:
                     self.event_this_frame = E.DOUBLE_TAP
                     self.double_count += 1
                     self.last_double_time = time.time()
+                    self._st["dbl"] += 1
+                    self._record_gest_ms()
                     self._enter_cooldown(DOUBLE_TAP_COOLDOWN_FRAMES)
                 elif is_tap and self._rescue_candidate:
                     # ⭐ 补救窗口内的第二击 Tap：发 RESCUE_DBL_TAP，由 mouse_controller 按位置门控：
@@ -677,11 +812,15 @@ class FingerTapClickDetector:
                     self._rescue_candidate = False
                     self._rescue_deadline = 0.0
                     self.event_this_frame = E.RESCUE_DBL_TAP
+                    self._st["rescue_tap"] += 1
+                    self._record_gest_ms()
                     self._diag(f"⑤ 补救第二击捕获(段长{self._bend_total_frames}帧≈{_seg_ms:.0f}ms) "
                                f"→ 交mouse_controller按位置门控:同图标=doubleClick打开/异处=普通click")
                     self._enter_cooldown()
                 elif is_tap:
                     # 第一次 Tap：不立即单击 → 进双击窗口等第二次（超时在 WAIT_DBL 补发单击）
+                    self._st["first_tap"] += 1
+                    self._record_gest_ms()
                     self.state = _S.WAIT_DBL
                     self._tap_pending = True
                     self._double_candidate = False
@@ -731,6 +870,7 @@ class FingerTapClickDetector:
                 self.event_this_frame = E.LONG_DOWN
                 self.long_count += 1
                 self.last_long_time = time.time()
+                self._st["long"] += 1
                 self._diag(f"⚠⚠ 转长按LONG_DOWN(没检测到回弹!) 总{self._bend_total_frames}帧 "
                            f"≈{(time.time()-self._dbg_arm_t)*1000.0:.0f}ms None门控{self._dbg_none_in_tap}帧 "
                            f"ratio={bend_ratio:.3f} Σ上={di_sum_up:.3f}(需{self._p['TAP_UP_DI_SUM']}) "
@@ -823,4 +963,450 @@ class FingerTapClickDetector:
             # 把硬度速度也放进去，方便上层 UI 直接拿
             "hardness_pct":   self.hardness_pct,
             "speed_pct":      self.speed_pct,
+        }
+
+
+# ======================================================================
+# 双指并拢右键检测器（2026-09-16）：食指+中指并拢，同时勾按回弹 → 鼠标右键
+# ======================================================================
+class TwoFingerRightClickDetector:
+    """食/中双指并拢 + 双指勾按回弹 → RIGHT_TAP（每次手势恰好 1 次右键，无双击语义）。
+
+    2026-09-17 v7（用户拍板：分阶段阈值 + 起势顺序门）：
+      · 起势（IDLE）：TIP 3D 排 ≤ 0.80（指尖先并拢）且须在 bend≥0.55 时连续并拢 3 帧取得资格，
+        才允许起弯 —— 区分"先并拢后勾"的右键与"弯到底才碰巧并拢"的单指点击（左键不再被抢杀）；
+      · 手势中（ARMED/HOLD/PRESSED）：深弯遮挡 TIP 失真（实测 1.33），改看 DIP 3D 排 ≤ 1.30；
+      · MCP/PIP/spread 不参与判定，仅日志；任意微弯姿态可起势，不要求伸直；
+      · 弯曲度只算一个"双指单元合成 bend"（四关节中点代入与左键相同的关节角公式）。
+    弯曲/回弹状态机逐条照搬左键 FingerTapClickDetector 模板；
+    右键门控 = 起势顺序门 + 手势中 DIP 连续 2 帧失效去抖。
+    """
+
+    def __init__(self, hardness: float | None = None, speed: float | None = None):
+        self._p = resolve_tap_params(hardness=hardness, speed=speed)
+        self.state = _S.IDLE
+        self.event_this_frame = E.NONE
+        # 双指单元合成 bend 的平滑值 / 伸直基线 / 近期伸直高值（单条序列，同左键）
+        self._sm:   float | None = None
+        self._base: float | None = None
+        self._maxr: float | None = None
+        self._hist: deque = deque(maxlen=8)   # 合成 r 的滑窗（差分，同左键 _bend_ratio_hist）
+        self._di_down = 0.0
+        self._di_up = 0.0
+        self._prev_r: float | None = None     # 合成 r 上一帧（同左键 _prev_smoothed_bend，稳定性判定）
+        self._max_recent_r: float | None = None  # 合成 r 近期伸直高值（同左键 _max_recent_bend，drop 用）
+        self._hold_frames = 0
+        self._total_frames = 0
+        self._stable_frames = 0
+        self._cooldown_frames = 0
+        self._armed_by_delta = False
+        self._none_frames = 0
+        self._gap_break_frames = 0            # 手势中 together 连续失效帧计数（去抖）
+        self._entry_frames = 0                # 高 bend 指尖并拢连续帧（起势顺序门资格）
+        self._arm_t = None
+        self._diag_n = 0              # 有效帧计数（心跳节拍，reset 不清零）
+        self._diag_geom_n = 0         # 未并拢帧计数（几何心跳节拍，reset 不清零）
+        self._last_gap: float | None = None
+        self._last_parts: tuple | None = None  # (MCP,PIP,DIP,TIP,spread) 指距比值（仅日志，不参与判定）
+        self.armed_this_frame = False        # 本帧是否 IDLE→ARMED（hands_tasks 据此取消左指检测器）
+        self.right_count = 0
+
+    # ------------------------------------------------------------
+    @staticmethod
+    def _diag(msg: str) -> None:
+        if TWO_FINGER_DIAG:
+            print(f"[2F-DIAG] {msg}", flush=True)
+
+    # ------------------------------------------------------------
+    def reset(self) -> None:
+        """双手出现 / 拉伸缩放等全局禁用场景调用：清空全部进行中状态。"""
+        self.state = _S.IDLE
+        self.event_this_frame = E.NONE
+        self._sm = None
+        self._base = None
+        self._maxr = None
+        self._hist.clear()
+        self._di_down = 0.0
+        self._di_up = 0.0
+        self._prev_r = None
+        self._max_recent_r = None
+        self._hold_frames = 0
+        self._total_frames = 0
+        self._stable_frames = 0
+        self._cooldown_frames = 0
+        self._armed_by_delta = False
+        self._none_frames = 0
+        self._gap_break_frames = 0
+        self._entry_frames = 0
+        self._arm_t = None
+        self.armed_this_frame = False
+        # right_count 保留（UI 统计不丢）
+
+    @property
+    def is_active(self) -> bool:
+        """手势进行中（ARMED/HOLD/PRESSED）：hands_tasks 在此期间冻结左指检测器。"""
+        return self.state in (_S.BEND_ARMED, _S.BEND_HOLD, _S.PRESSED)
+
+    @property
+    def freeze_left(self) -> bool:
+        """左指冻结范围 = 手势进行中 + 冷却尾帧。
+        ⭐ 冷却尾帧必须冻结：右键触发帧状态转 COOLDOWN，当帧/随后 2~3 帧的双指回弹 bend 值
+        若漏喂给左指检测器，会被它当成一次独立食指勾按（虚构 Tap 挂起，之后与真左键配成误双击）。"""
+        return self.state in (_S.BEND_ARMED, _S.BEND_HOLD, _S.PRESSED, _S.COOLDOWN)
+
+    # ------------------------------------------------------------
+    def _to_idle(self) -> None:
+        self.state = _S.IDLE
+        self._hold_frames = 0
+        self._total_frames = 0
+        self._stable_frames = 0
+        self._armed_by_delta = False
+        self._none_frames = 0
+        self._gap_break_frames = 0
+        self._entry_frames = 0
+        self._hist.clear()
+        self._di_down = 0.0
+        self._di_up = 0.0
+
+    def _enter_cooldown(self) -> None:
+        self.state = _S.COOLDOWN
+        self._cooldown_frames = self._p["COOLDOWN_FRAMES"]
+        self._hold_frames = 0
+        self._total_frames = 0
+        self._stable_frames = 0
+        self._armed_by_delta = False
+        self._none_frames = 0
+        self._gap_break_frames = 0
+        # ⭐ 2026-09-18 真机修复：手势结束（右键触发/长按静默/PRESSED结束）→ 起势资格必须失效。
+        #   旧实现此处不清 _entry_frames，一次右键后资格永久停在 3/3；之后单指勾按（TIP 全程张开
+        #   1.3~1.7、DIP=1.0~1.17<1.30）凭旧资格走"低 bend 有资格放行"分支，全部误判成右键连发，
+        #   且 freeze_left 把左键掐断。资格是一次性门票（与 _to_idle 对称清零，ARM 转换处也会消费）。
+        self._entry_frames = 0
+        # 推两帧近伸直值，让冷却后 IDLE 的差分立刻回 0（防连按残留，同左键手法）
+        if self._base is not None and self._sm is not None:
+            for _ in range(2):
+                self._hist.append(self._sm / max(self._base, 1e-6))
+
+    def _smooth(self, b: float) -> float:
+        """单条合成 bend 序列的 EMA 平滑 + 近期伸直高值 + 基线初始化（同左键）。"""
+        alpha = self._p["BEND_SMOOTH_ALPHA"]
+        if self._sm is None:
+            self._sm = float(b)
+        else:
+            self._sm = alpha * float(b) + (1.0 - alpha) * self._sm
+        if self._maxr is None:
+            self._maxr = self._sm
+        elif self._sm > self._maxr:
+            self._maxr = self._sm
+        else:
+            self._maxr = 0.985 * self._maxr + 0.015 * self._sm
+        if self._base is None:
+            self._base = self._sm
+        return float(self._sm)
+
+    def _learn_baseline_idle(self) -> None:
+        """IDLE 下双指近伸直时慢速学习基线（同左键规则）。"""
+        b, base = self._sm, self._base
+        if b is None or base is None:
+            return
+        if b > base * 0.95:
+            self._base = BASELINE_ALPHA_IDLE * b + (1.0 - BASELINE_ALPHA_IDLE) * base
+        if b > base * 0.97:
+            self._base = BASELINE_ALPHA_FAST * b + (1.0 - BASELINE_ALPHA_FAST) * self._base
+
+    def _compute_di(self, r: float) -> tuple[float, float]:
+        self._hist.append(float(r))
+        if len(self._hist) < 2:
+            self._di_down, self._di_up = 0.0, 0.0
+            return 0.0, 0.0
+        win = self._p["DI_WINDOW"]
+        hist = list(self._hist)
+        if len(hist) > win + 1:
+            hist = hist[-(win + 1):]
+        neg = pos = 0.0
+        for k in range(1, len(hist)):
+            d = hist[k] - hist[k - 1]
+            if d < 0:
+                neg += -d
+            elif d > 0:
+                pos += d
+        self._di_down = float(round(neg, 5))
+        self._di_up = float(round(pos, 5))
+        return self._di_down, self._di_up
+
+    # ------------------------------------------------------------
+    def update(self, two_finger_bend: float | None,
+               together: bool | None, gap_r: float | None = None,
+               gap_parts: tuple | None = None) -> int:
+        """
+        Args:
+            two_finger_bend: 双指单元合成伸直度（四关节中点代入同公式，0.20弯~0.88直）；无效帧 None
+            together:    【起势门控】TIP 3D 排是否并拢（TIP/米制掌宽≤TIP_ENTRY_R）；无法判定传 None。
+                         手势中（ARMED/HOLD/PRESSED）不再使用本参数，改用 gap_parts 的 DIP 排门控
+            gap_r:       指尖比值（日志用）
+            gap_parts:   (MCP,PIP,DIP,TIP,spread) 3D 比值五值；MCP/PIP/spread 仅诊断，DIP 供保持门控
+        Returns:
+            E.NONE / E.RIGHT_TAP
+        """
+        self.event_this_frame = E.NONE
+        self.armed_this_frame = False
+        if gap_r is not None:
+            self._last_gap = float(gap_r)
+        if gap_parts is not None:
+            self._last_parts = gap_parts
+
+        # ---- 冷却（同左键：只减帧；近伸直帧继续学基线，恢复无跳变）----
+        if self.state == _S.COOLDOWN:
+            self._cooldown_frames -= 1
+            # ⭐ 只有指尖并拢时合成 bend 才有物理意义；中指蜷着时中点是"半弯虚拟指"，禁止学基线
+            if two_finger_bend is not None and together:
+                B = self._smooth(two_finger_bend)
+                if self._base is not None and B > self._base * 0.97:
+                    self._learn_baseline_idle()
+            if self._cooldown_frames <= 0:
+                self.state = _S.IDLE
+            return E.NONE
+
+        # ---- 无效帧（丢手/掌心不稳门控/并拢度不可算）：同左键清差分 + 宽限 ----
+        if two_finger_bend is None or together is None:
+            self._hist.clear()
+            self._di_down = self._di_up = 0.0
+            self._prev_r = None
+            if self.state == _S.IDLE:
+                self._entry_frames = 0     # 等待中丢手：先并拢资格作废，须重新取得
+            if self.state in (_S.BEND_ARMED, _S.BEND_HOLD):
+                self._none_frames += 1
+                if self._none_frames % 4 == 1 or self._none_frames == TWO_FINGER_NONE_GRACE_FRAMES + 1:
+                    self._diag(f"手势中无效帧 {self._none_frames}/{TWO_FINGER_NONE_GRACE_FRAMES} 宽限"
+                               f"（state={self._state_name()}）")
+                if self._none_frames > TWO_FINGER_NONE_GRACE_FRAMES:
+                    self._to_idle()      # 手势中丢手超宽限 → 作废
+                    self._diag("✘ 手势中丢手/门控超宽限 → 作废回 IDLE")
+            elif self.state == _S.PRESSED:
+                self._enter_cooldown()   # 长按时丢手=释放（v1 无事件）
+                self._diag("双指长按中丢手 → 静默结束")
+            return E.NONE
+
+        # ---- 手势中的门控（v7）：深弯遮挡 TIP 失真 → 只看 DIP 排（parts 第3位）----
+        _dip_now = (self._last_parts[2]
+                    if (self._last_parts and len(self._last_parts) >= 4) else None)
+        _hold_ok = bool(_dip_now is None or _dip_now <= TWO_FINGER_DIP_HOLD_R)
+
+        # ---- IDLE 起势门控（v7）：先在高 bend 指尖并拢 ≥N 帧（顺序门），之后才准下弯 ----
+        if self.state == _S.IDLE:
+            _high_bend = two_finger_bend >= TWO_FINGER_ENTRY_BEND
+            if _high_bend and together:
+                # 高 bend + TIP 并拢：累计/维持资格
+                self._entry_frames = min(TWO_FINGER_ENTRY_FRAMES, self._entry_frames + 1)
+            elif _high_bend and not together:
+                # 高 bend 但指尖张开（单指待机/张开手/做手势前手松开了）：资格清零，bend 不喂状态机
+                self._entry_frames = 0
+                self._hist.clear()
+                self._di_down = self._di_up = 0.0
+                self._prev_r = None
+                if TWO_FINGER_DIAG:
+                    self._diag_geom_n += 1
+                    if self._diag_geom_n % 30 == 1:
+                        _tipv = (self._last_parts[3] if self._last_parts else -1.0)
+                        print(f"[2F-DIAG-HB] state=IDLE 指尖未并拢(3D) "
+                              f"TIP={_tipv:.3f}✗(≤{TWO_FINGER_TIP_ENTRY_R}) "
+                              f"parts[MCP,PIP,DIP,TIP,spr]={self._last_parts} bend={two_finger_bend:.3f}"
+                              f"（bend 不喂状态机）", flush=True)
+                return E.NONE
+            else:
+                # 低 bend 帧（勾弯进行中）：无资格 = 单指点击"弯到底才碰巧并拢" → 拒绝；
+                # 有资格 = 正常右键勾弯，TIP 在深弯会炸开，本帧起忽略 TIP（保持交给 DIP 门控）
+                if self._entry_frames < TWO_FINGER_ENTRY_FRAMES:
+                    self._hist.clear()
+                    self._di_down = self._di_up = 0.0
+                    self._prev_r = None
+                    # ⭐ 基线/平滑上下文一并作废：否则回弹帧用旧基线算出低 r，会被 down_abs
+                    #   误判为"新起弯"（先弯后并拢 → 回弹，不是新的勾按）
+                    self._sm = None
+                    self._base = None
+                    self._max_recent_r = None
+                    if TWO_FINGER_DIAG:
+                        self._diag_geom_n += 1
+                        if self._diag_geom_n % 15 == 1:
+                            print(f"[2F-DIAG] ✗ 先弯后并拢（bend={two_finger_bend:.3f}<{TWO_FINGER_ENTRY_BEND}，"
+                                  f"资格 {self._entry_frames}/{TWO_FINGER_ENTRY_FRAMES}）→ 判单指点击，右键不起势 "
+                                  f"parts={self._last_parts}", flush=True)
+                    return E.NONE
+
+        # ---- 有手：双指单元合成 bend 单条 EMA 平滑 ----
+        B = self._smooth(two_finger_bend)
+        r = B / max(self._base, 1e-6)        # 合成序列：双指单元一起弯 r 才降（并拢保证同步）
+
+        # ---- 合成序列的 prev / 近期伸直高值（同左键 _prev_smoothed_bend / _max_recent_bend）----
+        prev_r = self._prev_r
+        if self._max_recent_r is None:
+            self._max_recent_r = r
+        elif r > self._max_recent_r:
+            self._max_recent_r = r
+        else:
+            self._max_recent_r = 0.985 * self._max_recent_r + 0.015 * r
+
+        di_down, di_up = self._compute_di(r)
+        self._prev_r = r
+        self._none_frames = 0
+
+        enter = self._p["ENTER_BEND_RATIO"]
+        exit_r = self._p["EXIT_BEND_RATIO"]
+        drop = 0.0 if self._max_recent_r is None else \
+            (self._max_recent_r - r) / max(self._max_recent_r, 1e-6)
+
+        # ---- down/up 判据：与左键模板逐字同公式（作用在合成 r 上）----
+        down_delta = (di_down >= self._p["TAP_DOWN_DI_SUM"]) and (
+            r <= min(self._p["MIN_ABS_BEND_RATIO_FOR_DELTA"], enter + 0.06))
+        down_abs = (r < enter) and (drop > self._p["MIN_BEND_DROP"])
+        down_trigger = down_delta or down_abs
+
+        # 松开：进入方式决定优先级；差分（回弹变化量）与绝对回线互为兜底 OR —— 完全照搬左键
+        if self._armed_by_delta:
+            up_trigger = (di_up >= self._p["TAP_UP_DI_SUM"]) or (r >= exit_r)
+        else:
+            up_trigger = (r >= exit_r) or (di_up >= self._p["TAP_UP_DI_SUM"])
+
+        # ---- 心跳：每 30 个有效帧一行（含四排指距+同步超张量，仅观察；判定只调 root 阈值）----
+        self._diag_n += 1
+        if TWO_FINGER_DIAG and self._diag_n % 30 == 0:
+            _g = f"{self._last_gap:.3f}" if self._last_gap is not None else " n/a "
+            if self._last_parts is not None and len(self._last_parts) >= 4:
+                _parts = (f"[MCP={self._last_parts[0]:.3f} PIP={self._last_parts[1]:.3f} "
+                          f"DIP={self._last_parts[2]:.3f} TIP={self._last_parts[3]:.3f}")
+                if len(self._last_parts) >= 5:
+                    _parts += f" spread={self._last_parts[4]:.3f}"
+                _parts += "]"
+            else:
+                _parts = "[parts n/a]"
+            print(f"[2F-DIAG-HB] state={self._state_name():>4} gap={_g:>5} "
+                  f"TIP起势={'Y' if together else 'N'}(≤{TWO_FINGER_TIP_ENTRY_R}) "
+                  f"DIP保持={'Y' if _hold_ok else 'N'}(≤{TWO_FINGER_DIP_HOLD_R}) "
+                  f"资格={self._entry_frames}/{TWO_FINGER_ENTRY_FRAMES} {_parts} "
+                  f"r={r:.3f} enter={enter:.3f} exit={exit_r:.3f} "
+                  f"di↓={di_down:.3f}/{self._p['TAP_DOWN_DI_SUM']:.3f} "
+                  f"di↑={di_up:.3f}/{self._p['TAP_UP_DI_SUM']:.3f} drop={drop:.2f}", flush=True)
+
+        # ================= 状态流转（左键模板）+ 右键分阶段门控 =================
+        if self.state == _S.IDLE:
+            # 走到这里 TIP 必并拢且"先并拢"顺序门已过；学习当前姿态基线（微弯也可，不要求伸直）
+            self._learn_baseline_idle()
+            if down_trigger and self._entry_frames >= TWO_FINGER_ENTRY_FRAMES:
+                self.state = _S.BEND_ARMED
+                self.armed_this_frame = True
+                # ⭐ 一次性门票：IDLE→ARMED 立即消费资格。手势结束（触发/作废/尖峰/丢手）
+                #   回 IDLE 后必须重新在高 bend 并拢满 3 帧才能再起势——
+                #   杜绝"一次右键后单指勾按凭旧资格连发右键"（2026-09-18 真机故障）
+                self._entry_frames = 0
+                self._hold_frames = 1
+                self._total_frames = 1
+                self._stable_frames = 0
+                self._gap_break_frames = 0
+                self._armed_by_delta = bool(down_delta and not down_abs)
+                self._arm_t = time.time()
+                _g = f"{self._last_gap:.3f}" if self._last_gap is not None else "n/a"
+                self._diag(f"▶ 起弯 ARMED：gap={_g} r={r:.3f}"
+                           f"（入口={'差分' if self._armed_by_delta else '绝对'}，先并拢资格已确认）")
+
+        elif self.state == _S.BEND_ARMED:
+            # 右键门控（v7 手势中看 DIP）：连续失效 N 帧才判张开（单帧抖动不解散）
+            if not _hold_ok:
+                self._gap_break_frames += 1
+                if self._gap_break_frames >= TWO_FINGER_GAP_BREAK_FRAMES:
+                    _g = f"{self._last_gap:.3f}" if self._last_gap is not None else "n/a"
+                    _bf = self._gap_break_frames
+                    self._max_recent_r = r   # 作废后不许弯着不动直接重新起势，须重新做一次弯屈动作
+                    self._to_idle()
+                    self._diag(f"✘ ARMED 连续{_bf}帧 DIP 张开/不同步 DIP={_dip_now:.3f} → 解散")
+                    return E.NONE
+            else:
+                self._gap_break_frames = 0
+            # 模板第 2 帧确认：仍处于弯曲（残留 Σ下 或 r 仍在弯线附近）
+            still_down = ((di_down >= max(0.0, self._p["TAP_DOWN_DI_SUM"] * 0.35))
+                          or (r < enter + 0.03))
+            if still_down:
+                self._hold_frames += 1
+                self._total_frames += 1
+                if self._hold_frames >= self._p["MIN_BEND_HOLD"]:
+                    self.state = _S.BEND_HOLD
+                    self._diag(f"✔ ARMED 确认通过 → BEND_HOLD（r={r:.3f}）")
+            else:
+                self._to_idle()                # 单帧尖峰（与左键同处理）
+                self._diag(f"✘ ARMED 尖峰拒绝(第2帧未保持弯曲) r={r:.3f} Σ下={di_down:.3f} → IDLE")
+
+        elif self.state == _S.BEND_HOLD:
+            self._total_frames += 1
+
+            # 右键门控（v7 手势中看 DIP）：连续 N 帧张开 → 作废（EXIT 之前先过门控）
+            if not _hold_ok:
+                self._gap_break_frames += 1
+                if self._gap_break_frames >= TWO_FINGER_GAP_BREAK_FRAMES:
+                    _g = f"{self._last_gap:.3f}" if self._last_gap is not None else "n/a"
+                    _bf = self._gap_break_frames
+                    self._max_recent_r = r   # 作废后不许弯着不动直接重新起势
+                    self._to_idle()
+                    self._diag(f"✘ HOLD 连续{_bf}帧 DIP 张开/不同步 DIP={_dip_now:.3f} gap={_g} → 作废")
+                    return E.NONE
+            else:
+                self._gap_break_frames = 0
+
+            # ---------------- EXIT 优先于 LONG_PRESS（同左键）----------------
+            #   起势顺序门保证了双指同步意图，up_trigger 即双指一起回弹 → 直接判短按/长按
+            if up_trigger:
+                is_tap = (self._total_frames <= self._p["TAP_MAX_FRAMES"]
+                          or self._hold_frames <= self._p["LONG_PRESS_FRAMES"])
+                if is_tap:
+                    self.event_this_frame = E.RIGHT_TAP
+                    self.right_count += 1
+                    _tot, _hold = self._total_frames, self._hold_frames
+                    self._enter_cooldown()
+                    self._diag(f"★★ 触发 RIGHT_TAP 右键！总帧={_tot} 保持帧={_hold} "
+                               f"r={r:.3f}（变化量松开 Σ↑={di_up:.3f}）")
+                else:
+                    # 双指长按：v1 不映射右键拖拽 → 静默
+                    _tot = self._total_frames
+                    self._enter_cooldown()
+                    self._diag(f"● 双指长按后释放（总帧{_tot}>窗）→ 静默不发右键")
+                return self.event_this_frame
+
+            # ---------------- 弯曲深度稳定 → 累计长按帧（同左键：基于 prev_r 的逐帧差值）----------------
+            is_stable = True
+            if prev_r is not None:
+                delta = prev_r - r           # 正值 = r 继续变小 = 还在下压
+                if delta > self._p["BEND_STABLE_THRESH"]:
+                    is_stable = False
+            if is_stable:
+                self._stable_frames += 1
+                if self._stable_frames >= self._p["BEND_STABLE_MIN_HOLD"]:
+                    self._hold_frames += 1
+            else:
+                self._stable_frames = 0
+            if self._hold_frames >= self._p["LONG_PRESS_FRAMES"] + 1:
+                self.state = _S.PRESSED       # 长按按住中（v1 静默，等释放）
+                self._diag(f"● 双指保持超 {self._p['LONG_PRESS_FRAMES']} 帧 → PRESSED 长按"
+                           f"（v1 静默，释放也不发右键）")
+
+        elif self.state == _S.PRESSED:
+            # v1 无右键拖拽：DIP 张开 或 双指回弹 即静默结束
+            if not _hold_ok or up_trigger:
+                self._enter_cooldown()
+                self._diag("PRESSED 结束（DIP张开/回弹）→ 冷却，无事件")
+
+        return self.event_this_frame
+
+    def _state_name(self) -> str:
+        return {_S.IDLE: "IDLE", _S.BEND_ARMED: "ARMED", _S.BEND_HOLD: "HOLD",
+                _S.PRESSED: "PRS", _S.COOLDOWN: "COOL", _S.TAPPED: "TAP",
+                _S.WAIT_DBL: "WAIT"}.get(self.state, str(self.state))
+
+    # ------------------------------------------------------------
+    def metrics(self) -> dict:
+        return {
+            "state":        self.state,
+            "active":       self.is_active,
+            "armed":        self.armed_this_frame,
+            "right_count":  self.right_count,
+            "r":            round(self._sm / max(self._base, 1e-6), 3)
+                            if (self._sm is not None and self._base is not None) else None,
+            "cooldown_left": max(0, self._cooldown_frames),
         }

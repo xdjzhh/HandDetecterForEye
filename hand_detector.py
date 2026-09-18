@@ -44,7 +44,9 @@ class HandDetector:
     输出约定（两种模式共用）:
         hands_data[i] = {
             "label":    "Left" | "Right",   # MP 原始标签（调用端再反转为用户视角）
-            "landmarks": list[_LmLike],     # 21 个点，每个支持 .x/.y/.z ∈ [0,1]
+            "landmarks": list[_LmLike],     # 21 个点，每个支持 .x/.y/.z ∈ [0,1]（归一化图像坐标）
+            "world_landmarks": list[_LmLike] | None,
+            #                       21 个点，.x/.y/.z 单位【米】，原点在腕部（身体坐标系，与视角无关）
             "score":    float,              # 左右手分类置信度
         }
     """
@@ -78,15 +80,19 @@ class HandDetector:
 
         hands_data = []
         if results.multi_hand_landmarks and results.multi_handedness:
-            for lms_wrapper, handedness in zip(
+            _world_all = getattr(results, "multi_hand_world_landmarks", None) or []
+            for _i, (lms_wrapper, handedness) in enumerate(zip(
                 results.multi_hand_landmarks, results.multi_handedness
-            ):
+            )):
                 label = handedness.classification[0].label
                 score = handedness.classification[0].score
+                # 米制 3D 点（原点腕部，与视角无关）；proto Landmark 本身支持 .x/.y/.z，直接透传
+                _wlms = _world_all[_i].landmark if _i < len(_world_all) and _world_all[_i] else None
                 hands_data.append(
                     {
                         "label": label,
                         "landmarks": lms_wrapper.landmark,
+                        "world_landmarks": _wlms,
                         "score": score,
                     }
                 )
@@ -262,10 +268,17 @@ class TasksHandDetector(HandDetector):
 
                 # 包装成与 solutions 一致的 21 个 wrapper 列表
                 wrapped = [_LmWrapper(p.x, p.y, getattr(p, "z", 0.0)) for p in lms_norm]
+                # 米制 3D 点（hand_world_landmarks：单位米，原点腕部，身体坐标系与视角无关）
+                _wrapped_world = None
+                _wlms_raw = getattr(result, "hand_world_landmarks", None)
+                if _wlms_raw and i < len(_wlms_raw) and _wlms_raw[i]:
+                    _wrapped_world = [_LmWrapper(float(p.x), float(p.y), float(p.z))
+                                     for p in _wlms_raw[i]]
                 hands_data.append(
                     {
                         "label": hlabel,
                         "landmarks": wrapped,
+                        "world_landmarks": _wrapped_world,
                         "score": hscore,
                     }
                 )

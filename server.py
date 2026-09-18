@@ -19,6 +19,24 @@ import json
 import time
 import threading
 
+# =========================================================================
+# ⓪ 日志系统必须【最早】安装：先读 config.json 的 log_enabled，再 import 业务模块
+#   （cv2/MediaPipe/Flask/hands_tasks 的启动日志也要被镜像到 logs/ 文件）
+# =========================================================================
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_PATH_EARLY = os.path.join(_PROJECT_ROOT, "config.json")
+_log_enabled = True
+if os.path.exists(_CONFIG_PATH_EARLY):
+    try:
+        with open(_CONFIG_PATH_EARLY, "r", encoding="utf-8") as _f:
+            _cfg_early = json.load(_f)
+        _v = _cfg_early.get("log_enabled", True)
+        _log_enabled = bool(_v) if isinstance(_v, bool) else (str(_v) not in ("0", "false", "False", "no", "None"))
+    except Exception:
+        _log_enabled = True
+import app_log
+app_log.setup_logging(enabled=_log_enabled, project_root=_PROJECT_ROOT)
+
 from flask import Flask, jsonify, request
 
 import hands_tasks as HT

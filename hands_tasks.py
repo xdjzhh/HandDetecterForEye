@@ -32,7 +32,8 @@ from hand_detector import HandDetector, TasksHandDetector, HAND_CONNECTIONS
 from gesture_recognizer import recognize_gesture
 from mouse_controller import MouseController
 from draw_cn_text import put_text_cn
-from finger_tap_click_detector import FingerTapClickDetector, _S as _TS
+from finger_tap_click_detector import (FingerTapClickDetector, TwoFingerRightClickDetector,
+                                       _S as _TS, E as _TEV, TWO_FINGER_TIP_ENTRY_R)
 from diagonal_stretch import DiagonalStretchManager, _S as _DS, _MODE as _DM, _MS as _DMS
 
 # ---------------- 常量（原 main.py 顶部，原样搬） ----------------
@@ -93,9 +94,13 @@ def _three_point_angle(p_a: np.ndarray, p_v: np.ndarray, p_b: np.ndarray) -> flo
 
 
 def _index_bend_from_joint_angles(lms, palm_denom: float | None,
-                                  dist_bend_fallback: float | None = None) -> float:
+                                  dist_bend_fallback: float | None = None,
+                                  joint_ids=(5, 6, 7, 8)) -> float:
     """⭐ 2026-08-25 统一弯曲度量 v3（位置无关 + 手势匹配真实点击）
     输出值域：0.20 全弯 ~ 0.88 伸直；越大=越伸直（与旧语义兼容，detector 阈值平滑迁移）。
+
+    joint_ids: (MCP, PIP, DIP, TIP) 关键点序号——食指(5,6,7,8)默认；
+               中指传 (9,10,11,12) 复用同一度量（2026-09-16 双指并拢右键手势）。
 
     ✅ 统一设计 3 大原则（用户要求：不分区补偿、匹配真实点击、位置无关）：
     1) 关节权重匹配真实点击：PIP 0.40 + MCP 0.20 + DIP 0.40
@@ -106,11 +111,23 @@ def _index_bend_from_joint_angles(lms, palm_denom: float | None,
     3) 无任何分区 if/else（彻底删除 _top_band_hint 条带切换、顶部特殊权重补偿）
     """
     # 取点（用 x,y 不用 z，MediaPipe z 在 2D 画面里尺度不稳定；投影夹角本身就对深度折叠鲁棒）
+    _jm, _jp, _jd, _jt = joint_ids
     p0   = np.array([lms[0].x,  lms[0].y],  dtype=np.float64)   # WRIST 腕部
-    p5   = np.array([lms[5].x,  lms[5].y],  dtype=np.float64)   # INDEX_MCP 食指根
-    p6   = np.array([lms[6].x,  lms[6].y],  dtype=np.float64)   # INDEX_PIP 中间关节
-    p7   = np.array([lms[7].x,  lms[7].y],  dtype=np.float64)   # INDEX_DIP 指尖前
-    p8   = np.array([lms[8].x,  lms[8].y],  dtype=np.float64)   # INDEX_TIP 指尖
+    p5   = np.array([lms[_jm].x, lms[_jm].y], dtype=np.float64)  # 指根 MCP（食5/中9）
+    p6   = np.array([lms[_jp].x, lms[_jp].y], dtype=np.float64)  # PIP 中间关节（食6/中10）
+    p7   = np.array([lms[_jd].x, lms[_jd].y], dtype=np.float64)  # DIP 指尖前（食7/中11）
+    p8   = np.array([lms[_jt].x, lms[_jt].y], dtype=np.float64)  # TIP 指尖（食8/中12）
+    return _bend_from_points(p0, p5, p6, p7, p8, palm_denom, dist_bend_fallback)
+
+
+def _bend_from_points(p_wrist, p_mcp, p_pip, p_dip, p_tip,
+                      palm_denom: float | None,
+                      dist_bend_fallback: float | None = None) -> float:
+    """⭐ 从显式 5 点计算单指/双指单元的弯曲度（与 _index_bend_from_joint_angles 完全同公式）。
+    双指并拢右键用：p_mcp/p_pip/p_dip/p_tip 传食中两指对应关节的中点 → 得到"双指单元"的合成 bend。
+    输出值域：0.20 全弯 ~ 0.88 伸直；越大=越伸直。
+    """
+    p0, p5, p6, p7, p8 = p_wrist, p_mcp, p_pip, p_dip, p_tip
 
     # (A) PIP 角：∠MCP_5-PIP_6-DIP_7  （辅助，兜底用户偶尔弯 PIP 的动作）
     theta_pip = _three_point_angle(p5, p6, p7)
@@ -358,6 +375,8 @@ def init_models(args):
     mouse = MouseController(alpha=0.25, cursor_mode=args.cursor_mode, roi_scale=args.roi_scale,
                             roi_offset_y=args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
     tap_detector = FingerTapClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)
+    # 食中双指并拢勾按 → 右键（与左键同 hardness/speed 档位手感）
+    right_tap_detector = TwoFingerRightClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)
     stretch = DiagonalStretchManager()
 
     return dict(
@@ -365,6 +384,7 @@ def init_models(args):
         detector=detector,
         mouse=mouse,
         tap_detector=tap_detector,
+        right_tap_detector=right_tap_detector,
         stretch=stretch,
         mode_label=mode_label,
         mode_color=mode_color,
@@ -954,6 +974,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     detector        = components["detector"]
     mouse           = components["mouse"]
     tap_detector    = components["tap_detector"]
+    right_tap_detector = components["right_tap_detector"]
     stretch         = components["stretch"]
     mode_label      = components["mode_label"]
     mode_color      = components["mode_color"]
@@ -973,6 +994,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
     combo_hint = ""
     combo_hint_counter = 0
+    # ⭐ 上一帧 stretch 状态（move_only 最前置在本帧 stretch.update 之前执行，只能读上一帧结果；
+    #   首帧用 None 哨兵）
+    stretch_info = None
     _fps_smooth = None
     _fps_last_t = time.perf_counter()
     _fps_frame_cnt = 0
@@ -1296,6 +1320,16 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             )
             block_mouse_move_for_stretch = disable_click_for_stretch_global
 
+            # ⭐ 2026-09-17 修复「五指张开移窗时，光标在窗口中心↔掌心位置来回闪动」：
+            #   MOVE_ACTIVE 期间 diagonal_stretch 每帧 SetCursorPos 锁窗口中心（防误触），
+            #   而掌心跟随 move_only 又每帧把光标写回掌心映射点——两个写入源交替=闪动。
+            #   锁定期本帧一切掌心光标写入全部跳过，光标只允许窗口中心锁这一个写入源。
+            #   注：此处读的是【上一帧】move_state（stretch.update 在后面 L1708 才跑），
+            #   进入/退出 MOVE_ACTIVE 各有 1 帧交接，帧内同点 SetCursorPos 幂等、肉眼不可见。
+            _cursor_locked_by_window_move = bool(
+                stretch_info is not None and stretch_info.move_state == _DMS.MOVE_ACTIVE
+            )
+
             # ======================================================================
             # ⭐ B-1 优化：鼠标移动急活【最前置】
             #   目标：彻底消除"慢活（stretch.update/Tap 累积/每手循环 near_fist 计数/拉伸窗口确认）阻塞 move_only → 鼠标钉住 + 之后大跳"。
@@ -1304,7 +1338,11 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             #             通过 _eval_anchor_once 的同帧缓存，即使后面原代码再 move_only 一次，也只是 pyautogui.moveTo(同坐标) 幂等，不会额外重算平滑。
             # ======================================================================
             _pre_move_only_done_right = False
-            if "Left" in hand_results:
+            if _cursor_locked_by_window_move:
+                # 移窗锁定期：本帧掌心 move_only 禁止执行；同时置位"已处理"，
+                # 阻止 Pass C 兜底再调一次 moveTo
+                _pre_move_only_done_right = True
+            elif "Left" in hand_results:
                 try:
                     _gesture, _ext, _ratios, _lms = hand_results["Left"]
                     _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
@@ -1355,10 +1393,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     move_gesture_hint = "FIST" if any_fist_global else gesture
                     # ⭐ B-1 优化：若【全局门控后 move_only 最前置】已经跑过 → 这里不再重复 moveTo（同帧缓存已保证 smoother 状态只更新一次）
                     #            只有前置段异常（try 失败）时才兜底再跑一次，保证向后兼容。
-                    if not _pre_move_only_done_right:
+                    if (not _pre_move_only_done_right) and (not _cursor_locked_by_window_move):
                         mouse.move_only(cursor_anchor_norm, gesture_hint=move_gesture_hint)
                     # 门控只拦"点击/拖拽语义"（调 handle 走点击分支）——但该帧鼠标已经 move_only 移动过了，不会再卡
-                    if (not block_mouse_move_for_stretch) and (not is_pure_two_hand_mode) and stretch.state != _DS.SCALING:
+                    # ⭐ 移窗锁定帧额外跳过 handle：OPEN 稳定分支内部也会 moveTo，否则与窗口中心锁打架闪动
+                    if ((not _cursor_locked_by_window_move)
+                            and (not block_mouse_move_for_stretch)
+                            and (not is_pure_two_hand_mode)
+                            and stretch.state != _DS.SCALING):
                         fingertip_norm = (lms[8].x, lms[8].y)
                         mouse.handle(safe_gesture, fingertip_norm, cursor_anchor_norm=cursor_anchor_norm)
                     # ↓↓ 画锚点（绿圈=掌心，橙圈=食指TIP）——和 move_only 用的 cursor_anchor_norm 完全同一份 ↓↓
@@ -1371,6 +1413,10 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
             # ---------- 食指 Tap-Click（仅右手） ----------
             index_bend: float | None = None
+            two_finger_bend: float | None = None  # 双指右键：双指单元合成伸直度（四关节中点，0.20弯~0.88直）
+            two_finger_together: bool | None = None  # 双指右键：食/中四排关节是否都并拢（None=本帧不可判定）
+            two_finger_gap: float | None = None      # 双指右键：四排关节距 max（诊断/判定共用）
+            two_finger_gap_parts: tuple | None = None  # (MCP,PIP,DIP,TIP) 四排指距比值，仅诊断日志用
             right_screen_pt = None
             if "Left" in hand_results:
                 _, _, _, lms = hand_results["Left"]
@@ -1442,6 +1488,79 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             dist_bend_old = tip_m5 / denom
                             index_bend = _index_bend_from_joint_angles(
                                 lms, palm_denom=denom, dist_bend_fallback=dist_bend_old)
+                            # ----------------------------------------------------------
+                            # ⭐ 2026-09-17 食中双指并拢右键 v2：不再分别算食指/中指 bend
+                            #   用户要求：前置条件已是并拢 → 食中两指对应关节(PIP/PIP, DIP/DIP, TIP/TIP)
+                            #   应保持在容忍距离内；弯曲度只算"双指单元"一个合成值（四关节中点代入同公式）。
+                            #   同步性由四排关节距离直接保证：一指先直 → TIP 排距离超阈 → together 失效 → 作废。
+                            # ----------------------------------------------------------
+                            try:
+                                _p5  = np.array([lms[5].x,  lms[5].y],  dtype=np.float64)
+                                _p9  = np.array([lms[9].x,  lms[9].y],  dtype=np.float64)
+                                _p6  = np.array([lms[6].x,  lms[6].y],  dtype=np.float64)
+                                _p10 = np.array([lms[10].x, lms[10].y], dtype=np.float64)
+                                _p7  = np.array([lms[7].x,  lms[7].y],  dtype=np.float64)
+                                _p11 = np.array([lms[11].x, lms[11].y], dtype=np.float64)
+                                _p8  = np.array([lms[8].x,  lms[8].y],  dtype=np.float64)
+                                _p12 = np.array([lms[12].x, lms[12].y], dtype=np.float64)
+
+                                # 四排食-中指距（归一化到掌心宽）：MCP/PIP/DIP/TIP
+                                _g_mcp = float(np.linalg.norm(_p5  - _p9))
+                                _g_pip = float(np.linalg.norm(_p6  - _p10))
+                                _g_dip = float(np.linalg.norm(_p7  - _p11))
+                                _g_tip = float(np.linalg.norm(_p8  - _p12))
+
+                                # ⭐ 并拢判据（2026-09-17 v7，分阶段阈值，全部 3D 米制 world 坐标）：
+                                #   算 MCP/PIP/DIP/TIP 四排食-中指距 ÷ 同坐标系掌宽 dist(5,17)。
+                                #   together 只表达【起势口径】：TIP ≤ TIP_ENTRY_R(0.80)。
+                                #   · 起势必须 TIP 先并拢（IDLE 手指尚高、无遮挡，数据可信）；
+                                #   · 深弯后 TIP 会因遮挡炸到 1.3+（真机实测），手势中是否保持并拢
+                                #     由检测器自己改看 DIP ≤ DIP_HOLD_R(1.30)（parts 已传给它），
+                                #     hands_tasks 不在这里按 TIP 拦深弯帧；
+                                #   · 另外检测器有"先并拢后勾"顺序门（高 bend 连续 3 帧），
+                                #     挡住单指点击"弯到底才碰巧并拢"导致的左键被抢杀。
+                                _wlms = hand.get("world_landmarks")
+                                _gap_space = "3D"
+                                if _wlms is not None and len(_wlms) >= 18:
+                                    _w = np.array([[float(p.x), float(p.y), float(p.z)]
+                                                   for p in _wlms], dtype=np.float64)
+                                    def _wd3(a: int, b: int) -> float:
+                                        return float(np.linalg.norm(_w[a] - _w[b]))
+                                    _wden = _wd3(5, 17) or 1e-6          # 米制掌宽（与 2D denom 同语义点对）
+                                    _r_mcp  = _wd3(5, 9)  / _wden
+                                    _r_pip  = _wd3(6, 10) / _wden
+                                    _r_dip  = _wd3(7, 11) / _wden
+                                    _r_tip  = _wd3(8, 12) / _wden
+                                else:
+                                    # 兜底：老检测器无 world 点时退回 2D（2D 下 MCP/PIP 最稳，用指根）
+                                    _gap_space = "2D!"
+                                    _r_mcp, _r_pip = _g_mcp / denom, _g_pip / denom
+                                    _r_dip, _r_tip = _r_pip, _r_pip
+                                _sync_spread = _r_tip - _r_pip
+                                two_finger_gap = float(_r_tip)
+                                two_finger_gap_parts = (round(_r_mcp, 3), round(_r_pip, 3),
+                                                        round(_r_dip, 3), round(_r_tip, 3),
+                                                        round(_sync_spread, 3))
+                                # 起势口径只看 TIP；手势中 DIP 门控在检测器内部（TWO_FINGER_DIP_HOLD_R）
+                                two_finger_together = bool(_r_tip <= TWO_FINGER_TIP_ENTRY_R)
+                                run_loop._cached_two_finger_gap = round(float(_r_tip), 3)
+                                run_loop._cached_two_finger_gap_space = _gap_space
+
+                                # 双指单元合成 bend：四关节取中点，代入与单指完全相同的 _bend_from_points
+                                _mcp_mid = (_p5  + _p9)  * 0.5
+                                _pip_mid = (_p6  + _p10) * 0.5
+                                _dip_mid = (_p7  + _p11) * 0.5
+                                _tip_mid = (_p8  + _p12) * 0.5
+                                _p0 = np.array([lms[0].x, lms[0].y], dtype=np.float64)
+                                _dist_fb = float(np.linalg.norm(_tip_mid - _mcp_mid)) / denom
+                                two_finger_bend = _bend_from_points(
+                                    _p0, _mcp_mid, _pip_mid, _dip_mid, _tip_mid,
+                                    palm_denom=denom, dist_bend_fallback=_dist_fb)
+                            except Exception:
+                                two_finger_bend = None
+                                two_finger_together = None
+                                two_finger_gap = None
+                                two_finger_gap_parts = None
                     # ⭐ 统一后仍保留缓存供日志只读（IN_TB列显示位置，PIPΔ°列显示DIP/PIP角度变化量，不参与判断逻辑）
                     try:
                         _anx, _any = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
@@ -1496,6 +1615,10 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 else:
                     # palm_n_raw 太小（手离镜头特别远/截断）→ 直接丢弃
                     index_bend = None
+                    two_finger_bend = None
+                    two_finger_together = None
+                    two_finger_gap = None
+                    two_finger_gap_parts = None
 
                 # ⭐ 2026-08-22 核心修复：Tap-Click 段直接复用 move_only() 同帧计算出来的"缓存平滑后坐标"
                 #   之前的问题：
@@ -1510,9 +1633,22 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
             if disable_click_for_stretch_global:
                 tap_detector.reset()
+                right_tap_detector.reset()
                 tap_event = 0
+                right_tap_event = 0
             else:
-                tap_event = tap_detector.update(index_bend)
+                # ⭐ 2026-09-17 双指并拢右键 v2：单 bend 输入（双指单元合成值）+ together 门控
+                right_tap_event = right_tap_detector.update(two_finger_bend,
+                                                            two_finger_together, two_finger_gap,
+                                                            two_finger_gap_parts)
+                if right_tap_detector.freeze_left:
+                    # 双指手势占用期 + 右键触发后的冷却尾帧都冻结左指：
+                    #   触发帧起双指回弹的 bend 值若漏喂左指，会被它当成独立食指勾按（虚构 Tap → 误双击）
+                    if right_tap_detector.armed_this_frame:
+                        tap_detector.cancel_in_progress()
+                    tap_event = 0
+                else:
+                    tap_event = tap_detector.update(index_bend)
 
             # ======================================================================
             # ⭐⭐ 方案 A 取证日志（ROI 顶部 25% 条带）
@@ -1552,13 +1688,16 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 print(f"  [ERROR] top-band tap log 异常：{_tap_log_e!r}\n{_tb.format_exc()}", flush=True)
 
             if not disable_click_for_stretch_global and stretch.state != _DS.SCALING:
-                # 1=单击(窗口超时补发) 2=长按按下 5=双击(快速原子) 6=慢节奏补救双击：都要求鼠标钉在当前位置完成动作
-                if tap_event in (1, 2, 5, 6):
+                # 1=单击(窗口超时补发) 2=长按按下 5=双击(快速原子) 6=慢节奏补救双击 7=双指右键：都要求鼠标钉在当前位置完成动作
+                if tap_event in (1, 2, 5, 6) or right_tap_event == _TEV.RIGHT_TAP:
                     # freeze_for_click 冻结位置 = 同帧 move_only 输出位置（smoother 已被冻结，后续几帧都返回相同像素点）
                     mouse._smoother.freeze_for_click()
                 if tap_event != 0:
                     # handle_finger_tap_event 内部 click / drag / mouseDown 用的就是对齐后的 right_screen_pt
                     mouse.handle_finger_tap_event(tap_event, right_screen_pt)
+                if right_tap_event != 0:
+                    # 双指并拢勾按回弹 → 右键单击
+                    mouse.handle_finger_tap_event(right_tap_event, right_screen_pt)
 
             # ---------- 双手拉伸 / 移动 ----------
             left_px: tuple | None = None
@@ -1597,6 +1736,29 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             tm = tap_detector.metrics()
             # 回滚 B-2：每帧必画，不再跳帧（避免闪烁）
             _draw_tap_bar(frame, tm, tap_detector)
+
+            # ---------- 绘制：双指并拢右键手势状态（仅在手势进行/触发瞬间显示，平时不占画面）----------
+            try:
+                _rmt = right_tap_detector.metrics()
+                if right_tap_event == _TEV.RIGHT_TAP:
+                    setattr(run_loop, '_right_flash_frames', 15)
+                _flash = int(getattr(run_loop, '_right_flash_frames', 0))
+                if _flash > 0:
+                    setattr(run_loop, '_right_flash_frames', _flash - 1)
+                if _rmt["active"] or _flash > 0:
+                    _rstate = _rmt["state"]
+                    if _flash > 0:
+                        _rtxt, _rcol = "✅ 右键单击!", (60, 60, 255)
+                    elif _rstate in (_TS.BEND_ARMED, _TS.BEND_HOLD):
+                        _rtxt, _rcol = "双指并拢勾按中…(右键)", (0, 160, 255)
+                    elif _rstate == _TS.PRESSED:
+                        _rtxt, _rcol = "双指长按(不触发)", (0, 200, 255)
+                    else:
+                        _rtxt, _rcol = "双指右键冷却…", (150, 150, 150)
+                    put_text_cn(frame, _rtxt, (w - 320, 150),
+                                font_scale=0.55, color=_rcol, thickness=2)
+            except Exception:
+                pass
 
             # ---------- 绘制：SCALE 拉伸 UI ----------
             mode_now = getattr(stretch_info, 'mode', 'SCALE')
