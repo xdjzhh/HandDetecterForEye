@@ -242,11 +242,11 @@ def _draw_tap_bar(frame, tm: dict, det: FingerTapClickDetector | None = None):
     state_cn_map = {
         _TS.IDLE:       ("伸直待机(基线学习中)", (160, 255, 160)),
         _TS.BEND_ARMED: ("食指弯曲确认中…",      (80, 180, 255)),
-        _TS.BEND_HOLD:  (f"弯曲保持 {tm['hold_frames']} 帧",  (0, 180, 255)),
+        _TS.BEND_HOLD:  (f"弯曲保持 {tm.get('hold_sec', 0):.2f}s",  (0, 180, 255)),
         _TS.TAPPED:     ("✅ TAP 单击触发!",     (60, 60, 255)),
         _TS.WAIT_DBL:   (f"等待第二次点击(双击)… {tm.get('dbl_window_left', 0):.2f}s", (255, 0, 255)),
         _TS.PRESSED:    ("🔒 按住拖拽中",          (0, 200, 255)),
-        _TS.COOLDOWN:   (f"冷却 {tm['cooldown_left']} 帧",   (180, 180, 180)),
+        _TS.COOLDOWN:   (f"冷却 {tm.get('cooldown_left', 0):.2f}s",   (180, 180, 180)),
     }
     st_text, st_color = state_cn_map.get(st, (str(st), (255, 255, 255)))
     line2_y = bar_y0 + bar_h + 6
@@ -254,27 +254,28 @@ def _draw_tap_bar(frame, tm: dict, det: FingerTapClickDetector | None = None):
                 font_scale=0.55, color=st_color, thickness=2)
 
     line3_y = line2_y + 22
-    tap_max   = float(tm.get("TAP_MAX", 18))
-    long_max  = float(tm.get("LONG_MAX", 22))
-    tot_f     = float(tm.get("total_frames", 0))
-    hold_f    = float(tm.get("hold_frames", 0))
-    stab_f    = float(tm.get("stable_frames", 0))
+    # ⭐ 墙钟化（2026-09-18）：进度/文案全部秒；stable 仍是连续稳定样本帧计数
+    tap_max_s  = float(tm.get("TAP_MAX_SEC", 0.8))
+    long_max_s = float(tm.get("LONG_PRESS_SEC", 0.733))
+    tot_s      = float(tm.get("total_sec", 0))
+    hold_s     = float(tm.get("hold_sec", 0))
+    stab_f     = float(tm.get("stable_frames", 0))
 
     pb_w = int((bar_w - 10) / 2)
     pb_h = 10
     pb1_x = bar_x0
-    p1 = 0.0 if tot_f <= 0 else min(1.2, tot_f / tap_max)
+    p1 = 0.0 if tot_s <= 0 else min(1.2, tot_s / tap_max_s)
     cv2.rectangle(frame, (pb1_x, line3_y), (pb1_x + pb_w, line3_y + pb_h), (60, 60, 60), -1)
     tap_c = (30, 255, 90) if p1 < 0.7 else ((60, 220, 255) if p1 < 1.0 else (0, 0, 255))
     cv2.rectangle(frame, (pb1_x, line3_y), (pb1_x + int(pb_w * min(1.0, p1)), line3_y + pb_h), tap_c, -1)
-    put_text_cn(frame, f"短按窗口 {int(tot_f):>3d}/{int(tap_max):>2d}", (pb1_x, line3_y - 14),
+    put_text_cn(frame, f"短按窗 {tot_s * 1000:>4.0f}/{tap_max_s * 1000:.0f}ms", (pb1_x, line3_y - 14),
                 font_scale=0.32, color=tap_c, thickness=1)
     pb2_x = bar_x0 + pb_w + 10
-    p2 = 0.0 if hold_f <= 0 else min(1.0, hold_f / long_max)
+    p2 = 0.0 if hold_s <= 0 else min(1.0, hold_s / long_max_s)
     cv2.rectangle(frame, (pb2_x, line3_y), (pb2_x + pb_w, line3_y + pb_h), (60, 60, 60), -1)
     long_c = (40, 220, 255) if p2 < 0.5 else ((0, 150, 255) if p2 < 1.0 else (0, 0, 255))
     cv2.rectangle(frame, (pb2_x, line3_y), (pb2_x + int(pb_w * p2), line3_y + pb_h), long_c, -1)
-    put_text_cn(frame, f"长按计数 {int(hold_f):>3d}/{int(long_max):>2d}  稳{int(stab_f):>2d}f",
+    put_text_cn(frame, f"长按 {hold_s * 1000:>4.0f}/{long_max_s * 1000:.0f}ms 稳{int(stab_f):>2d}f",
                 (pb2_x, line3_y - 14), font_scale=0.32, color=long_c, thickness=1)
 
     line4_y = line3_y + pb_h + 10
@@ -1631,6 +1632,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _, _, sx, sy, _, _ = mouse._eval_anchor_once(anchor_norm, gesture_hint=None)
                 right_screen_pt = (float(sx), float(sy))
 
+            # 快路径双击(DOUBLE_TAP)挂起的首击落点（2026-09-19 位置门控，见下方 WAIT_DBL 捕获）
+            _pending_first_xy = None
             if disable_click_for_stretch_global:
                 tap_detector.reset()
                 right_tap_detector.reset()
@@ -1649,6 +1652,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     tap_event = 0
                 else:
                     tap_event = tap_detector.update(index_bend)
+                    # ⭐ 2026-09-19：首击回弹进 WAIT_DBL 当帧记录落点（掌心位置=被点目标），
+                    #   供 DOUBLE_TAP 事件按 10px 门控判"同目标双击 / 不同目标两次独立单击"
+                    _pending_first_xy = getattr(run_loop, "_first_tap_xy", None)
+                    if tap_detector.state == _TS.WAIT_DBL:
+                        if _pending_first_xy is None:
+                            run_loop._first_tap_xy = right_screen_pt
+                    else:
+                        run_loop._first_tap_xy = None
 
             # ======================================================================
             # ⭐⭐ 方案 A 取证日志（ROI 顶部 25% 条带）
@@ -1694,7 +1705,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     mouse._smoother.freeze_for_click()
                 if tap_event != 0:
                     # handle_finger_tap_event 内部 click / drag / mouseDown 用的就是对齐后的 right_screen_pt
-                    mouse.handle_finger_tap_event(tap_event, right_screen_pt)
+                    mouse.handle_finger_tap_event(tap_event, right_screen_pt,
+                                                  first_xy=_pending_first_xy)
                 if right_tap_event != 0:
                     # 双指并拢勾按回弹 → 右键单击
                     mouse.handle_finger_tap_event(right_tap_event, right_screen_pt)

@@ -128,19 +128,16 @@ ABS_LOCK_THRESH   = 5.6
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.0
 
-# ⭐ OS 双击模式（OS_DOUBLE_CLICK=True）下，第二次点击坐标吸附到第一击：
-#   OS 双击位置容差只有 ±2px（SM_CXDOUBLECLK=4），两次手势落点漂移常达 10~30px 必然失败。
-#   真双击语义上就是"同一个目标连点两下"，因此 OS 双击时间窗内、落点漂移 ≤ 本阈值时，
-#   把第二击坐标强制吸到第一击精确像素（Δpos=0，稳过位置门槛）；超过阈值说明是两个不同
-#   目标的连续单击，不吸附。单位：屏幕像素。
-TAP_DBL_SNAP_PX = 60
-# ⭐ 慢节奏双击补救（OS_DOUBLE_CLICK=False 延迟模式）的位置门控阈值：
-#   体感勾指"双击"实测间隔 1.5~3.3s，远超 OS 500ms 双击窗，补发 click#1 后第二击若发普通 click，
-#   资源管理器会把"选中后慢速再点文件名"判为重命名。补救窗口内第二击落点距 click#1 ≤ 本阈值时
-#   判定为"同一图标双击意图"→ 原子 doubleClick（内部两次点击几十ms，OS 必判双击打开）并吸附坐标；
-#   超过阈值说明手已移到别的图标 → 降级普通 click。阈值比 TAP_DBL_SNAP_PX 宽（慢节奏手漂更大，
-#   且桌面图标尺寸普遍 50~100px）。单位：屏幕像素。
-RESCUE_DBL_SNAP_PX = 100
+# ⭐ 双击"同一目标"位置容差（2026-09-19 用户拍板收紧为手指自然晃动量 10px；原 60/100px 过大，
+#   单击后掌心移到相邻目标再勾按会被强制判成双击、还把坐标吸回旧目标，新目标点不开）：
+#   两击落点 ≤10px 才算同一目标双击；>10px 一律视为"另一个目标的独立单击"。
+#   单位：屏幕像素。
+# · OS 双击模式（OS_DOUBLE_CLICK=True）下：OS 双击时间窗内、漂移 ≤ 本阈值时把第二击坐标
+#   吸到第一击精确像素（OS 双击位置容差仅 ±2px，不吸附自然手漂必然失败）；超阈值不吸附。
+TAP_DBL_SNAP_PX = 10
+# · 慢节奏双击补救（OS_DOUBLE_CLICK=False 延迟模式）：补救窗内第二击距 click#1 ≤ 本阈值
+#   → 原子 doubleClick 打开同一目标；超阈值 → 第二击降级普通 click（不点旧目标）。
+RESCUE_DBL_SNAP_PX = 10
 # ⭐ 点击诊断日志开关：True 时打印 [CLICK-DIAG]（双击间隔/漂移/吸附、补救双击判定）。
 #   2026-09-15：日常使用默认关闭（每次点击打印+flush 会在控制台 I/O 上阻塞主循环）；排查双击问题时临时改 True
 CLICK_DIAG = False
@@ -1208,12 +1205,13 @@ class MouseController:
         # NONE：什么都不做（不影响手势路径的鼠标状态）
 
     # ---------------- 食指 Tap-Click 事件接口（手指屈伸点击，手掌不动）----------------
-    def handle_finger_tap_event(self, tap_event: int, screen_pt):
+    def handle_finger_tap_event(self, tap_event: int, screen_pt, first_xy=None):
         """配合 finger_tap_click_detector.py 使用。
 
         Args:
-            tap_event:   E.{NONE,TAP_CLICK,LONG_DOWN,LONG_UP,DRAG_MOVE}
+            tap_event:   E.{NONE,TAP_CLICK,LONG_DOWN,LONG_UP,DRAG_MOVE,DOUBLE_TAP,RESCUE_DBL_TAP}
             screen_pt:   (x_pixel, y_pixel) 屏幕坐标，未映射传 None 则跳过移动
+            first_xy:    DOUBLE_TAP(快路径双击) 挂起的第一击落点；None=无位置门控
         """
         from finger_tap_click_detector import E as _TE
         if screen_pt is None:
@@ -1293,9 +1291,24 @@ class MouseController:
                 except Exception: pass
             self._drag_active = False
         elif tap_event == _TE.DOUBLE_TAP:
-            # 双击窗口内完成第二次"勾指回弹" → doubleClick
-            # 第一次单击挂起未发，所以物理点击恰好 2 次 = 原生双击（不会多出第 3 次点击）
-            pyautogui.doubleClick(ix, iy, button="left")
+            # 双击窗口（0.38s）内完成第二次"勾指回弹"。
+            # ⭐ 2026-09-19 位置门控（同补救路径 10px 规则）：第二击落点距挂起的第一击 >
+            #   RESCUE_DBL_SNAP_PX = 手已移到别的目标 → 先把挂起的 click#1 补在【第一击位置】，
+            #   再在新落点普通单击（两次独立 click，绝不在新目标上 doubleClick）；
+            #   ≤阈值才是同一目标 → 原子 doubleClick（第一次单击挂起未发，物理点击恰好 2 次）。
+            _d0 = 0.0 if first_xy is None else \
+                ((ix - first_xy[0]) ** 2 + (iy - first_xy[1]) ** 2) ** 0.5
+            if first_xy is not None and _d0 > RESCUE_DBL_SNAP_PX:
+                if CLICK_DIAG:
+                    print(f"[CLICK-DIAG] 快路径第二击 落点({ix},{iy}) 距首击({int(first_xy[0])},"
+                          f"{int(first_xy[1])}) {_d0:.1f}px>{RESCUE_DBL_SNAP_PX}px → 不同目标："
+                          f"补发click#1于首击位置 + 新目标普通click", flush=True)
+                pyautogui.click(int(first_xy[0]), int(first_xy[1]), button="left")
+                pyautogui.click(ix, iy, button="left")
+                self._dbg_last_click_t = time.time()
+                self._dbg_last_click_xy = (ix, iy)
+            else:
+                pyautogui.doubleClick(ix, iy, button="left")
             if self._drag_active:
                 try: pyautogui.mouseUp()
                 except Exception: pass
