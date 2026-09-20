@@ -2183,8 +2183,13 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 #   因为 HighGUI 消息泵没有窗口可挂，会进入「死等键盘事件」阻塞（不是1ms立即返回）
                 #   → 主循环每帧卡死在这里，move_only() / handle_finger_tap_event() 虽然已经执行完，
                 #     但下一轮循环永远到不了 → 用户体感「鼠标完全不动」。
-                #   修复：纯后台模式直接用 time.sleep(0.001)（1ms 轻量级调度让步，纯时间，不进 HighGUI）。
-                time.sleep(0.001)
+                #   修复：纯后台模式直接用 time.sleep(0)（仅让出 CPU 时间片给同优先级线程，
+                #   不进 HighGUI、不等待定时器）。
+                # ⭐ 2026-09-20：曾用 time.sleep(0.001)，但 Windows 默认定时器粒度 15.6ms，
+                #   实测该调用每帧阻塞 15.2ms（主循环从~20fps 被压到~8fps 的三大元凶之一）。
+                #   sleep(0) 不阻塞、零定时器税，仍把执行权让给 Flask 请求线程；
+                #   且 detect() 等待回调的 Event.wait 期间本就释放 GIL，Flask 有充足调度窗口。
+                time.sleep(0)
                 # 无预览模式额外心跳（~每 2 秒 1 次，与输入无关）：证明循环在跑，方便排查静默状态
                 if (_log_cnt % 120 == 0) and (_log_cnt > 0):
                     print(f"[RUN-OK bg-mode] frame={_log_cnt:>5} FPS={_fps_display:5.1f} preview=OFF gesture_left={hand_results.get('Left',(None,))[0]} move_ok={right_screen_pt is not None} tap_event={tap_event}",
