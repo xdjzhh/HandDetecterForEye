@@ -1102,11 +1102,13 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
         status_store["running"] = True
 
         # ================== 主循环（与原 main.py 唯一差别：加 stop_event 每帧退出） ==================
+        _bg_heartbeat_cnt = 0   # 无预览模式心跳帧计数（~每120帧打印一次 RUN-OK）
         while True:
             # 🔴 新增：stop_event 命中 → 立即干净退出
             if stop_event is not None and stop_event.is_set():
                 break
 
+            _bg_heartbeat_cnt += 1
             _t0 = time.perf_counter()
             ok, frame = cap.read()
             _t1 = time.perf_counter()
@@ -1433,7 +1435,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             two_finger_gap_parts: tuple | None = None  # (MCP,PIP,DIP,TIP) 四排指距比值，仅诊断日志用
             right_screen_pt = None
             if "Left" in hand_results:
-                run_loop._gt_miss_active = False   # 黑帧取证：目标手在 → 清除"未检出"标志
                 _, _, _, lms = hand_results["Left"]
                 tip = np.array([lms[8].x, lms[8].y])
                 m5  = np.array([lms[5].x, lms[5].y])
@@ -1464,7 +1465,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     _palm_que = deque(maxlen=8)
                     run_loop._tap_palm_n_queue = _palm_que
                 if palm_n_raw > 1e-6:
-                    run_loop._gt_palm_miss_active = False   # 取证：掌宽正常 → 清除截断标志
                     _palm_que.append(palm_n_raw)
                     if _palm_ema is None:
                         _palm_ema = palm_n_raw
@@ -1592,57 +1592,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                 two_finger_together = None
                                 two_finger_gap = None
                                 two_finger_gap_parts = None
-                    # ⭐ 统一后仍保留缓存供日志只读（IN_TB列显示位置，PIPΔ°列显示DIP/PIP角度变化量，不参与判断逻辑）
-                    try:
-                        _anx, _any = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
-                        _rx1, _ry1, _rx2, _ry2 = MouseController.compute_roi_bbox_px(
-                            w, h, args.roi_scale, args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
-                        _axp = float(_anx) * float(w)
-                        _ayp = float(_any) * float(h)
-                        _TOP = 0.25
-                        _by_top = float(_ry1)
-                        _by_bot = float(_ry1) + _TOP * max(1.0, float(_ry2 - _ry1))
-                        _inx = (_axp >= float(_rx1) - 6.0) and (_axp <= float(_rx2) + 6.0)
-                        _iny = (_ayp >= _by_top - 4.0) and (_ayp <= _by_bot + 4.0)
-                        run_loop._cached_in_top_band = bool(_inx and _iny)
-                    except Exception:
-                        run_loop._cached_in_top_band = False
-                    run_loop._cached_palm_stable_actual = bool(palm_stable)
-                    _pip_ema_q: deque = getattr(run_loop, '_tap_pip_ema_que', None)
-                    _dip_ema_q: deque = getattr(run_loop, '_tap_dip_ema_que', None)
-                    if _pip_ema_q is None:
-                        _pip_ema_q = deque(maxlen=5)
-                        run_loop._tap_pip_ema_que = _pip_ema_q
-                    if _dip_ema_q is None:
-                        _dip_ema_q = deque(maxlen=5)
-                        run_loop._tap_dip_ema_que = _dip_ema_q
-                    try:
-                        p5q, p6q, p7q = np.array([lms[5].x,lms[5].y]), np.array([lms[6].x,lms[6].y]), np.array([lms[7].x,lms[7].y])
-                        pip_now = _three_point_angle(p5q, p6q, p7q)
-                        _pip_ema_q.append(pip_now)
-                        p6q2, p7q2, p8q2 = p6q, p7q, np.array([lms[8].x,lms[8].y])
-                        dip_now = _three_point_angle(p6q2, p7q2, p8q2)
-                        _dip_ema_q.append(dip_now)
-                        if len(_pip_ema_q) >= 1:
-                            pip_ema = float(sum(_pip_ema_q)/len(_pip_ema_q))
-                            pip_chg = round(pip_now - pip_ema, 1)
-                        else:
-                            pip_chg = 0.0
-                        if len(_dip_ema_q) >= 1:
-                            dip_ema = float(sum(_dip_ema_q)/len(_dip_ema_q))
-                            dip_chg = round(dip_now - dip_ema, 1)
-                        else:
-                            dip_chg = 0.0
-                        run_loop._cached_pip_now = round(pip_now,1)
-                        run_loop._cached_pip_chg = pip_chg
-                        run_loop._cached_dip_now = round(dip_now,1)
-                        run_loop._cached_dip_chg = dip_chg
-                        del p5q,p6q,p7q,p6q2,p7q2,p8q2
-                    except Exception:
-                        run_loop._cached_pip_now = None
-                        run_loop._cached_pip_chg = 0.0
-                        run_loop._cached_dip_now = None
-                        run_loop._cached_dip_chg = 0.0
                 else:
                     # palm_n_raw 太小（手离镜头特别远/截断）→ 直接丢弃
                     index_bend = None
@@ -1650,18 +1599,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     two_finger_together = None
                     two_finger_gap = None
                     two_finger_gap_parts = None
-                    try:
-                        import time as _gt_t2
-                        _gn = _gt_t2.monotonic()
-                        if (not getattr(run_loop, "_gt_palm_miss_active", False)) \
-                                or _gn - getattr(run_loop, "_gt_palm_miss_last_t", -1e9) >= 0.5:
-                            run_loop._gt_palm_miss_last_t = _gn
-                            FingerTapClickDetector._gate_log(
-                                f"##MISS-PALM 关键点在手但掌宽≈0 palm_n_raw={palm_n_raw:.5f}"
-                                f"（截断/过远） tapState={tap_detector._GT_SN.get(tap_detector.state)}")
-                        run_loop._gt_palm_miss_active = True
-                    except Exception:
-                        pass
 
                 # ⭐ 2026-08-22 核心修复：Tap-Click 段直接复用 move_only() 同帧计算出来的"缓存平滑后坐标"
                 #   之前的问题：
@@ -1673,25 +1610,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 # 走 _eval_anchor_once：如果 move_only() 已经在本帧跑过同 anchor_norm → 缓存命中，smoother 不再二次更新
                 _, _, sx, sy, _, _ = mouse._eval_anchor_once(anchor_norm, gesture_hint=None)
                 right_screen_pt = (float(sx), float(sy))
-            else:
-                # ⭐ 取证（纯观测）：目标手(MP label "Left"=用户右手)整手未检出。
-                #   区分两种黑帧根因：①另一只手("Right")占名额/标签翻转 ②MediaPipe 整手 0 检出。
-                #   上升沿 + 每 0.5s 落一行，避免刷屏。
-                try:
-                    import time as _gt_t
-                    _gt_now = _gt_t.monotonic()
-                    _gt_last = getattr(run_loop, "_gt_miss_last_t", -1e9)
-                    _gt_was = getattr(run_loop, "_gt_miss_active", False)
-                    run_loop._gt_miss_active = True
-                    if (not _gt_was) or (_gt_now - _gt_last) >= 0.5:
-                        run_loop._gt_miss_last_t = _gt_now
-                        _oth = [f"{_lb}/{_gd[0]}"
-                                for _lb, _gd in hand_results.items()]
-                        FingerTapClickDetector._gate_log(
-                            f"##MISS-HAND 整手未检出 帧检出={_oth if _oth else '无任何手'} "
-                            f"hands={len(hands_data)} tapState={tap_detector._GT_SN.get(tap_detector.state)}")
-                except Exception:
-                    pass
 
             # 快路径双击(DOUBLE_TAP)挂起的首击落点（2026-09-19 位置门控，见下方 WAIT_DBL 捕获）
             _pending_first_xy = None
@@ -1713,26 +1631,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     tap_event = 0
                 else:
                     tap_event = tap_detector.update(index_bend)
-                    # ⭐⭐ 取证（纯观测，不参与判定）：本帧 raw 大跳变 → 把三个关节角+掌宽落同一日志，
-                    #   回答"raw 是怎么测出来的、跳变来自角度跳变还是归一化/掌宽"
-                    if getattr(tap_detector, "_gt_jump_pending", False):
-                        try:
-                            _jp0 = np.array([lms[0].x, lms[0].y])
-                            _jp5 = np.array([lms[5].x, lms[5].y])
-                            _jp6 = np.array([lms[6].x, lms[6].y])
-                            _jp7 = np.array([lms[7].x, lms[7].y])
-                            _jp8 = np.array([lms[8].x, lms[8].y])
-                            _ang_mcp = _three_point_angle(_jp0, _jp5, _jp6)
-                            _ang_pip = _three_point_angle(_jp5, _jp6, _jp7)
-                            _ang_dip = _three_point_angle(_jp6, _jp7, _jp8)
-                            FingerTapClickDetector._gate_log(
-                                f"!!JUMP-ANG ∠MCP(腕-5-6)={_ang_mcp:6.1f}° ∠PIP(5-6-7)={_ang_pip:6.1f}° "
-                                f"∠DIP(6-7-8)={_ang_dip:6.1f}° (180=伸直,0=对折) | "
-                                f"palm_raw={palm_n_raw:.4f} palm_ema={_palm_ema:.4f} "
-                                f"stable={int(palm_stable)} raw_bend={index_bend:.4f}")
-                        except Exception:
-                            pass
-                        tap_detector._gt_jump_pending = False
                     # ⭐ 2026-09-19：首击回弹进 WAIT_DBL 当帧记录落点（掌心位置=被点目标），
                     #   供 DOUBLE_TAP 事件按 10px 门控判"同目标双击 / 不同目标两次独立单击"
                     _pending_first_xy = getattr(run_loop, "_first_tap_xy", None)
@@ -1741,43 +1639,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             run_loop._first_tap_xy = right_screen_pt
                     else:
                         run_loop._first_tap_xy = None
-
-            # ======================================================================
-            # ⭐⭐ 方案 A 取证日志（ROI 顶部 25% 条带）
-            #   2026-08-25 致命修复：用户右手=MediaPipe label"Left"(镜像语义)，之前写"Right"=100%永不触发→无日志
-            #   保证：
-            #     · 每 60 帧打 1 行【心跳】= 无论条带是否命中，必打，证明日志代码执行中
-            #     · 掌心进 TOP 25% 条带 → 每 2 帧打 1 行详细表 + 首次表头
-            #     · 所有 print 强制 flush（Flask stdout 缓冲默认关闭 flushing）
-            # ======================================================================
-            try:
-                import sys as _sys
-                _log_cnt = getattr(run_loop, '_tap_log_frame_cnt', -1)
-                _log_header_printed = getattr(run_loop, '_tap_log_header_printed', False)
-                _log_cnt = 0 if _log_cnt < 0 else (_log_cnt + 1)
-                setattr(run_loop, '_tap_log_frame_cnt', _log_cnt)
-                # ---------- (1) 每 60 帧 1 行心跳日志（证明代码在执行，不会“完全无日志”）----------
-                if _log_cnt % 60 == 0:
-                    rx1, ry1, rx2, ry2 = MouseController.compute_roi_bbox_px(
-                        w, h, args.roi_scale, args.roi_offset_y, roi_safe_shrink=args.roi_safe_shrink)
-                    TOP_BAND_FACT = 0.25
-                    band_y_top = float(ry1); band_y_bot = float(ry1) + TOP_BAND_FACT * max(1.0, float(ry2-ry1))
-                    labels = sorted(hand_results.keys())
-                    anchor_info = "no Right-Left label"
-                    for _lbl in ("Left", "Right"):
-                        if _lbl in hand_results:
-                            _, _, _, _l = hand_results[_lbl]
-                            nx, ny = HandDetector.cursor_anchor_from_landmarks(_l, args.anchor)
-                            ay = float(ny) * float(h); ax = float(nx) * float(w)
-                            in_band = (ay >= band_y_top - 2.0) and (ay <= band_y_bot + 2.0)
-                            anchor_info = f"{_lbl}: anchor({ax:5.1f},{ay:5.1f}) inTopBand={'Y' if in_band else 'N'} | {anchor_info}"
-                    # 用户要求删除 [HEARTBEAT-TAPLOG] 心跳兜底日志（2026-08-26）
-                    # print(f"[HEARTBEAT-TAPLOG] frame={_log_cnt:>4} labels={labels} safe_rect_y=[{band_y_top:5.1f}~{band_y_bot:5.1f}~{ry2:5.1f}] | {anchor_info}",
-                    #       file=_sys.stdout, flush=True)
-                # (2) 详细逐帧 TAP 表格日志 │368 │ Y ... 已直接删除（2026-08-26，用户要求）
-            except Exception as _tap_log_e:
-                import traceback as _tb
-                print(f"  [ERROR] top-band tap log 异常：{_tap_log_e!r}\n{_tb.format_exc()}", flush=True)
 
             if not disable_click_for_stretch_global and stretch.state != _DS.SCALING:
                 # 1=单击(窗口超时补发) 2=长按按下 5=双击(快速原子) 6=慢节奏补救双击 7=双指右键：都要求鼠标钉在当前位置完成动作
@@ -2272,8 +2133,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 #   且 detect() 等待回调的 Event.wait 期间本就释放 GIL，Flask 有充足调度窗口。
                 time.sleep(0)
                 # 无预览模式额外心跳（~每 2 秒 1 次，与输入无关）：证明循环在跑，方便排查静默状态
-                if (_log_cnt % 120 == 0) and (_log_cnt > 0):
-                    print(f"[RUN-OK bg-mode] frame={_log_cnt:>5} FPS={_fps_display:5.1f} preview=OFF gesture_left={hand_results.get('Left',(None,))[0]} move_ok={right_screen_pt is not None} tap_event={tap_event}",
+                if (_bg_heartbeat_cnt % 120 == 0) and (_bg_heartbeat_cnt > 0):
+                    print(f"[RUN-OK bg-mode] frame={_bg_heartbeat_cnt:>5} FPS={_fps_display:5.1f} preview=OFF gesture_left={hand_results.get('Left',(None,))[0]} move_ok={right_screen_pt is not None} tap_event={tap_event}",
                           flush=True)
 
     # ================== finally：100% 与原 main.py 行为一致 ==================
