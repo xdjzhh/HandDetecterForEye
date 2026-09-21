@@ -1213,13 +1213,30 @@ class MouseController:
             screen_pt:   (x_pixel, y_pixel) 屏幕坐标，未映射传 None 则跳过移动
             first_xy:    DOUBLE_TAP(快路径双击) 挂起的第一击落点；None=无位置门控
         """
-        from finger_tap_click_detector import E as _TE
+        from finger_tap_click_detector import E as _TE, FingerTapClickDetector as _DTC
+        _EVN = {0: "NONE", 1: "TAP", 2: "LONG_DOWN", 3: "LONG_UP", 4: "DRAG_MOVE",
+                5: "DOUBLE_TAP", 6: "RESCUE_DBL_TAP", 7: "RIGHT_TAP"}
+        # ⭐⭐⭐ 2026-09-21 铁证：LONG_UP 不依赖坐标（mouseUp 无需位置），即使 screen_pt=None
+        #   （黑帧 10s 硬兜底发出的释放）也必须抬键，否则物理左键永久卡住，后续拖拽补 mouseDown
+        #   形成同点密集 up/down → OS 判多双击连开窗口。
+        if screen_pt is None and tap_event == _TE.LONG_UP:
+            try:
+                pyautogui.mouseUp()
+            except Exception:
+                pass
+            _DTC._gate_log(f"##MOUSE-ACT 物理mouseUp(无坐标,硬兜底释放) drag_was={int(self._drag_active)}")
+            self._drag_active = False
+            return
         if screen_pt is None:
             if tap_event in (_TE.TAP_CLICK, _TE.DOUBLE_TAP, _TE.RESCUE_DBL_TAP,
                              _TE.RIGHT_TAP, _TE.LONG_DOWN):
                 print(f"[点击异常] 事件 ev={tap_event} 被丢弃：触发帧手不在画面(screen_pt=None)")
+                _DTC._gate_log(f"##MOUSE-DROP {_EVN.get(tap_event, tap_event)} screen_pt=None 事件丢弃")
             return
         ix, iy = int(screen_pt[0]), int(screen_pt[1])
+        _DTC._gate_log(f"##MOUSE-IN {_EVN.get(tap_event, tap_event)} pt=({ix},{iy}) "
+                       f"first_xy={None if first_xy is None else (int(first_xy[0]), int(first_xy[1]))} "
+                       f"drag={int(self._drag_active)}")
 
         if tap_event == _TE.RIGHT_TAP:
             # 食中双指并拢勾按回弹 → 右键单击（独立分支：不写入左键双击诊断簿记，
@@ -1305,10 +1322,13 @@ class MouseController:
                           f"补发click#1于首击位置 + 新目标普通click", flush=True)
                 pyautogui.click(int(first_xy[0]), int(first_xy[1]), button="left")
                 pyautogui.click(ix, iy, button="left")
+                _DTC._gate_log(f"##MOUSE-ACT 物理click×2(异目标) ({int(first_xy[0])},{int(first_xy[1])}) "
+                               f"+ ({ix},{iy})")
                 self._dbg_last_click_t = time.time()
                 self._dbg_last_click_xy = (ix, iy)
             else:
                 pyautogui.doubleClick(ix, iy, button="left")
+                _DTC._gate_log(f"##MOUSE-ACT ★物理doubleClick ({ix},{iy}) 快路径同目标")
             if self._drag_active:
                 try: pyautogui.mouseUp()
                 except Exception: pass
@@ -1329,6 +1349,8 @@ class MouseController:
                     print(f"[CLICK-DIAG] 🔁 补救双击(慢节奏) 落点({ix},{iy}) 距click#1 {_dpos:.1f}px≤{RESCUE_DBL_SNAP_PX}px "
                           f"→ doubleClick({_xy0[0]},{_xy0[1]}) 原子双击打开", flush=True)
                 pyautogui.doubleClick(_xy0[0], _xy0[1], button="left")
+                _DTC._gate_log(f"##MOUSE-ACT ★物理doubleClick ({_xy0[0]},{_xy0[1]}) "
+                               f"慢补救同目标(本帧pt {ix},{iy} 吸附{_dpos:.1f}px)")
                 # 双击已由本次原子操作完成，清点击记录避免后续干扰
                 self._dbg_last_click_xy = None
                 self._dbg_last_click_t = None
@@ -1338,6 +1360,7 @@ class MouseController:
                     print(f"[CLICK-DIAG] 补救第二击 落点({ix},{iy}) 距click#1 {_dpos:.1f}px>{RESCUE_DBL_SNAP_PX}px "
                           f"→ 判定为不同目标，降级普通click", flush=True)
                 pyautogui.click(ix, iy, button="left")
+                _DTC._gate_log(f"##MOUSE-ACT 物理click({ix},{iy}) 慢补救异目标降级 {_dpos:.1f}px")
                 self._dbg_last_click_t = time.time()
                 self._dbg_last_click_xy = (ix, iy)
             if self._drag_active:

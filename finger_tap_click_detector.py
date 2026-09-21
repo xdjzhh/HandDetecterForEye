@@ -1,3 +1,4 @@
+import os
 import time
 import numpy as np
 from collections import deque  # 存最近 N 帧 bend_ratio，算一阶差分
@@ -25,32 +26,46 @@ from collections import deque  # 存最近 N 帧 bend_ratio，算一阶差分
 ⭐ 2026-08-22 用户明确：「点击应该计算的是最近几帧手指弯曲的变化量，而不是以绝对弯曲度判断」
 根因：老方案用绝对弯曲度 bend/baseline → 但 baseline 依赖 palm 宽度(MCP_5→MCP_17)，手掌翻转/远近变化时
       palm_n 慢波动 → bend_ratio 也跟着变 → 明明没弯手指，也会在 enter_t / exit_t 上上下下 → 疯狂误判。
-新方案（一阶差分 + 绝对阈值兜底，双判据 OR 兼容）：
-  主判据 = 最近 K 帧 bend_ratio（=smoothed_bend / baseline）的「一阶差分累积和」
-    · 按下 = 近 5 帧 Δbend_ratio 累计 ≤ -TAP_DOWN_DI_SUM（bend_ratio 变小了 = 食指真的主动弯了）
-    · 松开 = 近 5 帧 Δbend_ratio 累计 ≥ +TAP_UP_DI_SUM（bend_ratio 变大了 = 食指真的主动回弹伸直）
-  兜底判据（保留旧工程约定，高级用户仍能用老参数习惯）：
-    · 原来的 enter_t/exit_t + MIN_BEND_DROP 仍作为「绝对弯曲度门槛」兜底，保证：
-      - 纯差分的小抖动（比如差分刚好触发但实际根本没弯）= 绝对门槛拦下
-      - 差分窗口太窄没接住、但用户确实明显弯了 = 绝对门槛仍能触发（兼容）
+新方案（一阶差分变化量是【唯一】起弯判据，2026-09-21 用户拍板废除绝对弯曲度入口）：
+  按下 = 最近 DI_WINDOW_SEC 秒 bend_ratio 的负差分累积 ≥ TAP_DOWN_DI_SUM，且已离开伸直位
+    · 必须真的发生「下弯变化」：手指本来就弯着 / 黑帧恢复时仍弯着 / 长按回直途中还弯着，
+      只要没有新的下弯变化量 → 一律不起弯（绝对弯曲度 B<enter_t 兜底入口已删除，它正是
+      "长按回直被识别成双击"的根因：LONG_UP 后手指没动却被当成新一次起弯）
+    · bend_ratio ≤ MIN_ABS_BEND_RATIO_FOR_DELTA 只是"确实弯离伸直位"的确认门，单独不触发
+  松开 = 必须【真的回直】（2026-09-21 用户拍板，长按/双击隔离；同日真机日志补第三门）：
+    ① 回直变化量：从本段弯曲谷底 bend_ratio 回升 ≥ RECOVER_RISE_MIN
+    ② EMA 伸直位：平滑 bend_ratio ≥ RECOVER_RATIO_MIN（基本伸直）
+    ③ raw 伸直位：原始测量 bend ≥ 基线*0.985（手指物理位置真到位；②会在回弹运动途中
+       被 EMA 惯性提前满足——真机误触 raw=0.77 未直、EMA 0.881 险过②，③拦之）
+    三个门 AND，再与快速回弹线索（正差分累积 ≥ TAP_UP_DI_SUM 或 B≥exit_t）AND。
+    长按中手指不回直（微松到 ratio 0.55~0.70 仍明显弯着，谷底回升量小；或回弹途中 raw 未到位）
+    → 不松手、不产生第一次 Tap、不进 WAIT_DBL → 长按中在状态机层面不可能凑出双击。
+  点击质量门：Tap/双击任一击回弹时，整段谷底必须 ≤ TAP_MIN_BEND_RATIO(0.66)，
+    半弯抖动（谷底 0.69、raw 才到 0.52）静默取消，首击不发点击、无效第二击回 WAIT 不占名额。
+    ARMED 第二帧"尖峰拒绝"对深弯（起弯帧谷底 ≤0.55）豁免：1 帧深弯后立刻弹直=最短合法点击，
+    不得整条吞掉（真机日志：真第二击被吞→后面没松直的抖动顶包成双击）。
+  双击第二击 = 第一次回直变化【之后】又出现一段新的下弯变化（WAIT_DBL down_trigger / 趋势探测）；
+    长按与双击互斥：①长按中途的微松不构成第一次 Tap（上面的真回直门）；
+    ②LONG_DOWN 即清掉全部挂起的单击/双击状态，LONG_UP 之后没有新下弯变化就
+    不会产生任何可配对的点击（不需要额外的"伸直观测"等复杂状态）。
   → 手掌翻转/远近变化是低频慢漂（相邻几帧 Δbend_ratio ≈ ±0.01）→ 差分和 = 0 → 绝不误判。
   → 只有真的"食指主动弯下去再弹回来"才会形成大幅差分正负脉冲 → 精准识别。
 
 状态机（严格时序：伸直→弯→伸直 = 一次Tap；弯曲超时=Hold拖拽）：
 
  STRAIGHT_IDLE (bend≈伸直, 持续学习伸直基线)
-   │ (主：近5帧Δ累积 ≥ DOWN_DI  且  B < enter_t*1.02)  OR  (兜底：B < enter_t 且 drop>MIN_DROP)
+   │ 唯一入口：近窗 Δ负累积 ≥ DOWN_DI（真的发生下弯变化）且 bend_ratio 已离开伸直位
    ▼
  BEND_ARMED (检测到弯曲，等 1 帧避免瞬间尖峰)
    │ 下一帧仍满足弯曲
    ▼
  BEND_HOLD  (弯曲持续中 → 计时)
-   ├─ (主：近5帧Δ累积 ≥ UP_DI  或  兜底：B≥exit_t)  且 hold_frames <= LONG_PRESS  → TAP_CLICK → 单击
-   └─ (hold_frames > LONG_PRESS  且 bend 仍<baseline*0.80)                           → LONG_PRESS → 长按拖拽开始
+   ├─ 回弹线索(Δ正累积≥UP_DI 或 B≥exit_t) 且【真回直】(谷底回升≥0.30 且 ratio≥0.88) 且短按窗 → TAP_CLICK
+   └─ hold 超过 LONG_PRESS（仍弯着；中途微松不满足真回直 → 不松手、不计Tap）              → LONG_PRESS → 长按拖拽开始
                 │
                 ▼
           PRESSED_HOLD (保持按住，拖拽跟随)
-                │  (主：差分释放  或  兜底：B≥exit_t → 释放)
+                │  释放同样要求【真回直】(谷底回升≥0.30 且 ratio≥0.88)；黑帧(bend=None)立即释放（既有行为）
                 ▼
           COOLDOWN (4帧冷却 + 重置伸直基线慢速学习) → IDLE
 """
@@ -62,7 +77,7 @@ _CLOCK = time.monotonic
 # 阈值（文件级默认值；实际运行时可通过构造参数 hardness/speed 被 CLI 参数覆盖）
 ENTER_BEND_RATIO_DEFAULT = 0.78       # 进入弯曲判定：bend < baseline * ENTER_BEND_RATIO
 EXIT_BEND_RATIO_DEFAULT  = 0.86       # 释放回到"伸直"判定：bend > baseline * EXIT_BEND_RATIO
-MIN_BEND_DROP_DEFAULT    = 0.12       # 最低相对下降幅度（从历史高值下降的比例，避免小幅抖动=误触）
+MIN_BEND_DROP_DEFAULT    = 0.12       # 最低相对下降幅度（仅双指右键检测器的绝对兜底仍在用；左键起弯已废除绝对入口）
 # ---------------- 墙钟时间归一化（2026-09-18，帧计数→time.monotonic 秒）----------------
 # 所有"物理时长"阈值一律以秒表示，按 NOMINAL_FPS=30 由旧帧阈值【精确】换算：
 #   状态机首帧计 1（ARM 当帧 hold/total=1），"N 帧成立"= 经过 N-1 个帧间隔 → 阈值=(N-1)*FRAME_SEC；
@@ -98,6 +113,25 @@ MIN_HOLD_SEC_DEFAULT     = (MIN_BEND_HOLD_DEFAULT - 1) * FRAME_SEC
 # COOLDOWN_SEC：用户明确要求保留改动（原14帧→4帧，解决连点第二下卡死）
 COOLDOWN_FRAMES  = 4
 COOLDOWN_SEC     = COOLDOWN_FRAMES * FRAME_SEC
+# ⭐⭐⭐ 2026-09-21 18:12 真机日志铁证：MediaPipe 整手丢失(非掌心门控)可连续 0.5s+，
+#   而手回来时手指始终弯着(raw .21/.22/.55)——"丢手超时=松手"假设物理上不成立。
+#   最终语义：手势进行中(ARMED/HOLD/PRESSED)黑帧【无限期冻结】，松手与否只由手回来当帧的
+#   手指物理状态裁决（回直三门：弯着→继续按；直了→LONG_UP/点击成立）。
+#   仅保留超长硬兜底：连续黑帧超过此时长（手真离开再也不回来）才强制结束，防鼠标永久按住。
+NONE_GESTURE_HOLD_SEC = 0.50      # 仅用于诊断：超过此时长的冻结在日志里标注"长冻结"
+NONE_GESTURE_ABANDON_SEC = 10.0   # 硬兜底：连续黑帧超过此时长才强制释放/丢弃
+# ⭐⭐⭐ 2026-09-21 18:57 真机日志铁证：误触链的真正起点是【丢手恢复期的过渡垃圾帧】——
+#   手重新被 MediaPipe 捕获的头几帧会吐中间态关键点（日志 L43-46：黑帧2帧后 raw .535→.726
+#   →.785→.788→.801 连"直"4帧，下一帧 L47 立刻又测到 .20 深弯）。旧逻辑当帧即释放 →
+#   真实未松的按压被斩断，随后真实弯指动作被当成新点击 → 双击。
+#   修复：黑帧结束后的 POST_NONE_CONFIRM_WINDOW 秒内，"松手"必须连续 POST_NONE_CONFIRM_FRAMES
+#   帧都稳定过伸直门（任一帧重新弯下即清零）。真松手手指会一直直着，代价仅 ~0.1s 确认延迟；
+#   重新捕获的瞬时假伸直会被紧接着的弯帧打断，不释放。
+POST_NONE_CONFIRM_WINDOW = 0.35
+POST_NONE_CONFIRM_FRAMES = 3
+# ⭐ 取证（纯观测，不参与判定）：手势保持中(HOLD/PRESSED)原始 raw 帧间跳变 ≥ 此值 → 落 JUMP 证据行。
+#   正常保持帧间波动 <0.05；重新捕获过渡帧/测量跳变 0.15~0.40。
+JUMP_TRACE_DELTA = 0.12
 # ⭐ 双击判定（2026-09-10，用户要求：食指勾按有且只有「单击/双击」两种结果，严格互斥）：
 #   第一次 Tap 松开后【不立即单击】，进入 WAIT_DBL 窗口：
 #     · 窗口内完成第二次 Tap → DOUBLE_TAP（只发一次 doubleClick，挂起的单击作废 → 物理点击恰好 2 次）
@@ -145,6 +179,10 @@ OS_DOUBLE_CLICK = False
 #   ARM=起弯  TAP=点击发出  LONG=长按转换(双击被吞的头号嫌疑)  SPIKE=尖峰拒绝  NONE帧=掌心不稳被门控
 #   2026-09-15：日常使用默认关闭（控制台刷屏会拖慢主循环、影响鼠标流畅度）；排查点击问题时临时改 True
 TAP_DIAG = False
+
+# ⭐⭐ 临时取证（2026-09-20 "长按当双击"真机排查）：只写 tap_gate.log，不参与任何判定，修复后连同代码删除
+GATE_TRACE = True
+_GATE_TRACE_FILE = "tap_gate.log"
 
 # ⭐ 真机测量（2026-09-17）：纯内存计数 + 周期摘要，【不参与任何判定逻辑】（零风险）。
 #   每 TAP_STATS_PRINT_SEC 秒打印一行 [TAP-STAT]：帧率/None占比/ARM入口占比/尖峰拒绝/
@@ -212,6 +250,30 @@ DI_HIST_MAXLEN = 32           # 加宽后 60fps 窗内最多 ~25 点（speed0 �
 TAP_DOWN_DI_SUM = 0.10        # 按下门限：ΣΔbend_ratio ≤ -0.10 → 食指真的主动弯了（bend_ratio 下降）
 #   （v2 关节角度 手指从伸直→90°弯，bend_ratio 变化≈0.85→0.30=-0.55 → 取 0.10 半程即可触发，5帧内必须完成）
 TAP_UP_DI_SUM   = 0.07        # 松开门限：ΣΔbend_ratio ≥ +0.07 → 食指真的主动回伸（bend_ratio 上升）
+# ⭐⭐ 2026-09-21 长按/双击隔离（用户拍板）：松开不能只看过没过一条低绝对线 / 窗内差分，
+#   必须验证「真的回直」——否则按住中途手指微松（仍明显弯着）会被当成第一次 Tap 回弹，
+#   再压弯、再微松即在短按窗内凑成 DOUBLE_TAP（长按中直接触发双击的根因）。
+#   两个门 AND，缺一不可：
+#     ① 回直变化量门：从本段弯曲【谷底】算起的 bend_ratio 回升幅度 ≥ RECOVER_RISE_MIN
+#        （真机标定：真实点击 谷底≈0.25~0.43 → 回直 0.95，回升 0.52~0.70；
+#          长按中微松 谷底0.25 → 0.55~0.70，回升仅 0.30~0.45 且手指仍弯着）
+#     ② 伸直位确认门：当前 bend_ratio ≥ RECOVER_RATIO_MIN（基本回到伸直；0.70/0.76 旧线太低已废）
+#   长按中手指没回直 → 两个门必不过 → 不产生 Tap、不进 WAIT_DBL → 状态机层面不可能发双击。
+RECOVER_RISE_MIN  = 0.30      # 相对本段谷底的最小回升幅度（ratio 尺度）
+RECOVER_RATIO_MIN = 0.88      # 当前 bend_ratio 必须到此线（接近伸直）才承认回弹/松手
+# ⭐⭐ 2026-09-21 真机日志(tap_gate.log 17:05)三连证：只靠 EMA 平滑值判回直会在【回弹运动途中】松手——
+#   误触帧 raw=0.7705（伸直≈0.81，手指挥弹中未到位）EMA 后 ratio=0.881 险过 0.88 门(仅多0.001)。
+#   补第三门：原始测量 raw bend（不经 EMA）也必须回到基线 98% 以上，三个门 AND。
+#   标定：真回直 raw=0.806~0.816；途中误触 0.7704/0.7705。基线随伸直帧快速学习，长期稳定。
+RAW_RECOVER_FRAC  = 0.98
+# 点击段（Tap/双击任一击）谷底必须真的弯到过这条线以下，否则算半弯抖动、静默取消不发点击。
+#   标定：正常点击谷底 ratio=0.25~0.45；日志误触段谷底 0.69（raw 仅到 0.52，几乎没弯）。
+#   仅用于 HOLD→点击分支；长按(PRESSED)释放不受此限（能进长按说明已弯得够久）。
+TAP_MIN_BEND_RATIO = 0.66
+# ARMED 第二帧"尖峰拒绝"的深弯豁免：起弯帧谷底已到此线（实打实弯到过半），第二帧即便弹直
+#   也是【最短合法点击】而不是噪声（真机日志：raw 0.20 弯1帧→0.81 真直，旧逻辑整条吞掉，
+#   反让后面没松直的抖动顶替成第二击）。
+DEEP_ARM_KEEP_RATIO = 0.55
 MIN_ABS_BEND_RATIO_FOR_DELTA = 0.75  # 差分触发后仍必须满足 bend_ratio ≤ 这个兜底（防止"差分刚好到了、但其实没弯"）
                                       # ✅ v3 统一弯曲度量（DIP=0.40 主力）后校准：
                                       #   中等点击(DIP 弯至 120°=60°折) → bratio≈0.70 ≤ 0.75 ✅（能过）
@@ -249,7 +311,8 @@ def resolve_tap_params(hardness: float | None = None,
     speed    = 0.0 if speed    < 0.0 else (1.0 if speed    > 1.0 else float(speed))
 
     # ✨ ENTER_BEND_RATIO：v3 统一度量校准档 0.65~0.73（旧 0.62~0.70 略提 0.03 = 中等点击能过，移动不误触）
-    #    h=0.6(默认) → enter=0.698 → enter_t=baseline*0.7 ≈ 0.85*0.7=0.595（中等点击 B≈0.58 < 0.595 → down_abs 刚好过）
+    #    h=0.6(默认) → enter=0.698 → enter_t=baseline*0.7 ≈ 0.85*0.7=0.595
+    #    （左键起弯只看变化量，enter 线仅用于松开兜底/双指右键；MIN_BEND_DROP 仅右键在用）
     enter = 0.65 + hardness * 0.08           # 0.65 ~ 0.73
     drop  = 0.10 + hardness * 0.16           # 0.10 ~ 0.26（门槛B相对降幅，保持稳定）
     # EXIT = ENTER + 0.06 形成滞回，ENTER 整体下移 EXIT 同步下移（更早识别回弹）
@@ -335,7 +398,6 @@ class FingerTapClickDetector:
         self._smoothed_bend = None
         self._prev_smoothed_bend = None  # 上一帧 bend，判断"是否还在继续弯曲"
         self._baseline = None        # 伸直状态的 bend "高值"（用户动作前后都以此为参考）
-        self._max_recent_bend = None # 近几秒内的最大伸直值（用于 MIN_BEND_DROP 判断）
 
         # ⭐ 墙钟化（2026-09-18）：物理累计一律秒（monotonic）；_stable_frames 仍是连续样本计数
         self._hold_sec = 0.0             # ARM 起累计的"有效弯曲保持时长"（ARMED 每有效帧+dt；HOLD 仅稳定帧+dt）
@@ -343,6 +405,9 @@ class FingerTapClickDetector:
         self._stable_frames = 0          # 连续"弯曲深度稳定"的【样本帧数】（毛刺门，按帧不按时长）
         self._cooldown_until = 0.0       # COOLDOWN 结束时刻（monotonic）；每次 update（含 None）都查
         self._last_valid_t = None        # 上一有效帧时刻；None 帧不推进，恢复首帧 dt=FRAME_SEC（旧 None 透明语义）
+        self._none_run_start = None      # 连续黑帧首帧时刻（墙钟）；有效帧清零。短黑帧冻结、超时才释放
+        self._post_none_deadline = 0.0   # 黑帧恢复后的"松手确认窗"截止时刻；窗内松手须连续N帧伸直
+        self._straight_confirm = 0       # 恢复窗内连续过伸直门的帧数；重新弯下即清零
 
         # ⭐ 2026-08-22 差分点击新增状态
         #   _bend_ratio_hist：连续最近窗内的 (时刻, bend_ratio)，maxlen 按 60fps 窗放宽到 16
@@ -352,6 +417,10 @@ class FingerTapClickDetector:
         #   本帧计算出的差分和（给 metrics/UI 展示用）
         self._di_sum_neg_now = 0.0  # ΣΔ<0 的总和 = 按下去的累积（负值；触发时 ≤ -DOWN_DI）
         self._di_sum_pos_now = 0.0  # ΣΔ>0 的总和 = 抬起来的累积（正值；触发时 ≥ +UP_DI）
+        # ⭐⭐ 2026-09-21 段内弯曲谷底（bend_ratio）：ARMED 当帧起记录，HOLD/PRESSED 每帧取 min；
+        #   松开必须从此谷底回升 RECOVER_RISE_MIN 且当前 ≥ RECOVER_RATIO_MIN（真回直才松手）。
+        #   None = 当前不在弯曲段（IDLE/WAIT_DBL/RESCUE_DBL/COOLDOWN）。
+        self._seg_min_ratio: float | None = None
 
         # ⭐ 双击判定状态
         self._double_candidate = False  # 当前这段弯曲是否始于双击窗口内（=第二次Tap候选）
@@ -368,12 +437,17 @@ class FingerTapClickDetector:
         # ⭐ TAP-DIAG 诊断
         self._dbg_arm_t = None          # 最近一次 ARMED 时刻
         self._dbg_none_in_tap = 0       # 当前 ARM/HOLD 段内 bend=None（掌心不稳门控）帧数
+        self._gt_last_state = None      # ⭐⭐ 临时取证：状态切换检测
+        self._gt_prev_raw = None        # ⭐ 取证：上一有效帧原始 raw（算帧间 Δraw，抓跳变）
+        self._gt_seg_enter_t = None     # ⭐ 取证：当前手势段(ARM起)墙钟，JUMP 行报段持续时长
+        self._gt_jump_pending = False   # ⭐ 取证：本帧发生 raw 大跳变 → 供上层补写关节角证据
 
         # ⭐ 真机测量（2026-09-17）：纯观测计数，reset() 不清（保留整段会话的统计），绝不参与判定
         self._st = {
             "frames": 0, "none": 0,             # update 调用总数 / bend=None 帧数
             "arm_delta": 0, "arm_abs": 0,       # 起弯次数（差分入口 / 绝对入口）
             "spike": 0,                         # ARMED 第2帧尖峰拒绝次数
+            "shallow": 0,                       # 回弹时发现整段弯得太浅（谷底>0.66）→静默取消次数
             "none_ah_frames": 0, "none_ah_seg": 0,  # 点击段(ARM/HOLD)内 None 总帧 / 含 None 的段数
             "first_tap": 0,                     # 首击回弹进 WAIT_DBL 次数
             "click": 0,                         # TAP_CLICK 实际发出次数（含超时补发/丢手立即补发）
@@ -403,15 +477,18 @@ class FingerTapClickDetector:
         self._smoothed_bend = None
         self._prev_smoothed_bend = None
         self._baseline = None
-        self._max_recent_bend = None
         self._hold_sec = 0.0
         self._total_sec = 0.0
         self._stable_frames = 0
         self._cooldown_until = 0.0
         self._last_valid_t = None
+        self._none_run_start = None
+        self._post_none_deadline = 0.0
+        self._straight_confirm = 0
         # 差分点击状态也同步清空
         self._bend_ratio_hist.clear()
         self._armed_by_delta = False
+        self._seg_min_ratio = None
         self._di_sum_neg_now = 0.0
         self._di_sum_pos_now = 0.0
         # 双击判定状态同步清空（挂起的单击作废）
@@ -448,6 +525,7 @@ class FingerTapClickDetector:
             self._stable_frames = 0
             self._last_valid_t = None
             self._armed_by_delta = False
+            self._seg_min_ratio = None
             self._di_sum_neg_now = 0.0
             self._di_sum_pos_now = 0.0
             # 差分队列清掉这段弯曲残留，避免手势结束恢复喂帧时被旧尾巴误触发
@@ -501,6 +579,55 @@ class FingerTapClickDetector:
                 print(f"[TAP-DIAG] t={_CLOCK():.3f} {msg}", flush=True)
             except Exception:
                 pass
+
+    # ---------------------- ⭐⭐ 临时取证：弯侧位置门真机日志（修复后删除） ----------------------
+    _GT_SN = {0: "IDLE", 1: "ARMED", 2: "HOLD", 3: "PRESSED", 4: "COOL",
+              5: "TAPPED", 6: "WAIT", 7: "RESCUE"}
+    _GT_EN = {0: "NONE", 1: "TAP", 2: "LONG_DOWN", 3: "LONG_UP", 4: "DRAG",
+              5: "DBL", 6: "RESCUE", 7: "RIGHT"}
+    _gate_fh = None
+
+    @classmethod
+    def _gate_log(cls, line: str):
+        if not GATE_TRACE:
+            return
+        try:
+            if cls._gate_fh is None:
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _GATE_TRACE_FILE)
+                cls._gate_fh = open(path, "w", encoding="utf-8", buffering=1)
+                cls._gate_fh.write(f"# gate trace start {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            _tw = time.time()
+            _ts = time.strftime("%H:%M:%S", time.localtime(_tw)) + f".{int((_tw % 1.0) * 1000):03d}"
+            cls._gate_fh.write(f"[{_ts}] {line}\n")
+        except Exception:
+            pass
+
+    def _gt_release(self, where: str, why: str, bend_raw, B, bend_ratio, enter_t, exit_t,
+                    di_sum_up, di_sum_down, now):
+        tail = [(round(now - t, 3), round(r, 3)) for t, r in list(self._bend_ratio_hist)[-7:]]
+        self._gate_log(
+            f"!!RELEASE[{where}] {why} | raw={bend_raw if bend_raw is None else round(bend_raw,4)} "
+            f"B={B:.4f} ratio={bend_ratio:.3f} enterR={self._p['ENTER_BEND_RATIO']:.3f} "
+            f"exitR={self._p['EXIT_BEND_RATIO']:.3f} sumUp={di_sum_up:.4f}/thr{self._p['TAP_UP_DI_SUM']:.3f} "
+            f"sumDn={di_sum_down:.4f} dEntry={int(self._armed_by_delta)} "
+            f"total={self._total_sec:.3f} hold={self._hold_sec:.3f} stable={self._stable_frames} "
+            f"histTail(dt,r)={tail}")
+
+    def _gt_emit(self, bend, now):
+        """⭐ 取证：本帧真的有事件离开 detector → 落盘（堵 WAIT补发/RESCUE 盲区）。"""
+        if not GATE_TRACE or self.event_this_frame == E.NONE:
+            return
+        _extra = ""
+        if self.state == _S.WAIT_DBL:
+            _extra = f" waitDeadline+{max(0.0, self._wait_deadline - now):.3f}s"
+        elif self.state == _S.COOLDOWN:
+            _extra = f" cool→{self._GT_SN.get(self._cooldown_next)}"
+        elif self.state == _S.RESCUE_DBL:
+            _extra = f" rescueLeft={max(0.0, self._rescue_deadline - now):.3f}s"
+        self._gate_log(
+            f">>EMIT {self._GT_EN.get(self.event_this_frame)} "
+            f"stateAfter={self._GT_SN.get(self.state)} "
+            f"raw={'None' if bend is None else f'{float(bend):.4f}'}{_extra}")
 
     # ---------------------- 真机测量（纯观测，不参与判定）----------------------
     @staticmethod
@@ -583,30 +710,69 @@ class FingerTapClickDetector:
                     #   否则冷却会吃掉大半个窗口，第二击弯下时已超时回 IDLE）
                     self._rescue_deadline = now + RESCUE_DBL_WINDOW_SEC
                     self._rescue_candidate = False
+                    self._gate_log(f"##ENTER RESCUE 补救窗至 +{RESCUE_DBL_WINDOW_SEC:.2f}s "
+                                   f"(deadline now+{RESCUE_DBL_WINDOW_SEC:.2f})")
             if bend is not None:
                 self._last_valid_t = now   # 冷却中的有效帧仍推进有效帧时刻（不影响任何进行中计数）
             self._update_baseline(bend, can_update=True)
             return E.NONE
 
-        # ---- 无手：回到IDLE；若之前按住则释放 ----
+        # ---- 无手(黑帧)：手势进行中无限期冻结，松手由手回来时的物理状态裁决；仅10s硬兜底 ----
         if bend is None:
-            # ⭐ 差分队列清空（下一次有手是全新场景，不能带上旧差分）
-            self._bend_ratio_hist.clear()
-            self._last_valid_t = None   # None 段不产生 dt；恢复首帧按标称 FRAME_SEC（旧 None 对帧计数透明）
-            self._di_sum_neg_now = 0.0
-            self._di_sum_pos_now = 0.0
-            if self.state in (_S.BEND_HOLD, _S.BEND_ARMED):
-                if self._dbg_none_in_tap == 0:
-                    self._st["none_ah_seg"] += 1      # 本段第一次 None = 又一个受门控影响的点击段
-                self._dbg_none_in_tap += 1
-                self._st["none_ah_frames"] += 1
-                if self._dbg_none_in_tap <= 3 or self._dbg_none_in_tap % 10 == 0:
-                    self._diag(f"⚠ bend=None(掌心不稳门控) 状态={self.state} 累计{self._dbg_none_in_tap}帧")
-                # 只是中间态，不算（不推进、不判回弹）
+            if self._none_run_start is None:
+                self._none_run_start = now
+            _none_dur = now - self._none_run_start
+            _none_dead = _none_dur >= NONE_GESTURE_ABANDON_SEC
+            if self.state in (_S.BEND_HOLD, _S.BEND_ARMED, _S.PRESSED):
+                if not _none_dead:
+                    # ⭐⭐⭐ 冻结：不推进计时、不释放、不清差分历史、不动 _smoothed_bend。
+                    #   手回来当帧走正常分支：手指仍弯→继续手势；已回直→回直三门成立才释放。
+                    #   时间不裁决松手（实测 MediaPipe 丢手 0.5s+ 手指仍弯着，超时释放=凭空双击之源）。
+                    if self.state in (_S.BEND_HOLD, _S.BEND_ARMED):
+                        if self._dbg_none_in_tap == 0:
+                            self._st["none_ah_seg"] += 1      # 本段第一次 None = 又一个受门控影响的点击段
+                        self._dbg_none_in_tap += 1
+                        self._st["none_ah_frames"] += 1
+                        if self._dbg_none_in_tap <= 3 or self._dbg_none_in_tap % 30 == 0:
+                            self._diag(f"⚠ bend=None 冻结 状态={self.state} "
+                                       f"累计{self._dbg_none_in_tap}帧 dur={_none_dur:.2f}s")
+                    else:
+                        if _none_dur < NONE_GESTURE_HOLD_SEC or int(_none_dur * 4) != int(
+                                max(0.0, _none_dur - FRAME_SEC) * 4):
+                            self._gate_log(f"##NONE FREEZE PRESSED dur={_none_dur:.3f}"
+                                           f"（按住保持，等手回来按物理状态裁决）")
+                    return E.NONE
+                # ---- 连续黑帧超 10s 硬兜底：手真的再也没回来，强制结束防鼠标永久按住 ----
+                if self.state == _S.PRESSED:
+                    self._diag(f"⚠ PRESSED 连续黑帧{_none_dur:.1f}s≥{NONE_GESTURE_ABANDON_SEC:.0f}"
+                               f" → 硬兜底 LONG_UP")
+                    self.event_this_frame = E.LONG_UP
+                    self._bend_ratio_hist.clear()
+                    self._di_sum_neg_now = 0.0
+                    self._di_sum_pos_now = 0.0
+                    self._enter_cooldown()
+                    self._gt_emit(None, now)
+                    return self.event_this_frame
+                else:
+                    # ARMED/HOLD 段超 10s：未发出过任何点击，整段静默丢弃
+                    self._diag(f"⚠ bend=None 连续{_none_dur:.1f}s 状态={self.state} → 硬兜底段丢弃")
+                    self._bend_ratio_hist.clear()
+                    self._di_sum_neg_now = 0.0
+                    self._di_sum_pos_now = 0.0
+                    self._seg_min_ratio = None
+                    self._double_candidate = False
+                    self._rescue_candidate = False
+                    self._armed_by_delta = False
+                    self.state = _S.IDLE
+                    self._smoothed_bend = None
+                    self._hold_sec = 0.0
+                    self._total_sec = 0.0
+                    self._stable_frames = 0
+                    return E.NONE
             elif self.state == _S.WAIT_DBL:
-                # ⭐ 2026-09-17 取消丢手宽限：挂着 click#1 时遇 None（丢帧/掌心不稳门控）→
+                # ⭐ 2026-09-17 取消丢手宽限（用户拍板保留）：挂着 click#1 时遇 None →
                 #   立即补发单击结束序列，cooldown 后直接回 IDLE（不开 RESCUE：补救窗同样遇 None 即结束）。
-                #   掌心门控丢手时手仍在画面、screen_pt 有效；手完全消失则事件在 controller 层丢弃。
+                #   能进 WAIT 必已过回直三门（手指物理上刚伸直），补发不涉及"弯着被伪造"问题。
                 self._st["wait_none_cancel"] += 1
                 self._tap_pending = False
                 self._double_candidate = False
@@ -620,8 +786,12 @@ class FingerTapClickDetector:
                 self.last_tap_time = _CLOCK()
                 self._st["click"] += 1
                 self._record_click_ms()
+                self._bend_ratio_hist.clear()
+                self._di_sum_neg_now = 0.0
+                self._di_sum_pos_now = 0.0
                 self._diag("③ 单击补发(等待双击中遇None→无宽限立即补发) → cooldown回IDLE")
                 self._enter_cooldown()   # next_state 默认 IDLE
+                self._gt_emit(None, now)
                 return self.event_this_frame
             elif self.state == _S.RESCUE_DBL:
                 # click#1 已送达；遇 None 立即结束补救序列（真单击），回 IDLE
@@ -629,16 +799,22 @@ class FingerTapClickDetector:
                 self.state = _S.IDLE
                 self._rescue_candidate = False
                 self._rescue_deadline = 0.0
+                self._bend_ratio_hist.clear()
+                self._di_sum_neg_now = 0.0
+                self._di_sum_pos_now = 0.0
                 return E.NONE
-            elif self.state == _S.PRESSED:
-                self.event_this_frame = E.LONG_UP  # 手丢了 = 释放
-                self._enter_cooldown()
             else:
+                # IDLE 等非手势态：差分队列清空（全新场景，不带旧差分）
+                self._bend_ratio_hist.clear()
+                self._di_sum_neg_now = 0.0
+                self._di_sum_pos_now = 0.0
                 self.state = _S.IDLE
                 self._smoothed_bend = None
                 self._hold_sec = 0.0
                 self._total_sec = 0.0
                 self._stable_frames = 0
+            self._last_valid_t = None   # None 段不产生 dt；恢复首帧按标称 FRAME_SEC
+            self._gt_emit(None, now)
             return self.event_this_frame
 
         # ---- 有手：墙钟 dt（仅有效帧；钳 2 帧防卡顿跳秒）+ 平滑 bend ----
@@ -647,21 +823,20 @@ class FingerTapClickDetector:
         else:
             dt = min(MAX_DT_SEC, max(0.0, now - self._last_valid_t))
         self._last_valid_t = now
+        # 有效帧打断黑帧连续计数：若此前确有黑帧段 → 开启"松手确认窗"，
+        # 窗内 up_trigger 需连续多帧伸直（防重新捕获过渡垃圾帧假释放）
+        if self._none_run_start is not None:
+            self._post_none_deadline = now + POST_NONE_CONFIRM_WINDOW
+            self._straight_confirm = 0
+        self._none_run_start = None
         prev_b = self._smoothed_bend
+        self._gt_jump_pending = False   # 每有效帧重置；JUMP 发生时在帧尾置位供上层取关节角
         if self._smoothed_bend is None:
             self._smoothed_bend = float(bend)
         else:
             alpha = self._p["BEND_SMOOTH_ALPHA"]
             self._smoothed_bend = alpha * float(bend) + (1.0 - alpha) * self._smoothed_bend
         self._prev_smoothed_bend = prev_b
-        # 近期伸直高值（在 IDLE/伸直阶段维护，保证 MIN_BEND_DROP 对新手势初始化友好）
-        if self._max_recent_bend is None:
-            self._max_recent_bend = self._smoothed_bend
-        else:
-            if self._smoothed_bend > self._max_recent_bend:
-                self._max_recent_bend = self._smoothed_bend
-            else:
-                self._max_recent_bend = 0.985 * self._max_recent_bend + 0.015 * self._smoothed_bend
 
         # 初始化基线
         if self._baseline is None:
@@ -677,29 +852,71 @@ class FingerTapClickDetector:
         # 计算 参考阈值（基于 伸直基线）
         enter_t = self._baseline * self._p["ENTER_BEND_RATIO"]
         exit_t  = self._baseline * self._p["EXIT_BEND_RATIO"]
-        # 下降幅度 = 相对近期伸直高值的跌幅
-        drop = 0.0 if self._max_recent_bend is None else (self._max_recent_bend - self._smoothed_bend) / max(self._max_recent_bend, 1e-6)
 
-        # ⭐ 差分/绝对双判据的"按下判定"和"松开判定"封装
-        #   down_trigger = 进入弯曲（IDLE→ARMED）
+        # ⭐⭐ 2026-09-21 用户拍板：「起弯」只认【下弯变化量】，彻底废除绝对弯曲度入口。
+        #   down_trigger = 进入弯曲（IDLE/WAIT_DBL/RESCUE_DBL → ARMED），三处共用，一处修复全路径生效。
+        #   真机日志(tap_gate.log L58-60)实证旧逻辑故障：
+        #     长按中黑帧 → LONG_UP → 冷却后手指"根本没动、只是还弯着"(ratio=0.252, Σ下=0.000)，
+        #     旧 down_abs 兜底(B<enter_t 且 drop>MIN_BEND_DROP)把它当成【新一次起弯】；
+        #     手指真正回直时这段幻影手势补发 click，与长按自身的 mouseDown/Up 同点且间隔落在
+        #     OS 双击时间(500ms)内 → 长按回直后被系统执行成双击。
+        #   手势识别是【动态问题】（变化了多少、如何变化），不是弯下去多少的静态问题：
+        #     · 只有近窗内真的发生下弯变化量（ΣΔ负 ≥ 门限）且已离开伸直位，才允许起弯；
+        #     · "本来就弯着 / 黑帧恢复时仍弯着 / 长按回直途中还弯着" → 没有新变化量，一概不起弯；
+        #     · 双击第二击同理：必须先出现回直变化、之后再出现一段【新的下弯变化】才算第二击。
+        #   长按因此与双击天然互斥：LONG_UP 之后若没有新的下弯变化，不会产生任何可配对的点击。
+        #   （bend_ratio 上限只是"确实弯离伸直位"的确认门，单独不触发；松开另见下方【真回直双门】。）
         down_delta = (di_sum_down >= self._p["TAP_DOWN_DI_SUM"]) and (
             bend_ratio <= min(self._p["MIN_ABS_BEND_RATIO_FOR_DELTA"],
                               self._p["ENTER_BEND_RATIO"] + 0.06)
         )
-        down_abs   = (B < enter_t) and (drop > self._p["MIN_BEND_DROP"])
-        down_trigger = down_delta or down_abs
+        down_trigger = down_delta
 
-        #   up_trigger = 从弯曲回到伸直（BEND_HOLD→TAP / PRESSED→LONG_UP）
-        #   【优先级】：如果当前这段是「差分进入」(armed_by_delta=True)，先看差分松手；否则看绝对松手；
-        #   再用另一种判据兜底 OR，确保不会漏。
-        if self._armed_by_delta:
-            up_delta_first = di_sum_up >= self._p["TAP_UP_DI_SUM"]
-            up_abs_fallback = B >= exit_t
-            up_trigger = up_delta_first or up_abs_fallback
-        else:
-            up_abs_first = B >= exit_t
-            up_delta_fallback = di_sum_up >= self._p["TAP_UP_DI_SUM"]
-            up_trigger = up_abs_first or up_delta_fallback
+        #   up_trigger = 从弯曲回到伸直（BEND_HOLD→TAP / PRESSED→LONG_UP）：
+        #   ⭐⭐ 2026-09-21 长按/双击隔离：必须【真的回直】才承认松手。
+        #      段内谷底 _seg_min_ratio 在每个弯曲段有效帧更新；松开双门 AND：
+        #        ① 回直变化量：bend_ratio - 谷底 ≥ RECOVER_RISE_MIN（从最深弯处弹回得够多）
+        #        ② 伸直位确认：bend_ratio ≥ RECOVER_RATIO_MIN（当前已基本伸直）
+        #      按住中途手指微松（谷底0.25→0.55~0.70，手指仍明显弯着）两个门都不过 →
+        #      不会结束弯曲段、不会产生第一次 Tap、不进 WAIT_DBL → 长按中物理上发不出双击。
+        #      旧的 Σ上差分/enter_t/exit_t 低线只作"回弹发生过"的快速线索，不再能单独决定松手。
+        if self.state in (_S.BEND_ARMED, _S.BEND_HOLD, _S.PRESSED) \
+                and self._seg_min_ratio is not None:
+            if bend_ratio < self._seg_min_ratio:
+                self._seg_min_ratio = bend_ratio
+        _recover_rise = (bend_ratio - self._seg_min_ratio) if self._seg_min_ratio is not None else 0.0
+        # 三门 AND：①谷底回升量 ②EMA ratio 到伸直位 ③原始 raw 也真到伸直位（防回弹途中 EMA 先过线）
+        _raw_recover_ok = bend >= (self._baseline * RAW_RECOVER_FRAC)
+        _recover_ok = ((_recover_rise >= RECOVER_RISE_MIN)
+                       and (bend_ratio >= RECOVER_RATIO_MIN)
+                       and _raw_recover_ok)
+        _up_thr = self._p["TAP_UP_DI_SUM"]
+        # 快速回弹线索（窗内回直差分 或 越过旧回伸直线）AND 真回直双门
+        up_delta_release = (di_sum_up >= _up_thr) and (B >= enter_t)
+        up_abs_fallback   = B >= exit_t
+        up_trigger = (up_delta_release or up_abs_fallback) and _recover_ok
+        # ⭐⭐⭐ 丢手恢复期确认窗：窗内"松手"必须【连续 N 帧】当前位置都在伸直位
+        #   （raw 门 + ratio 门；任一帧重新弯下即清零）。专杀重新捕获过渡垃圾帧造成的假释放。
+        if self.state in (_S.BEND_ARMED, _S.BEND_HOLD, _S.PRESSED) \
+                and _t_lt(now, self._post_none_deadline):
+            _pos_straight = (bend_ratio >= RECOVER_RATIO_MIN) and _raw_recover_ok
+            if _pos_straight:
+                self._straight_confirm += 1
+            else:
+                self._straight_confirm = 0
+            if up_trigger and self._straight_confirm < POST_NONE_CONFIRM_FRAMES:
+                up_trigger = False
+                self._gate_log(f"##POST-NONE 伸直确认 {self._straight_confirm}/"
+                               f"{POST_NONE_CONFIRM_FRAMES}（黑帧恢复期，暂不释放）"
+                               f" raw={float(bend):.4f} ratio={bend_ratio:.3f}")
+        _cmp_sum = ">=" if di_sum_up >= _up_thr else "<"
+        _cmp_ent = ">=" if B >= enter_t else "<"
+        _up_why = (f"Δ(sum{di_sum_up:.3f}{_cmp_sum}thr{_up_thr:.3f} & "
+                   f"ratio{bend_ratio:.3f}{_cmp_ent}enter{self._p['ENTER_BEND_RATIO']:.3f})"
+                   f"={up_delta_release} absFB(ratio>=exit)={up_abs_fallback} "
+                   f"回直(rise{_recover_rise:.3f}/{RECOVER_RISE_MIN} & "
+                   f"ratio{bend_ratio:.3f}>={RECOVER_RATIO_MIN} & "
+                   f"raw{float(bend):.3f}>={self._baseline*RAW_RECOVER_FRAC:.3f})={_recover_ok}")
 
         # ================= 状态流转 =================
 
@@ -713,10 +930,10 @@ class FingerTapClickDetector:
                 self._double_candidate = False
                 self._dbg_arm_t = _CLOCK()
                 self._dbg_none_in_tap = 0
-                self._armed_by_delta = bool(down_delta and not down_abs)  # 纯差分进入 = True；兜底或同时 = False 归绝对
+                self._armed_by_delta = True   # 起弯只可能由下弯变化量触发（绝对入口已废除）
+                self._seg_min_ratio = bend_ratio  # 段内弯曲谷底从 ARM 当帧起记
                 self._arm_stats(self._armed_by_delta)
-                self._diag(f"① ARM 起弯 ratio={bend_ratio:.3f} Σ下={di_sum_down:.3f}/Σ上={di_sum_up:.3f} "
-                           f"入口={'差分' if self._armed_by_delta else '绝对'}")
+                self._diag(f"① ARM 起弯 ratio={bend_ratio:.3f} Σ下={di_sum_down:.3f}/Σ上={di_sum_up:.3f}")
             elif B > self._baseline * 0.97:
                 # 非常接近伸直 → 快速更新基线，避免基线长期滞后用户真实伸直姿态变化
                 self._baseline = BASELINE_ALPHA_FAST * B + (1 - BASELINE_ALPHA_FAST) * self._baseline
@@ -737,7 +954,8 @@ class FingerTapClickDetector:
                 self._total_sec = 0.0
                 self._stable_frames = 0
                 self._double_candidate = True
-                self._armed_by_delta = bool(down_delta and not down_abs)
+                self._armed_by_delta = True   # 第二击同样必须是新的下弯变化量
+                self._seg_min_ratio = bend_ratio  # 第二击段谷底从本帧起记
                 self._arm_stats(self._armed_by_delta)
                 self._dbg_arm_t = _CLOCK()   # 第二击段耗时从第二击起弯算（click#1 延迟已在补发前记完）
                 self._dbg_none_in_tap = 0
@@ -776,6 +994,7 @@ class FingerTapClickDetector:
                 self._diag(f"③ 单击补发({_fire_reason}) → "
                            f"cooldown后开补救窗口{RESCUE_DBL_WINDOW_SEC:.1f}s，窗内第二击将按位置门控判双击/单击")
                 self._enter_cooldown(next_state=_S.RESCUE_DBL)
+                self._gt_emit(bend, now)
                 return self.event_this_frame
 
         elif self.state == _S.RESCUE_DBL:
@@ -791,7 +1010,10 @@ class FingerTapClickDetector:
                 self._stable_frames = 0
                 self._rescue_candidate = True
                 self._double_candidate = False
-                self._armed_by_delta = bool(down_delta and not down_abs)
+                self._armed_by_delta = True   # 补救第二击同样必须是新的下弯变化量
+                self._seg_min_ratio = bend_ratio  # 补救第二击段谷底从本帧起记
+                self._gate_log(f"##RESCUE-CATCH 补救窗内捕获第二击下弯 ratio={bend_ratio:.3f} "
+                               f"补救窗剩余{max(0.0, self._rescue_deadline - _CLOCK()):.3f}s")
                 self._arm_stats(self._armed_by_delta)
                 self._dbg_arm_t = _CLOCK()   # 补救第二击段耗时从本击起弯算
                 self._dbg_none_in_tap = 0
@@ -804,7 +1026,14 @@ class FingerTapClickDetector:
 
         elif self.state == _S.BEND_ARMED:
             # ARMED 的下一帧：仍需满足"还没回到伸直"（不能刚一帧就直接弹回去=尖峰）
-            still_down = (di_sum_down >= max(0.0, self._p["TAP_DOWN_DI_SUM"] * 0.35)) or (B < enter_t + self._baseline * 0.03)
+            # ⭐⭐ 2026-09-21 深弯豁免：起弯帧已实打实弯到 DEEP_ARM_KEEP_RATIO 以下（噪声不可能
+            #   瞬时压出 >0.45 的 ratio 跌幅），第二帧即便立刻弹直也是【最短合法点击】，
+            #   进 HOLD 后由回直三门诊放/继续等；不能整条吞掉让后续抖动顶替成双击第二击。
+            _deep_arm = (self._seg_min_ratio is not None
+                         and self._seg_min_ratio <= DEEP_ARM_KEEP_RATIO)
+            still_down = _deep_arm or (
+                (di_sum_down >= max(0.0, self._p["TAP_DOWN_DI_SUM"] * 0.35))
+                or (B < enter_t + self._baseline * 0.03))
             if still_down:
                 # ARMED 中每个有效帧都累计（无稳定门）；旧第2帧 hold=2>=MIN_BEND_HOLD
                 self._hold_sec += dt
@@ -830,6 +1059,7 @@ class FingerTapClickDetector:
                 self._total_sec = 0.0
                 self._stable_frames = 0
                 self._armed_by_delta = False
+                self._seg_min_ratio = None
 
         elif self.state == _S.BEND_HOLD:
             # ✨ 总时长：从 ARM 开始累计（不管有没有稳定，都要算在 TAP_MAX_SEC 时间窗里）
@@ -837,6 +1067,9 @@ class FingerTapClickDetector:
 
             # ---------------- 修复1：先判断 EXIT（伸直回弹） → 优先于 LONG_PRESS ----------------
             if up_trigger:
+                # ⭐⭐ 临时取证
+                self._gt_release("HOLD", _up_why, bend, B, bend_ratio, enter_t, exit_t,
+                                 di_sum_up, di_sum_down, now)
                 # -------- 修复3：快速短按优先级。总时长 <= TAP_MAX_SEC 一律按 TAP，绝不能算长按 --------
                 # 判定本次是 Tap（快速短按 或 长按阈值前回弹）还是 真·长按释放
                 #   旧帧版：total<=18 或 hold<=22；墙钟阈值 (N-1)/30 与 22/30（hold 用严格<，f24=阈值不算 tap）
@@ -844,7 +1077,35 @@ class FingerTapClickDetector:
                           or _t_lt(self._hold_sec, self._p["LONG_PRESS_SEC"]))
                 _seg_ms = (now - self._dbg_arm_t) * 1000.0 if self._dbg_arm_t else 0.0
                 _none_n = self._dbg_none_in_tap
-                if OS_DOUBLE_CLICK and is_tap:
+                # ⭐⭐ 2026-09-21 浅弯门：整段谷底都没弯过 TAP_MIN_BEND_RATIO（半弯抖动/手指挥弹），
+                #   即使回弹三门诊全过也不发任何点击：首击→静默回 IDLE；无效第二击→回 WAIT_DBL
+                #   让窗口到期补单击（不能占掉第二击名额，否则后面的真点击会被错配/顶包）。
+                _shallow_tap = is_tap and (
+                    self._seg_min_ratio is None or self._seg_min_ratio > TAP_MIN_BEND_RATIO)
+                if _shallow_tap:
+                    self._st["shallow"] += 1
+                    self._gate_log(f"##SHALLOW-CANCEL 浅弯取消 谷底={self._seg_min_ratio:.3f}"
+                                   f">{TAP_MIN_BEND_RATIO} 不发点击 → "
+                                   f"{'回WAIT等真第二击' if self._double_candidate else ('回RESCUE' if self._rescue_candidate else 'IDLE')}")
+                    self._diag(f"⑤ 浅弯取消(谷底{self._seg_min_ratio:.3f}>{TAP_MIN_BEND_RATIO}) "
+                               f"不发点击 {'第二击→回WAIT等真第二击' if self._double_candidate else ('补救→回RESCUE' if self._rescue_candidate else '→IDLE')}")
+                    for _ in range(2):
+                        self._bend_ratio_hist.append(
+                            (now, self._smoothed_bend / max(self._baseline, 1e-6)))
+                    if self._double_candidate:
+                        self.state = _S.WAIT_DBL
+                    elif self._rescue_candidate:
+                        self.state = _S.RESCUE_DBL
+                    else:
+                        self.state = _S.IDLE
+                    self._double_candidate = False
+                    self._rescue_candidate = False
+                    self._hold_sec = 0.0
+                    self._total_sec = 0.0
+                    self._stable_frames = 0
+                    self._armed_by_delta = False
+                    self._seg_min_ratio = None
+                elif OS_DOUBLE_CLICK and is_tap:
                     # ★ 即时模式：每次勾按回弹立刻单击（双击交给 Windows 双击时间自然识别）
                     self._double_candidate = False
                     self._tap_pending = False
@@ -892,10 +1153,13 @@ class FingerTapClickDetector:
                     self._wait_trend_seen = False
                     self._wait_trend_frames = 0
                     self._wait_trend_deadline = now + TREND_WAIT_SEC
+                    self._gate_log(f"##ENTER WAIT 首击挂起：{TREND_WAIT_SEC:.2f}s趋势短窗 "
+                                   f"/ 完整窗{DOUBLE_TAP_WINDOW_SEC:.2f}s（挂起单击未发，等真第二击）")
                     self._hold_sec = 0.0
                     self._total_sec = 0.0
                     self._stable_frames = 0
                     self._armed_by_delta = False
+                    self._seg_min_ratio = None   # 本段已随第一次 Tap 结束（第二击 ARM 时重新记谷底）
                     # 同 _enter_cooldown 的差分清零手法：推两个"当前时刻"伸直值，让窗内 ΣΔ 立刻回 0
                     if self._baseline is not None and self._smoothed_bend is not None:
                         for _ in range(2):
@@ -911,6 +1175,7 @@ class FingerTapClickDetector:
                     self.event_this_frame = E.LONG_UP
                     self.last_long_time = _CLOCK()
                     self._enter_cooldown()
+                self._gt_emit(bend, now)
                 return self.event_this_frame
 
             # ---------------- 修复2：仍在弯曲中（exit_t 未到）→ 先计算"弯曲深度是否稳定" ----------------
@@ -931,6 +1196,8 @@ class FingerTapClickDetector:
             #   旧 hold_frames>=LONG_PRESS_FRAMES+1(23)；墙钟 hold_sec>=22/30（第24帧触发=t0.767s）
             if _t_ge(self._hold_sec, self._p["LONG_PRESS_SEC"]):
                 self.state = _S.PRESSED
+                self._gate_log(f"##LONG_DOWN ratio={bend_ratio:.3f} total={self._total_sec:.3f} "
+                               f"hold={self._hold_sec:.3f}")  # ⭐⭐ 临时取证
                 self.event_this_frame = E.LONG_DOWN
                 self.long_count += 1
                 self.last_long_time = _CLOCK()
@@ -947,6 +1214,9 @@ class FingerTapClickDetector:
 
         elif self.state == _S.PRESSED:
             if up_trigger:
+                # ⭐⭐ 临时取证
+                self._gt_release("PRESSED", _up_why, bend, B, bend_ratio, enter_t, exit_t,
+                                 di_sum_up, di_sum_down, now)
                 # 松开 → release
                 self.event_this_frame = E.LONG_UP
                 self.last_long_time = _CLOCK()
@@ -955,6 +1225,42 @@ class FingerTapClickDetector:
                 # 还按住 → 持续发 DRAG_MOVE
                 self.event_this_frame = E.DRAG_MOVE
 
+        # ⭐⭐ 临时取证：ARMED/HOLD/PRESSED 逐帧轨迹（只写文件，不参与判定；修复后删除）
+        if GATE_TRACE and self.state in (_S.BEND_ARMED, _S.BEND_HOLD, _S.PRESSED):
+            if self._gt_last_state != self.state:
+                if self.state == _S.BEND_ARMED:
+                    self._gt_seg_enter_t = now   # 新弯段起点（JUMP 行报段持续时长）
+                self._gate_log(
+                    f">>ENTER {self._GT_SN.get(self.state)} ratio={bend_ratio:.3f} "
+                    f"sumDn={di_sum_down:.3f} sumUp={di_sum_up:.3f} dEntry={int(self._armed_by_delta)}")
+            # ⭐ 跳变取证：与上一【有效帧】原始 raw 对比（黑帧后首帧 Δ 通常巨大 → 标注 postNone）
+            _d_raw = None if self._gt_prev_raw is None else float(bend) - self._gt_prev_raw
+            _post = _t_lt(now, self._post_none_deadline)
+            self._gate_log(
+                f"  f {self._GT_SN.get(self.state)} dt={dt:.3f} raw={float(bend):.4f} "
+                f"Δraw={'  n/a' if _d_raw is None else f'{_d_raw:+.3f}'} "
+                f"B={B:.4f} ratio={bend_ratio:.3f} sumUp={di_sum_up:.3f} sumDn={di_sum_down:.3f} "
+                f"hold={self._hold_sec:.3f} total={self._total_sec:.3f} st={self._stable_frames} "
+                f"postNone={int(_post)} ev={self._GT_EN.get(self.event_this_frame)}")
+            if _d_raw is not None and abs(_d_raw) >= JUMP_TRACE_DELTA:
+                _seg_dur = (now - self._gt_seg_enter_t) if self._gt_seg_enter_t is not None else 0.0
+                _since_none = (now - (self._post_none_deadline - POST_NONE_CONFIRM_WINDOW)
+                               if _post else -1.0)
+                self._gate_log(
+                    f"!!JUMP 状态={self._GT_SN.get(self.state)} raw {self._gt_prev_raw:.4f}→"
+                    f"{float(bend):.4f} Δraw={_d_raw:+.3f} 方向={'伸直跳' if _d_raw > 0 else '下弯跳'} "
+                    f"段持续={_seg_dur:.3f}s hold={self._hold_sec:.3f} total={self._total_sec:.3f} "
+                    f"谷底={self._seg_min_ratio if self._seg_min_ratio is None else round(self._seg_min_ratio,3)} "
+                    f"postNone={int(_post)} 距黑帧恢复={_since_none:.3f}s ratio={bend_ratio:.3f}")
+                self._gt_jump_pending = True
+            self._gt_prev_raw = float(bend)
+            self._gt_last_state = self.state
+        else:
+            self._gt_last_state = None
+            if GATE_TRACE and bend is not None:
+                self._gt_prev_raw = float(bend)
+
+        self._gt_emit(bend, now)
         return self.event_this_frame
 
     # ---------------------- 内部 ----------------------
@@ -978,6 +1284,7 @@ class FingerTapClickDetector:
         self._total_sec = 0.0
         self._stable_frames = 0
         self._armed_by_delta = False
+        self._seg_min_ratio = None
         self._tap_pending = False
         self._double_candidate = False
         self._rescue_candidate = False
@@ -1061,7 +1368,7 @@ class TwoFingerRightClickDetector:
         self._di_down = 0.0
         self._di_up = 0.0
         self._prev_r: float | None = None     # 合成 r 上一帧（同左键 _prev_smoothed_bend，稳定性判定）
-        self._max_recent_r: float | None = None  # 合成 r 近期伸直高值（同左键 _max_recent_bend，drop 用）
+        self._max_recent_r: float | None = None  # 合成 r 近期伸直高值（右键绝对兜底 down_abs 的 drop 用；左键已无此机制）
         # ⭐ 墙钟化（2026-09-18）
         self._hold_sec = 0.0                  # ARM 起有效保持时长（同左键口径）
         self._total_sec = 0.0                 # ARM 起有效总时长（TAP_MAX_SEC 判定）
@@ -1336,7 +1643,7 @@ class TwoFingerRightClickDetector:
         B = self._smooth(two_finger_bend)
         r = B / max(self._base, 1e-6)        # 合成序列：双指单元一起弯 r 才降（并拢保证同步）
 
-        # ---- 合成序列的 prev / 近期伸直高值（同左键 _prev_smoothed_bend / _max_recent_bend）----
+        # ---- 合成序列的 prev / 近期伸直高值（右键自己的绝对兜底用；左键无近期伸直高值机制）----
         prev_r = self._prev_r
         if self._max_recent_r is None:
             self._max_recent_r = r
@@ -1360,10 +1667,11 @@ class TwoFingerRightClickDetector:
         down_trigger = down_delta or down_abs
 
         # 松开：进入方式决定优先级；差分（回弹变化量）与绝对回线互为兜底 OR —— 完全照搬左键
+        # ⭐ 2026-09-19 差分松开加对称位置门 r>=enter（手指仍深弯时 Σ上 不允许判松开，同左键注释）
         if self._armed_by_delta:
-            up_trigger = (di_up >= self._p["TAP_UP_DI_SUM"]) or (r >= exit_r)
+            up_trigger = ((di_up >= self._p["TAP_UP_DI_SUM"]) and (r >= enter)) or (r >= exit_r)
         else:
-            up_trigger = (r >= exit_r) or (di_up >= self._p["TAP_UP_DI_SUM"])
+            up_trigger = (r >= exit_r) or ((di_up >= self._p["TAP_UP_DI_SUM"]) and (r >= enter))
 
         # ---- 心跳：每 30 个有效帧一行（含四排指距+同步超张量，仅观察；判定只调 root 阈值）----
         self._diag_n += 1

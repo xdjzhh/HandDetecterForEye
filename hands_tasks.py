@@ -355,8 +355,14 @@ def init_models(args):
       {args, detector, mouse, tap_detector, stretch, mode_label, mode_color}
     """
     detector_kwargs = dict(max_hands=args.max_hands,
-                           detection_confidence=0.65,   # 从 0.7 下调：更容易检出边缘角度的手（配合 EMA 去抖不抖）
-                           tracking_confidence=0.55)   # 从 0.6 下调：降低 tracking 门限，跟手更稳
+                           # ⭐ 2026-09-21 黑帧根因治理：video 模式下 tracking 置信度低于门限时 MediaPipe
+                           #   会【退回全帧掌检测器】。食指深折自遮挡掌心时 tracking 置信度在 0.5 附近抖动，
+                           #   旧门限 0.55 → 频繁退回重检；掌检测器对非张开手掌命中率低 → 连串整手丢失
+                           #   （实测长按 9.5s 内 70% 黑帧、最长连续 9.75s），重检成功的头几帧还吐过渡
+                           #   垃圾关键点。下调 tracking 到 0.40 让时序跟踪器持续锁定（跟踪模式用上一帧
+                           #   ROI，对指关节自遮挡天然鲁棒）；detection 0.55 仅在真丢手重检时使用。
+                           detection_confidence=0.55,
+                           tracking_confidence=0.40)
     if args.use_tasks:
         if args.model:
             model_path = args.model
@@ -1398,9 +1404,16 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         mouse.move_only(cursor_anchor_norm, gesture_hint=move_gesture_hint)
                     # 门控只拦"点击/拖拽语义"（调 handle 走点击分支）——但该帧鼠标已经 move_only 移动过了，不会再卡
                     # ⭐ 移窗锁定帧额外跳过 handle：OPEN 稳定分支内部也会 moveTo，否则与窗口中心锁打架闪动
+                    # ⭐⭐⭐ 2026-09-21 铁证修复（长按开出三个窗口）：旧手势路径 handle() 的
+                    #   OPEN/POINT/OTHER 分支【每帧】见 _drag_active 就 mouseUp。食指勾按长按期间
+                    #   手势必落 POINT/OTHER → 它先抬键，本帧稍后 handle_finger_tap_event(DRAG_MOVE)
+                    #   发现 drag=0 又补 mouseDown → 同一图标上每帧 up/down 一次，密集 up/down 被 OS
+                    #   判成多次双击连开多窗。tap 拖拽期间(PRESSED)鼠标键所有权归食指 tap 状态机，
+                    #   旧路径整体跳过（move_only 已负责移动；FIST 取消也让位于 tap 自己的回直释放）。
                     if ((not _cursor_locked_by_window_move)
                             and (not block_mouse_move_for_stretch)
                             and (not is_pure_two_hand_mode)
+                            and (tap_detector.state != _TS.PRESSED)
                             and stretch.state != _DS.SCALING):
                         fingertip_norm = (lms[8].x, lms[8].y)
                         mouse.handle(safe_gesture, fingertip_norm, cursor_anchor_norm=cursor_anchor_norm)
@@ -1420,6 +1433,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             two_finger_gap_parts: tuple | None = None  # (MCP,PIP,DIP,TIP) 四排指距比值，仅诊断日志用
             right_screen_pt = None
             if "Left" in hand_results:
+                run_loop._gt_miss_active = False   # 黑帧取证：目标手在 → 清除"未检出"标志
                 _, _, _, lms = hand_results["Left"]
                 tip = np.array([lms[8].x, lms[8].y])
                 m5  = np.array([lms[5].x, lms[5].y])
@@ -1437,7 +1451,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 #   算法：
                 #     1) EMA 平滑单帧 palm_n（抗瞬时尖峰）
                 #     2) 最近 8 帧 palm_n 进 deque 滑窗，算 mean_palm（近期手掌大小基准）
-                #     3) 不稳定判定（满足任一条 → 这帧 index_bend 视为噪声，传 None 给 tap_detector → 状态机不更新）：
+                #     3) 不稳定判定（满足任一条 → palm_stable=False；⭐2026-09-21 起【不再】把 index_bend
+                #        置 None：bend 95% 来自关节夹角、5% 距离项分母也是 EMA 掌宽，单帧掌宽抖动不影响 bend。
+                #        palm_stable 仅用于抑制双指右键的 3D 原始掌宽判据 + 日志显示）：
                 #        · 当前 palm_n_raw  vs  EMA(palm_n)   偏差 > 15%
                 #        · 当前 palm_n_raw  vs  8 帧均值       偏差 > 20%
                 #        · 8 帧滑窗标准差 / 滑窗均值 > 16%       （近期手掌大小一直在变化）
@@ -1448,6 +1464,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     _palm_que = deque(maxlen=8)
                     run_loop._tap_palm_n_queue = _palm_que
                 if palm_n_raw > 1e-6:
+                    run_loop._gt_palm_miss_active = False   # 取证：掌宽正常 → 清除截断标志
                     _palm_que.append(palm_n_raw)
                     if _palm_ema is None:
                         _palm_ema = palm_n_raw
@@ -1470,9 +1487,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         if q_std / max(q_mean, 1e-6) > 0.16:
                             palm_stable = False
 
-                    # ⭐ 掌心归一化基准稳定 → 才算 index_bend（否则传 None → tap_detector 本帧完全不学习不流转）
-                    if palm_stable:
-                        # 额外修正：分母 palm_n 用 EMA 平滑后的，而不是 raw 单帧，进一步降低单帧抖动
+                    # ⭐⭐ 2026-09-21 废除掌心不稳黑帧：只要关键点齐全(palm_n_raw>1e-6)就照常算 bend。
+                    #   依据：bend = 95% 关节夹角(与掌宽无关) + 5% 距离项(分母 denom 用 EMA 掌宽)，
+                    #   当前帧掌宽瞬时抖动(遮挡/顶部clip/透视)根本不进入 bend 数值。
+                    #   旧逻辑把这些帧置 None → tap 检测器在长按中断连、恢复帧伪造下弯 → 凭空双击。
+                    #   palm_stable 仍计算，但只用于：①双指右键(3D world 原始掌宽归一)抑制 ②诊断日志。
+                    bend_allowed = True
+                    if bend_allowed:
+                        # 分母 palm_n 用 EMA 平滑后的，而不是 raw 单帧，进一步降低单帧抖动
                         denom = float(_palm_ema)
                         if denom > 1e-6:
                             # ------------------------------------------------------------------
@@ -1562,6 +1584,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                 two_finger_together = None
                                 two_finger_gap = None
                                 two_finger_gap_parts = None
+                            if not palm_stable:
+                                # ⭐ 食指 bend 已放开（关节角主导）；但双指并拢判据的四排指距用 3D world
+                                #   【原始掌宽】归一，掌宽不稳帧不可信 → 沿用旧策略不给右键检测器喂数据，
+                                #   避免掌心翻转时假并拢误触发右键。
+                                two_finger_bend = None
+                                two_finger_together = None
+                                two_finger_gap = None
+                                two_finger_gap_parts = None
                     # ⭐ 统一后仍保留缓存供日志只读（IN_TB列显示位置，PIPΔ°列显示DIP/PIP角度变化量，不参与判断逻辑）
                     try:
                         _anx, _any = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
@@ -1620,6 +1650,18 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     two_finger_together = None
                     two_finger_gap = None
                     two_finger_gap_parts = None
+                    try:
+                        import time as _gt_t2
+                        _gn = _gt_t2.monotonic()
+                        if (not getattr(run_loop, "_gt_palm_miss_active", False)) \
+                                or _gn - getattr(run_loop, "_gt_palm_miss_last_t", -1e9) >= 0.5:
+                            run_loop._gt_palm_miss_last_t = _gn
+                            FingerTapClickDetector._gate_log(
+                                f"##MISS-PALM 关键点在手但掌宽≈0 palm_n_raw={palm_n_raw:.5f}"
+                                f"（截断/过远） tapState={tap_detector._GT_SN.get(tap_detector.state)}")
+                        run_loop._gt_palm_miss_active = True
+                    except Exception:
+                        pass
 
                 # ⭐ 2026-08-22 核心修复：Tap-Click 段直接复用 move_only() 同帧计算出来的"缓存平滑后坐标"
                 #   之前的问题：
@@ -1631,6 +1673,25 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 # 走 _eval_anchor_once：如果 move_only() 已经在本帧跑过同 anchor_norm → 缓存命中，smoother 不再二次更新
                 _, _, sx, sy, _, _ = mouse._eval_anchor_once(anchor_norm, gesture_hint=None)
                 right_screen_pt = (float(sx), float(sy))
+            else:
+                # ⭐ 取证（纯观测）：目标手(MP label "Left"=用户右手)整手未检出。
+                #   区分两种黑帧根因：①另一只手("Right")占名额/标签翻转 ②MediaPipe 整手 0 检出。
+                #   上升沿 + 每 0.5s 落一行，避免刷屏。
+                try:
+                    import time as _gt_t
+                    _gt_now = _gt_t.monotonic()
+                    _gt_last = getattr(run_loop, "_gt_miss_last_t", -1e9)
+                    _gt_was = getattr(run_loop, "_gt_miss_active", False)
+                    run_loop._gt_miss_active = True
+                    if (not _gt_was) or (_gt_now - _gt_last) >= 0.5:
+                        run_loop._gt_miss_last_t = _gt_now
+                        _oth = [f"{_lb}/{_gd[0]}"
+                                for _lb, _gd in hand_results.items()]
+                        FingerTapClickDetector._gate_log(
+                            f"##MISS-HAND 整手未检出 帧检出={_oth if _oth else '无任何手'} "
+                            f"hands={len(hands_data)} tapState={tap_detector._GT_SN.get(tap_detector.state)}")
+                except Exception:
+                    pass
 
             # 快路径双击(DOUBLE_TAP)挂起的首击落点（2026-09-19 位置门控，见下方 WAIT_DBL 捕获）
             _pending_first_xy = None
@@ -1652,6 +1713,26 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     tap_event = 0
                 else:
                     tap_event = tap_detector.update(index_bend)
+                    # ⭐⭐ 取证（纯观测，不参与判定）：本帧 raw 大跳变 → 把三个关节角+掌宽落同一日志，
+                    #   回答"raw 是怎么测出来的、跳变来自角度跳变还是归一化/掌宽"
+                    if getattr(tap_detector, "_gt_jump_pending", False):
+                        try:
+                            _jp0 = np.array([lms[0].x, lms[0].y])
+                            _jp5 = np.array([lms[5].x, lms[5].y])
+                            _jp6 = np.array([lms[6].x, lms[6].y])
+                            _jp7 = np.array([lms[7].x, lms[7].y])
+                            _jp8 = np.array([lms[8].x, lms[8].y])
+                            _ang_mcp = _three_point_angle(_jp0, _jp5, _jp6)
+                            _ang_pip = _three_point_angle(_jp5, _jp6, _jp7)
+                            _ang_dip = _three_point_angle(_jp6, _jp7, _jp8)
+                            FingerTapClickDetector._gate_log(
+                                f"!!JUMP-ANG ∠MCP(腕-5-6)={_ang_mcp:6.1f}° ∠PIP(5-6-7)={_ang_pip:6.1f}° "
+                                f"∠DIP(6-7-8)={_ang_dip:6.1f}° (180=伸直,0=对折) | "
+                                f"palm_raw={palm_n_raw:.4f} palm_ema={_palm_ema:.4f} "
+                                f"stable={int(palm_stable)} raw_bend={index_bend:.4f}")
+                        except Exception:
+                            pass
+                        tap_detector._gt_jump_pending = False
                     # ⭐ 2026-09-19：首击回弹进 WAIT_DBL 当帧记录落点（掌心位置=被点目标），
                     #   供 DOUBLE_TAP 事件按 10px 门控判"同目标双击 / 不同目标两次独立单击"
                     _pending_first_xy = getattr(run_loop, "_first_tap_xy", None)
