@@ -93,6 +93,22 @@ def _three_point_angle(p_a: np.ndarray, p_v: np.ndarray, p_b: np.ndarray) -> flo
     return float(_mt.degrees(_mt.acos(cos_v)))
 
 
+# ⭐ 2026-09-22 握拳卷曲排他门（修复"握拳被误判单指长按"）：握拳时食指全折，95% 关节角
+#   bend 与勾按落在同一深弯区间，差分/绝对门无法区分；唯一稳定几何差——勾按只弯 DIP、
+#   食指整体保持前伸（见 _index_bend_from_joint_angles 设计原则），TIP_8 离 MCP_5 远；
+#   握拳 PIP/MCP/DIP 全折、指尖卷回掌心，TIP_8 贴近 MCP_5。
+#   判据 index_curl = dist(TIP_8,MCP_5)/dist(MCP_5,MCP_17)，3D world 优先（正面握拳沿光轴
+#   折叠时 2D 投影不缩短）、2D(EMA 掌宽)兜底。
+#   阈值依据（成人食指解剖比例 近节4.5/中节2.7/远节2.0cm，掌宽~8cm，比值消单位）枚举：
+#     勾按/长按(MCP≤40,PIP≤40,DIP≤80°) = 0.82~1.15；握拳(60~90/110~170/120~180°) = 0.26~0.54。
+#   ⚠ 首版误用 5.4cm 短指模型得阈值 0.38，真机握拳值在其上下抖动→门每~5帧横跳一次→卡顿。
+#   双阈值迟滞：<0.62 连续3帧激活；>0.78 连续5帧解除；0.62~0.78 带内计数冻结（不横跳）。
+FIST_CURL_ENTER_RATIO = 0.62   # 低于此值开始累计"卷回"
+FIST_CURL_EXIT_RATIO = 0.78    # 高于此值开始累计"离开"（与激活线间隔 0.16 抗遮挡抖动）
+FIST_CURL_ENTER_FRAMES = 3     # 连续 3 帧卷回才确认（~0.1~0.15s 去抖，握拢过程不误拦）
+FIST_CURL_EXIT_FRAMES = 5      # 连续 5 帧离开才解除
+
+
 def _index_bend_from_joint_angles(lms, palm_denom: float | None,
                                   dist_bend_fallback: float | None = None,
                                   joint_ids=(5, 6, 7, 8)) -> float:
@@ -1429,6 +1445,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
             # ---------- 食指 Tap-Click（仅右手） ----------
             index_bend: float | None = None
+            _fist_forced_ev = 0   # 握拳门在 PRESSED 态强制抬键时，本帧直接输出的事件（E.LONG_UP）
             two_finger_bend: float | None = None  # 双指右键：双指单元合成伸直度（四关节中点，0.20弯~0.88直）
             two_finger_together: bool | None = None  # 双指右键：食/中四排关节是否都并拢（None=本帧不可判定）
             two_finger_gap: float | None = None      # 双指右键：四排关节距 max（诊断/判定共用）
@@ -1511,6 +1528,46 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             dist_bend_old = tip_m5 / denom
                             index_bend = _index_bend_from_joint_angles(
                                 lms, palm_denom=denom, dist_bend_fallback=dist_bend_old)
+                            # ---- ⭐ 2026-09-22 握拳卷曲排他门（常量说明见文件头 FIST_CURL_*）----
+                            # 3D world 优先；取不到 world 时用 2D tip_m5/EMA掌宽 兜底
+                            _wl = next((h.get("world_landmarks") for h in hands_data
+                                        if h.get("label") == "Left"), None)
+                            if _wl is not None and len(_wl) >= 18:
+                                _wc8  = np.array([float(_wl[8].x),  float(_wl[8].y),  float(_wl[8].z)])
+                                _wc5  = np.array([float(_wl[5].x),  float(_wl[5].y),  float(_wl[5].z)])
+                                _wc17 = np.array([float(_wl[17].x), float(_wl[17].y), float(_wl[17].z)])
+                                _wpw = float(np.linalg.norm(_wc5 - _wc17))
+                                index_curl = float(np.linalg.norm(_wc8 - _wc5)) / max(_wpw, 1e-6)
+                            else:
+                                index_curl = dist_bend_old
+                            _curl_in_n  = int(getattr(run_loop, "_fist_curl_in_n", 0))
+                            _curl_out_n = int(getattr(run_loop, "_fist_curl_out_n", 0))
+                            _fist_curl_active = bool(getattr(run_loop, "_fist_curl_active", False))
+                            if index_curl < FIST_CURL_ENTER_RATIO:
+                                _curl_in_n += 1
+                                _curl_out_n = 0
+                            elif index_curl > FIST_CURL_EXIT_RATIO:
+                                _curl_out_n += 1
+                                _curl_in_n = 0
+                            # 迟滞带 [ENTER_RATIO, EXIT_RATIO] 内：两个计数都冻结，
+                            # 深弯遮挡导致的指尖抖动不会把门抖开/抖关
+                            if not _fist_curl_active and _curl_in_n >= FIST_CURL_ENTER_FRAMES:
+                                _fist_curl_active = True
+                                # 静默取消 ARM/HOLD 挂起段：握拳张开回直时不补发单击
+                                tap_detector.cancel_in_progress()
+                                # 慢握拳可能已先进入 PRESSED（LONG_DOWN 已发）：None 对 PRESSED 是
+                                # 冻结语义会把键卡住，这里明确作废长按 → 本帧立即 LONG_UP 抬键
+                                _fist_forced_ev = tap_detector.force_long_up()
+                                print(f"[FIST-GUARD] 握拳卷曲拦截 index_curl={index_curl:.3f}"
+                                      f"（<{FIST_CURL_ENTER_RATIO:.2f}）：挂起段取消"
+                                      f"{'，长按强制抬起' if _fist_forced_ev else ''}", flush=True)
+                            elif _fist_curl_active and _curl_out_n >= FIST_CURL_EXIT_FRAMES:
+                                _fist_curl_active = False
+                            run_loop._fist_curl_in_n = _curl_in_n
+                            run_loop._fist_curl_out_n = _curl_out_n
+                            run_loop._fist_curl_active = _fist_curl_active
+                            if _fist_curl_active:
+                                index_bend = None
                             # ----------------------------------------------------------
                             # ⭐ 2026-09-17 食中双指并拢右键 v2：不再分别算食指/中指 bend
                             #   用户要求：前置条件已是并拢 → 食中两指对应关节(PIP/PIP, DIP/DIP, TIP/TIP)
@@ -1623,7 +1680,11 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 right_tap_event = right_tap_detector.update(two_finger_bend,
                                                             two_finger_together, two_finger_gap,
                                                             two_finger_gap_parts)
-                if right_tap_detector.freeze_left:
+                if _fist_forced_ev:
+                    # 握拳门强制抬键优先级最高：物理键必须抬起，不能被双指 freeze_left 吞掉
+                    tap_event = _fist_forced_ev
+                    tap_detector.update(index_bend)
+                elif right_tap_detector.freeze_left:
                     # 双指手势占用期 + 右键触发后的冷却尾帧都冻结左指：
                     #   触发帧起双指回弹的 bend 值若漏喂左指，会被它当成独立食指勾按（虚构 Tap → 误双击）
                     if right_tap_detector.armed_this_frame:

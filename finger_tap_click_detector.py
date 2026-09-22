@@ -219,7 +219,8 @@ TWO_FINGER_GAP_BREAK_FRAMES = 2
 #   · [2F-DIAG-HB] 每 30 有效帧一行心跳：gap 并拢度/together/ri/rm/r/阈值/状态
 #   · [2F-DIAG]    关键事件：起弯被拦原因、ARMED 确认/拒绝、HOLD 释放/作废、长按静默、丢帧宽限、触发
 #   识别手感调好后可改 False（与 TAP_DIAG 同样的临时排查用途）。
-TWO_FINGER_DIAG = True
+# 2026-09-21：手感已确认，默认关闭（心跳每30帧刷屏）；排查右键问题时临时改 True。
+TWO_FINGER_DIAG = False
 
 # ⭐ 2026-08-22 差分点击新增常量
 # 差分窗口【墙钟化】：hist 存 (t, bend_ratio)，取最近 DI_WINDOW_SEC 秒（旧"5帧"=5个帧间隔=167ms，
@@ -517,6 +518,23 @@ class FingerTapClickDetector:
             self._di_sum_pos_now = 0.0
             # 差分队列清掉这段弯曲残留，避免手势结束恢复喂帧时被旧尾巴误触发
             self._bend_ratio_hist.clear()
+
+    def force_long_up(self) -> int:
+        """外部仲裁【明确作废当前长按】时调用（2026-09-22 握拳卷曲门：看见食指尖卷回掌心，
+        物理上不可能仍在按住）。与 bend=None 的丢手语义不同——None=没看见手→冻结等待；
+        本方法=看见手且判定姿态已变→立即抬键，避免慢握拳先触发 LONG_DOWN 后卡键 10s。
+        Returns: E.LONG_UP（调用方把它作为本帧事件）；非 PRESSED 态返回 E.NONE（无动作）。
+        """
+        if self.state != _S.PRESSED:
+            return E.NONE
+        self.event_this_frame = E.LONG_UP
+        self._bend_ratio_hist.clear()
+        self._di_sum_neg_now = 0.0
+        self._di_sum_pos_now = 0.0
+        self._none_run_start = None
+        self._st["long"] += 1
+        self._enter_cooldown()
+        return E.LONG_UP
 
     # 便捷属性（返回用户友好的 hardness/speed 百分比，供 UI 展示）
     @property
