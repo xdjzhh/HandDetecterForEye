@@ -34,7 +34,8 @@ from mouse_controller import MouseController
 from draw_cn_text import put_text_cn
 from finger_tap_click_detector import (FingerTapClickDetector, TwoFingerRightClickDetector,
                                        _S as _TS, E as _TEV, TWO_FINGER_TIP_ENTRY_R)
-from diagonal_stretch import DiagonalStretchManager, _S as _DS, _MODE as _DM, _MS as _DMS
+from diagonal_stretch import (DiagonalStretchManager, _S as _DS, _MODE as _DM,
+                           _MS as _DMS, MOVE_CONFIRM_SEC)
 
 # ---------------- 常量（原 main.py 顶部，原样搬） ----------------
 HAND_COLORS = {"Left": (255, 100, 0), "Right": (0, 140, 255)}
@@ -93,6 +94,174 @@ def _three_point_angle(p_a: np.ndarray, p_v: np.ndarray, p_b: np.ndarray) -> flo
     return float(_mt.degrees(_mt.acos(cos_v)))
 
 
+# ======================================================================
+# ⭐ 同视角：左右手身份时序稳定器（2026-09-30 新增稳定性兜底）
+# ======================================================================
+# 为什么需要：
+#   面对面视角手掌基本正对镜头，MediaPipe 的 Left/Right 分类稳定；同视角（头戴）
+#   常见手背入镜，捏合/勾按时手掌还会绕视线轴旋转，此时 MP handedness 会在
+#   Left/Right 之间【逐帧横跳】。而下游 landmarks-EMA、手势多数投票、双手全局门控、
+#   双手拉伸全部以 label 为字典 key —— 一次横跳就等于"双手身份互换"：
+#   平滑缓存串手、控鼠手瞬间切到另一只手、双手拉伸左右锚点对调。
+# 策略（位置锁定为主、标签滞回为辅）：
+#   1) 检测手与在册轨迹按掌心归一化距离做【全局最优一一匹配】（最多 2 手，枚举配法，
+#      避免两只手最近邻贪心被同时带偏）；
+#   2) 匹配上的手沿用轨迹锁定身份，本帧 MP 标签给反了直接忽略；
+#   3) MP 连续 SWITCH_FRAMES 帧给相反标签才承认真换手（人转身/双手真实换位），
+#      单帧/数帧横跳被滞回门挡住；
+#   4) 双手位置重叠难分（两配法距离接近）时，给"标签一致"的配法小幅奖励 → 退回尊重 MP；
+#   5) 未匹配检测=新轨迹（用 MP 标签初始化；与在册身份撞车时取另一标签，保证不重名）；
+#      未匹配轨迹保留 MAX_MISS 帧可被找回，超期注销。
+# 🔴 单一入口原则：只允许在 run_loop 的检测出口（标签交换之后、EMA/跳帧缓存之前）
+#    调用一次，下游所有模块只消费稳定后的 label，禁止在别处自行翻转/猜身份。
+class HandIdentityStabilizer:
+    MATCH_TOL = 0.15        # 掌心归一化距离容差（短边720≈108px；30fps 正常移动邻帧位移远小于此）
+    LABEL_BONUS = 0.05      # 配法代价中"MP标签与轨迹一致"的奖励；双手重叠难分时让位给 MP
+    SWITCH_FRAMES = 8       # MP 连续 N 个【样本】给反标签才允许翻转身份（样本数条件）
+    SWITCH_SEC = 0.27       # 且连续墙钟时长达到 0.27s（≈原 8 帧 @30fps；帧率变化时物理手感不变）
+    MAX_MISS = 8            # 轨迹丢失保留【样本】数（与 landmarks-EMA 的 miss 清理阈值一致）
+    MAX_MISS_SEC = 0.27     # 轨迹丢失保留【墙钟时长】（双条件同时满足才注销）
+
+    def __init__(self):
+        # 每条轨迹：label=锁定身份；x,y=最近掌心（归一化）；
+        #          miss_n/miss_sec=连续丢失样本数/墙钟秒数（双条件到期才注销）
+        #          disagree_n/disagree_sec=匹配在手但 MP 连续给反标签的样本数/墙钟秒数
+        self._tracks: list[dict] = []
+
+    def reset(self):
+        self._tracks = []
+
+    @staticmethod
+    def _palm_of(hand: dict) -> tuple[float, float]:
+        # ⭐ 2026-10-01 跟踪点与光标锚点 mcp 保持同一真相：四指根 MCP(5,9,13,17) 质心。
+        #   旧 (腕0+中指根9)/2 在同视角手腕出画面时 #0 是模型猜的 → 身份轨迹跟着漂。
+        lms = hand["landmarks"]
+        return (0.25 * (float(lms[5].x) + float(lms[9].x)
+                          + float(lms[13].x) + float(lms[17].x)),
+                0.25 * (float(lms[5].y) + float(lms[9].y)
+                          + float(lms[13].y) + float(lms[17].y)))
+
+    def apply(self, hands_data: list[dict], dt: float = 0.0) -> None:
+        """就地把 hands_data 中每只手的 label 改写为时序稳定后的身份。
+
+        Args:
+            dt: 距上一帧墙钟秒数（防误触用，与样本计数组成双条件）
+        """
+        # ---- 无手：全部轨迹累计丢失（样本+墙钟双条件到期注销） ----
+        if not hands_data:
+            for tr in self._tracks:
+                tr["miss_n"] += 1
+                tr["miss_sec"] += float(dt)
+            self._tracks = [t for t in self._tracks
+                            if t["miss_n"] <= self.MAX_MISS and t["miss_sec"] < self.MAX_MISS_SEC]
+            return
+
+        dets = [{"hand": h, "mp": h.get("label"),
+                 "x": self._palm_of(h)[0], "y": self._palm_of(h)[1],
+                 "matched": False} for h in hands_data]
+        n_det, n_trk = len(dets), len(self._tracks)
+
+        # ---- 枚举所有"检测↔轨迹"配对方式（d≤2, t≤2，手写穷举；允许不配=新轨迹）----
+        candidates = [[]]
+        if n_det >= 1:
+            for ti in range(n_trk):
+                candidates.append([(0, ti)])
+        if n_det >= 2:
+            for di in (0, 1):
+                for ti in range(n_trk):
+                    candidates.append([(di, ti)])
+            if n_trk >= 2:
+                candidates.append([(0, 0), (1, 1)])
+                candidates.append([(0, 1), (1, 0)])
+
+        # 选法：① 匹配对数最多优先；② 同对数下总代价最小
+        #   代价 = Σ(掌心距离 − 标签一致奖励)，任一对距离超 MATCH_TOL 的配法作废
+        best_key, best_pairs = None, []
+        for pairs in candidates:
+            used_di, used_ti = set(), set()
+            cost, valid = 0.0, True
+            for di, ti in pairs:
+                if di in used_di or ti in used_ti:
+                    valid = False
+                    break
+                used_di.add(di)
+                used_ti.add(ti)
+                tr = self._tracks[ti]
+                dist = _mt.hypot(dets[di]["x"] - tr["x"], dets[di]["y"] - tr["y"])
+                if dist > self.MATCH_TOL:
+                    valid = False
+                    break
+                if dets[di]["mp"] == tr["label"]:
+                    dist -= self.LABEL_BONUS
+                cost += dist
+            if not valid:
+                continue
+            key = (-len(pairs), cost)
+            if best_key is None or key < best_key:
+                best_key, best_pairs = key, pairs
+
+        # ---- 应用匹配结果：锁定身份 + 标签滞回 ----
+        matched_ti: set[int] = set()
+        used_labels: set[str] = set()
+        for di, ti in best_pairs:
+            d, tr = dets[di], self._tracks[ti]
+            d["matched"] = True
+            matched_ti.add(ti)
+            tr["x"], tr["y"], tr["miss_n"], tr["miss_sec"] = d["x"], d["y"], 0, 0.0
+            if d["mp"] == tr["label"]:
+                tr["disagree_n"] = 0
+                tr["disagree_sec"] = 0.0
+            else:
+                tr["disagree_n"] += 1
+                tr["disagree_sec"] += float(dt)
+                # ✨ 双条件：样本数 + 墙钟时长都达标，才承认双手真实换位
+                if tr["disagree_n"] >= self.SWITCH_FRAMES and tr["disagree_sec"] >= self.SWITCH_SEC:
+                    # MP 持续多帧/足够久给反标签 → 承认双手真实换位，翻转锁定身份
+                    tr["label"] = "Right" if tr["label"] == "Left" else "Left"
+                    tr["disagree_n"] = 0
+                    tr["disagree_sec"] = 0.0
+            d["final_label"] = tr["label"]
+            used_labels.add(tr["label"])
+
+        # ---- 未匹配轨迹：累计丢失（样本+墙钟）；未匹配检测：建立新轨迹 ----
+        for ti, tr in enumerate(self._tracks):
+            if ti not in matched_ti:
+                tr["miss_n"] += 1
+                tr["miss_sec"] += float(dt)
+        self._tracks = [t for t in self._tracks
+                          if t["miss_n"] <= self.MAX_MISS and t["miss_sec"] < self.MAX_MISS_SEC]
+
+        unmatched = [d for d in dets if not d["matched"]]
+        # 冷启动双手同框且 MP 给出【相同标签】：按同视角画面解剖先验裁决——
+        # 非镜像画面中用户左手必在画面左侧（x 小 = Right），右手在右侧（x 大 = Left）。
+        # 手臂交叉是瞬态且 MP 一般不会给同标签，下一帧起位置锁定+滞回会接管。
+        if len(unmatched) >= 2 and len({d["mp"] for d in unmatched}) == 1:
+            unmatched.sort(key=lambda d: d["x"])
+            for d, lab in zip(unmatched, ("Right", "Left")):
+                d["final_label"] = lab
+                used_labels.add(lab)
+                self._tracks.append(
+                    {"label": lab, "x": d["x"], "y": d["y"],
+                     "miss_n": 0, "miss_sec": 0.0, "disagree_n": 0, "disagree_sec": 0.0})
+            unmatched = []
+        for d in unmatched:
+            lab = d["mp"] if d["mp"] in ("Left", "Right") else "Right"
+            if lab in used_labels:
+                # 与在册身份撞车（单手恢复等）→ 强制取另一个未占用身份
+                other = "Right" if lab == "Left" else "Left"
+                if other not in used_labels:
+                    lab = other
+            d["final_label"] = lab
+            used_labels.add(lab)
+            self._tracks.append(
+                {"label": lab, "x": d["x"], "y": d["y"],
+                 "miss_n": 0, "miss_sec": 0.0, "disagree_n": 0, "disagree_sec": 0.0})
+
+        # ---- 单一出口：改写回 hands_data，下游只消费这份身份 ----
+        for d in dets:
+            d["hand"]["label"] = d["final_label"]
+
+
 # ⭐ 2026-09-22 握拳卷曲排他门（修复"握拳被误判单指长按"）：握拳时食指全折，95% 关节角
 #   bend 与勾按落在同一深弯区间，差分/绝对门无法区分；唯一稳定几何差——勾按只弯 DIP、
 #   食指整体保持前伸（见 _index_bend_from_joint_angles 设计原则），TIP_8 离 MCP_5 远；
@@ -103,10 +272,27 @@ def _three_point_angle(p_a: np.ndarray, p_v: np.ndarray, p_b: np.ndarray) -> flo
 #     勾按/长按(MCP≤40,PIP≤40,DIP≤80°) = 0.82~1.15；握拳(60~90/110~170/120~180°) = 0.26~0.54。
 #   ⚠ 首版误用 5.4cm 短指模型得阈值 0.38，真机握拳值在其上下抖动→门每~5帧横跳一次→卡顿。
 #   双阈值迟滞：<0.62 连续3帧激活；>0.78 连续5帧解除；0.62~0.78 带内计数冻结（不横跳）。
+#
+# ⭐ 2026-10-01 清理两个已证伪的补丁（代码与真机日志双证），握拳门恢复为只看 index_curl：
+#   · im_sep（食-中指 3D 排距）：假设"单指勾按时其他三指伸直、与中指分开"，但用户真实握法
+#     是单指勾按时其他三指与握拳完全一致地弯着、并拢；实测 勾按 0.34~0.66 vs
+#     握拳 0.33~0.57，区间完全重叠，一次正确否决都没有产生 → 删除。
+#   · ob（中/无名指 2D DIP 弯度）：姿态假设同上错误，且四指沿纵深卷回时 2D 投影角
+#     被视角压缩到 160~170°（看着直），全部姿态实测 0.04~0.20 无区分度 → 删除。
+#   残留唯一问题：食指深勾进掌平面、TIP_8 被手掌遮挡时，指尖估计点贴向掌心，
+#   curl 漂进 0.50~0.62 误激活；该区间与真握拳不可分割，非阈值可解，需改用遮挡时
+#   仍可见的食指近端证据（PIP/MCP），详见后续标定。
 FIST_CURL_ENTER_RATIO = 0.62   # 低于此值开始累计"卷回"
 FIST_CURL_EXIT_RATIO = 0.78    # 高于此值开始累计"离开"（与激活线间隔 0.16 抗遮挡抖动）
-FIST_CURL_ENTER_FRAMES = 3     # 连续 3 帧卷回才确认（~0.1~0.15s 去抖，握拢过程不误拦）
-FIST_CURL_EXIT_FRAMES = 5      # 连续 5 帧离开才解除
+FIST_CURL_ENTER_FRAMES = 3     # 连续 3 个【样本】卷回才确认
+FIST_CURL_ENTER_SEC = 0.10    # 且连续墙钟 0.10s（≈原 3 帧 @30fps；~0.1~0.15s 去抖，握拢过程不误拦）
+FIST_CURL_EXIT_FRAMES = 5      # 连续 5 个【样本】离开才解除
+FIST_CURL_EXIT_SEC = 0.17     # 且连续墙钟 0.17s（≈原 5 帧 @30fps）
+# ⭐ 2026-10-01 v2：区分"握拳"与"仅食指弯（食指长按）"
+#   食指长按时只有食指卷向掌心，中/无名/小三指仍然伸直；握拳时四指全卷。
+#   3D 世界坐标齐全时：食指卷 且 其余三指中至少 N 指也卷 → 才判握拳。
+FIST_OTHER_CURL_RATIO = 0.72  # 中/无名/小：‖TIP-MCP‖/掌宽 低于此值视为该指也卷向掌心
+FIST_OTHER_CURL_MIN   = 2      # 其余三指中至少 2 指同卷（遮挡一指也不影响判定）
 
 
 def _index_bend_from_joint_angles(lms, palm_denom: float | None,
@@ -325,8 +511,10 @@ def parse_args(argv=None):
     parser.add_argument("--model", type=str, default=None,
                         help="（仅 --use-tasks 时有效）指定 hand_landmarker.task 的绝对/相对路径")
     parser.add_argument("--max-hands", type=int, default=2, help="最多识别手的数量 (默认 2)")
-    parser.add_argument("--anchor", type=str, default="palm", choices=["palm", "index_tip"],
-                        help="鼠标光标锚点：palm=掌心 / index_tip=食指TIP")
+    parser.add_argument("--anchor", type=str, default="mcp",
+                        choices=["mcp", "palm", "index_tip"],
+                        help="鼠标光标锚点：mcp=四指根质心(同视角默认,手腕出画不漂) / "
+                             "palm=掌心(面对面旧锚点) / index_tip=食指TIP")
     parser.add_argument("--cursor-mode", type=str, default="smooth", choices=["smooth", "absolute", "direct"],
                         help="光标移动策略：smooth(AR悬停5层稳) / absolute(指哪打哪3层兼顾稳跟手) / direct⭐严格跟UI掌心绿圈(无阻尼无锁，翻转手掌也不卡)")
     parser.add_argument("--roi-scale", type=float, default=0.70,
@@ -1042,6 +1230,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     _EMA_RESET_TOL = 0.015                 # 掌心单帧归一化位移超过此值 → 清 EMA 缓存（≈1280×720下≈10像素）
     _ema_landmarks: dict[str, list] = {}   # key = Left/Right, value = 21 个 [x,y,z] 列表
     _ema_miss_count: dict[str, int] = {}   # 连续丢失计数，超过阈值清空 EMA
+    # ⭐ 同视角身份时序稳定器（2026-09-30）：手背入镜/手掌旋转时锁定左右手身份，
+    #   防止 MP handedness 单帧横跳 → EMA 串手 / 控鼠手瞬切 / 双手拉伸左右对调
+    _hand_id_stab = HandIdentityStabilizer()
 
     # (2) 手势标签 majority-vote 去抖：最近 N 帧投票取众数
     #     ✅ 2026-08-20 调参：窗口从 5 → 3
@@ -1119,21 +1310,79 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
         # ================== 主循环（与原 main.py 唯一差别：加 stop_event 每帧退出） ==================
         _bg_heartbeat_cnt = 0   # 无预览模式心跳帧计数（~每120帧打印一次 RUN-OK）
+        # ⭐ 2026-10-01 摄像头读帧两级容错（修复"运行中偶发 1 帧 cap.read()=False 整个服务退出"）：
+        #   第一级：偶发空帧 → 等 20ms 重试，读到好帧立即清零（USB 驱动瞬时卡顿下帧自恢复，
+        #          下游本就有"黑帧冻结/跳帧复用"语义，用户无感）；
+        #   第二级：连续失败满 5s → 判定掉线/被别的程序抢占，release 旧句柄并走完整的
+        #          _open_camera_robust 枚举+预热自动重开（USB 重插也能自愈），成功继续运行；
+        #          重开仍失败才退出，并把枚举尝试记录打全（那才是真故障）。
+        _CAM_READ_RETRY_SEC = 5.0
+        _CAM_READ_FAIL_SLEEP = 0.02
+        _cam_read_fail_since: float | None = None
+        _cam_reopen_count = 0
+        # ✨ 2026-10-01 全项目墙钟化：主循环统一时间源（monotonic），下传给所有"帧数→秒数"状态机
+        _last_frame_wall = time.monotonic()
+        _frame_dt = 0.0   # 上一帧→当前帧的墙钟间隔（首帧0；含异常保护，永不抛错）
         while True:
             # 🔴 新增：stop_event 命中 → 立即干净退出
             if stop_event is not None and stop_event.is_set():
                 break
 
+            # ✨ 墙钟 dt：所有状态机共用的唯一时间源（异常保护：任何负值/跳变都夹回 0）
+            try:
+                _wall_now = time.monotonic()
+                _frame_dt = float(_wall_now) - float(_last_frame_wall)
+                if _frame_dt < 0.0 or _frame_dt > 0.5:
+                    _frame_dt = 0.0
+                _last_frame_wall = _wall_now
+            except Exception:
+                _frame_dt = 0.0
+
             _bg_heartbeat_cnt += 1
             _t0 = time.perf_counter()
             ok, frame = cap.read()
             _t1 = time.perf_counter()
-            if not ok:
-                print("[hands_tasks.run_loop] 摄像头读取失败，退出")
+            if not ok or frame is None:
+                # ---- 第一级：偶发空帧，短等重试 ----
+                if _cam_read_fail_since is None:
+                    _cam_read_fail_since = _t0
+                    print("[hands_tasks.run_loop] ⚠ 摄像头空帧，重试中（偶发不退出）…", flush=True)
+                _fail_elapsed = _t0 - _cam_read_fail_since
+                if _fail_elapsed < _CAM_READ_RETRY_SEC:
+                    time.sleep(_CAM_READ_FAIL_SLEEP)
+                    continue
+                # ---- 第二级：连续 5s 失败 → 自动重开相机 ----
+                print(f"[hands_tasks.run_loop] ⚠ 连续 {_fail_elapsed:.1f}s 读帧失败，"
+                      f"尝试自动重开摄像头 camera_id={_cid!r}…", flush=True)
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                _new_cap, _new_info = _open_camera_robust(
+                    int(_cid),
+                    int(_cap_info.get("width", 1280) or 1280),
+                    int(_cap_info.get("height", 720) or 720))
+                if _new_cap is not None:
+                    cap = _new_cap
+                    if isinstance(_new_info, dict):
+                        _cap_info = _new_info
+                    _cam_reopen_count += 1
+                    _cam_read_fail_since = None
+                    print(f"[hands_tasks.run_loop] ✅ 摄像头自动重开成功"
+                          f"（第{_cam_reopen_count}次，后端={_cap_info.get('backend')}），继续运行",
+                          flush=True)
+                    continue
+                _attempts = _new_info.get("attempts_summary", []) if isinstance(_new_info, dict) else []
+                print(f"[hands_tasks.run_loop] ❌ 连续 {_fail_elapsed:.1f}s 读帧失败，自动重开也失败，退出。"
+                      f"尝试记录:\n" + ";\n".join(f"    {_p}" for _p in _attempts),
+                      flush=True)
                 break
+            # 读到好帧：连续失败计时立即清零（偶发失败不跨帧累计）
+            _cam_read_fail_since = None
 
-            # ---------- 单点镜像 ----------
-            frame = cv2.flip(frame, 1)
+            # ---------- 第一人称同视角：画面【不】做水平镜像 ----------
+            # 头戴相机视线与人眼一致：手向右动 → 画面 x 向右增，光标自然同向。
+            # 旧面对面视角在此 cv2.flip(frame, 1)（自拍镜像），同视角改造后永久移除。
             h, w = frame.shape[:2]
 
             # 把摄像头实际宽高通知 MouseController：_norm_to_screen 才能和预览绿框 100% 对齐
@@ -1162,6 +1411,22 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _skip_was_skipped = False
                 # ---------- 正常：双手检测 ----------
                 hands_data, frame = detector.detect(frame)
+                # ⭐ 同视角标签归一化：MediaPipe 左右手标签假定输入为【镜像自拍图】
+                #   （旧面对面流程靠 cv2.flip 满足该假定，用户右手原始标签恰为 "Left"）。
+                #   同视角输入不镜像，按官方规则在应用层交换 handedness：
+                #   交换后沿用全项目既有约定 —— label "Left" = 用户右手 = 控鼠手，
+                #   下游 EMA / 手势投票 / 鼠标 / 点击 / 拉伸 全部无需改动。
+                #   🔴 只能在【新检测结果】处交换一次：跳帧复用的 _skip_last_hands_data
+                #      已在下方 deepcopy 前完成交换，重复交换会双手身份互换。
+                for _h in hands_data:
+                    if _h.get("label") == "Left":
+                        _h["label"] = "Right"
+                    elif _h.get("label") == "Right":
+                        _h["label"] = "Left"
+                # ⭐ 身份时序稳定（单一入口，紧挨标签交换）：以掌心位置跨帧锁定身份，
+                #   手背入镜/转掌造成的 MP 标签单帧横跳在此被消化为【不变】。
+                #   必须在 deepcopy 之前：跳帧复用的帧携带的就是已稳定身份，不重复 apply。
+                _hand_id_stab.apply(hands_data, _frame_dt)
                 _skip_last_hands_data = _cp.deepcopy(hands_data)
 
             # ================================================================
@@ -1174,17 +1439,22 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _cur_labels_in_frame.add(_lab)
                 _cur_arr = [[float(_p.x), float(_p.y), float(_p.z)] for _p in _hand["landmarks"]]
 
-                # ✅ 掌心大位移硬重置（彻底消除快速移动时的EMA拖尾）：
-                #   先计算当前掌心（关键点0 + 关键点9 的中点，和 cursor anchor 完全一致）
-                #   如果这一帧掌心相对上一帧跳了 > _EMA_RESET_TOL（≈10px归一化），说明是真实快速移动，
+                # ✅ 掌位大位移硬重置（彻底消除快速移动时的EMA拖尾）：
+                #   先计算当前掌位（⭐ 2026-10-01 起与 cursor anchor 同真相：四指根
+                #   MCP 5/9/13/17 质心，即 args.anchor=mcp；旧 0+9 中点在手腕出画时漂移）
+                #   如果这一帧掌位相对上一帧跳了 > _EMA_RESET_TOL（≈10px归一化），说明是真实快速移动，
                 #   直接丢掉历史EMA（不拖尾巴），强制用当前值（然后下一帧再从这个点开始EMA）。
-                _cx0_cur = 0.5 * (_cur_arr[0][0] + _cur_arr[9][0])
-                _cy0_cur = 0.5 * (_cur_arr[0][1] + _cur_arr[9][1])
+                _cx0_cur = 0.25 * (_cur_arr[5][0] + _cur_arr[9][0]
+                                      + _cur_arr[13][0] + _cur_arr[17][0])
+                _cy0_cur = 0.25 * (_cur_arr[5][1] + _cur_arr[9][1]
+                                      + _cur_arr[13][1] + _cur_arr[17][1])
                 _reset_this_hand = False
                 if _lab in _ema_landmarks:
                     _last_arr = _ema_landmarks[_lab]
-                    _cx0_prev = 0.5 * (_last_arr[0][0] + _last_arr[9][0])
-                    _cy0_prev = 0.5 * (_last_arr[0][1] + _last_arr[9][1])
+                    _cx0_prev = 0.25 * (_last_arr[5][0] + _last_arr[9][0]
+                                           + _last_arr[13][0] + _last_arr[17][0])
+                    _cy0_prev = 0.25 * (_last_arr[5][1] + _last_arr[9][1]
+                                           + _last_arr[13][1] + _last_arr[17][1])
                     if abs(_cx0_cur - _cx0_prev) > _EMA_RESET_TOL or abs(_cy0_cur - _cy0_prev) > _EMA_RESET_TOL:
                         _reset_this_hand = True
 
@@ -1249,8 +1519,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _mv_final[label] = gesture_final
                 # 用投票后的手势（不改变 ext/ratios，保持原始弯曲度反馈）
                 hand_results[label] = (gesture_final, ext, ratios, lms)
-                # 记录掌心（归一化）
-                _palm_x, _palm_y = HandDetector.cursor_anchor_from_landmarks(lms, "palm")
+                # 记录掌位（归一化）——⭐ 2026-10-01 与光标锚点同源（args.anchor，默认 mcp），
+                # 跳帧稳定性判定的位移基准必须等于光标实际跟随的点，否则两者门限语义脱节
+                _palm_x, _palm_y = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
                 _cur_palms_now[label] = (float(_palm_x), float(_palm_y))
 
                 color = HAND_COLORS.get(label, (128, 128, 128))
@@ -1435,7 +1706,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             and stretch.state != _DS.SCALING):
                         fingertip_norm = (lms[8].x, lms[8].y)
                         mouse.handle(safe_gesture, fingertip_norm, cursor_anchor_norm=cursor_anchor_norm)
-                    # ↓↓ 画锚点（绿圈=掌心，橙圈=食指TIP）——和 move_only 用的 cursor_anchor_norm 完全同一份 ↓↓
+                    # ↓↓ 画锚点（绿圈=光标锚点 args.anchor，默认 mcp 指根；橙圈=食指TIP）
+                    # ——和 move_only 用的 cursor_anchor_norm 完全同一份 ↓↓
                     mx, my = HandDetector.landmark_to_pixel(lms[8], w, h)
                     cv2.circle(frame, (mx, my), 7, (0, 140, 255), 2)
                     ax = int(cursor_anchor_norm[0] * w)
@@ -1528,45 +1800,81 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             dist_bend_old = tip_m5 / denom
                             index_bend = _index_bend_from_joint_angles(
                                 lms, palm_denom=denom, dist_bend_fallback=dist_bend_old)
-                            # ---- ⭐ 2026-09-22 握拳卷曲排他门（常量说明见文件头 FIST_CURL_*）----
-                            # 3D world 优先；取不到 world 时用 2D tip_m5/EMA掌宽 兜底
+                            # ---- ⭐ 2026-10-01 握拳卷曲排他门 v2（常量说明见文件头 FIST_CURL_*）----
+                            # 目的：把"握拳"与"仅食指弯下（食指长按）"分开——
+                            #   食指长按：只有食指 TIP8 卷向掌心，中/无名/小三指仍伸直；
+                            #   握拳：四指（含中12/无名16/小20）全部卷向掌心。
+                            # 3D world 优先，四指都算；world 不全（遮挡）时【默认握拳】（2026-10-01 用户拍板：宁拦勿漏）。
                             _wl = next((h.get("world_landmarks") for h in hands_data
                                         if h.get("label") == "Left"), None)
-                            if _wl is not None and len(_wl) >= 18:
-                                _wc8  = np.array([float(_wl[8].x),  float(_wl[8].y),  float(_wl[8].z)])
+                            _fist_shape_now = False   # 本帧是否"几何形状像握拳"（当帧即压制，不等确认）
+                            index_curl = dist_bend_old  # 兜底：world 异常时退回 2D 食指估计
+                            if _wl is not None and len(_wl) >= 21:
                                 _wc5  = np.array([float(_wl[5].x),  float(_wl[5].y),  float(_wl[5].z)])
+                                _wc9  = np.array([float(_wl[9].x),  float(_wl[9].y),  float(_wl[9].z)])
+                                _wc13 = np.array([float(_wl[13].x), float(_wl[13].y), float(_wl[13].z)])
                                 _wc17 = np.array([float(_wl[17].x), float(_wl[17].y), float(_wl[17].z)])
+                                _wc8  = np.array([float(_wl[8].x),  float(_wl[8].y),  float(_wl[8].z)])
+                                _wc12 = np.array([float(_wl[12].x), float(_wl[12].y), float(_wl[12].z)])
+                                _wc16 = np.array([float(_wl[16].x), float(_wl[16].y), float(_wl[16].z)])
+                                _wc20 = np.array([float(_wl[20].x), float(_wl[20].y), float(_wl[20].z)])
                                 _wpw = float(np.linalg.norm(_wc5 - _wc17))
-                                index_curl = float(np.linalg.norm(_wc8 - _wc5)) / max(_wpw, 1e-6)
+                                if _wpw > 1e-6:
+                                    index_curl  = float(np.linalg.norm(_wc8  - _wc5))  / _wpw
+                                    mid_curl    = float(np.linalg.norm(_wc12 - _wc9))  / _wpw
+                                    ring_curl   = float(np.linalg.norm(_wc16 - _wc13)) / _wpw
+                                    pinky_curl  = float(np.linalg.norm(_wc20 - _wc17)) / _wpw
+                                    # 食指卷 + 其余三指至少 N 指同卷 → 握拳（食指单独弯不触发）
+                                    _others_curled = sum(1 for r in (mid_curl, ring_curl, pinky_curl)
+                                                        if r < FIST_OTHER_CURL_RATIO)
+                                    _fist_shape_now = (index_curl < FIST_CURL_ENTER_RATIO
+                                                       and _others_curled >= FIST_OTHER_CURL_MIN)
                             else:
+                                # world 坐标不全（关键点缺失/遮挡）：用户拍板默认按【握拳】处理（宁拦勿漏），
+                                #   不再退回"仅食指"单指标——否则真握拳时恰好 world 丢失就会漏判。
+                                #   index_curl 仍取 2D 估计，仅供"手张开"退出计数使用。
                                 index_curl = dist_bend_old
+                                _fist_shape_now = True
                             _curl_in_n  = int(getattr(run_loop, "_fist_curl_in_n", 0))
+                            _curl_in_sec  = float(getattr(run_loop, "_fist_curl_in_sec", 0.0))
                             _curl_out_n = int(getattr(run_loop, "_fist_curl_out_n", 0))
+                            _curl_out_sec = float(getattr(run_loop, "_fist_curl_out_sec", 0.0))
                             _fist_curl_active = bool(getattr(run_loop, "_fist_curl_active", False))
-                            if index_curl < FIST_CURL_ENTER_RATIO:
+                            # 进入用"握拳形状"（四指全卷）；离开用食指完全伸直（手张开）
+                            if _fist_shape_now:
                                 _curl_in_n += 1
+                                _curl_in_sec += _frame_dt
                                 _curl_out_n = 0
+                                _curl_out_sec = 0.0
                             elif index_curl > FIST_CURL_EXIT_RATIO:
                                 _curl_out_n += 1
+                                _curl_out_sec += _frame_dt
                                 _curl_in_n = 0
-                            # 迟滞带 [ENTER_RATIO, EXIT_RATIO] 内：两个计数都冻结，
-                            # 深弯遮挡导致的指尖抖动不会把门抖开/抖关
-                            if not _fist_curl_active and _curl_in_n >= FIST_CURL_ENTER_FRAMES:
+                                _curl_in_sec = 0.0
+                            # 迟滞带内样本/计时冻结：指尖抖动不会把门抖开/抖关
+                            # ✨ 双条件：样本数 + 墙钟时长都达标才翻转（帧率变化物理手感不变）
+                            if not _fist_curl_active and _curl_in_n >= FIST_CURL_ENTER_FRAMES \
+                                    and _curl_in_sec >= FIST_CURL_ENTER_SEC:
                                 _fist_curl_active = True
                                 # 静默取消 ARM/HOLD 挂起段：握拳张开回直时不补发单击
                                 tap_detector.cancel_in_progress()
                                 # 慢握拳可能已先进入 PRESSED（LONG_DOWN 已发）：None 对 PRESSED 是
-                                # 冻结语义会把键卡住，这里明确作废长按 → 本帧立即 LONG_UP 抬键
+                                # 冻结语义会把键卡住，这里明确作废长按 → 本帧立即 LONG_UP 抬起
                                 _fist_forced_ev = tap_detector.force_long_up()
-                                print(f"[FIST-GUARD] 握拳卷曲拦截 index_curl={index_curl:.3f}"
-                                      f"（<{FIST_CURL_ENTER_RATIO:.2f}）：挂起段取消"
+                                print(f"[FIST-GUARD] 握拳卷曲拦截（四指全卷 index={index_curl:.3f}）：挂起段取消"
                                       f"{'，长按强制抬起' if _fist_forced_ev else ''}", flush=True)
-                            elif _fist_curl_active and _curl_out_n >= FIST_CURL_EXIT_FRAMES:
+                            elif _fist_curl_active and _curl_out_n >= FIST_CURL_EXIT_FRAMES \
+                                    and _curl_out_sec >= FIST_CURL_EXIT_SEC:
                                 _fist_curl_active = False
                             run_loop._fist_curl_in_n = _curl_in_n
+                            run_loop._fist_curl_in_sec = _curl_in_sec
                             run_loop._fist_curl_out_n = _curl_out_n
+                            run_loop._fist_curl_out_sec = _curl_out_sec
                             run_loop._fist_curl_active = _fist_curl_active
-                            if _fist_curl_active:
+                            # ✨ 当帧几何形状已像握拳就立刻压制 bend（不等 0.10s 确认），
+                            #   避免确认前的 1~3 帧食指 bend 已把长按门 ARMED 顶起；
+                            #   确认态保持是为了挂起段继续压制 + force_long_up 时机
+                            if _fist_curl_active or _fist_shape_now:
                                 index_bend = None
                             # ----------------------------------------------------------
                             # ⭐ 2026-09-17 食中双指并拢右键 v2：不再分别算食指/中指 bend
@@ -1724,7 +2032,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             if "Left" in hand_results:
                 _, _, _, lms = hand_results["Left"]
                 left_lms_main = lms
-                nx, ny = HandDetector.cursor_anchor_from_landmarks(lms, "palm")
+                # ⭐ 2026-10-01 拉伸掌位与光标锚点同源（mcp）：手腕出画时双手距离/移动量不漂
+                nx, ny = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
                 left_px = (float(nx) * w, float(ny) * h)
                 try:
                     sx, sy = mouse._norm_to_screen(float(nx), float(ny))
@@ -1734,7 +2043,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             if "Right" in hand_results:
                 _, _, _, lms = hand_results["Right"]
                 right_lms_main = lms
-                nx, ny = HandDetector.cursor_anchor_from_landmarks(lms, "palm")
+                nx, ny = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
                 right_px = (float(nx) * w, float(ny) * h)
                 try:
                     sx, sy = mouse._norm_to_screen(float(nx), float(ny))
@@ -1743,7 +2052,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     right_palm_screen = None
             stretch_info = stretch.update(left_px, right_px, (w, h),
                                           left_lms_main, right_lms_main,
-                                          left_palm_screen, right_palm_screen)
+                                          left_palm_screen, right_palm_screen,
+                                          dt=_frame_dt)
 
             _t2 = time.perf_counter()
 
@@ -1812,8 +2122,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         cv2.line(frame, (x1, y1), (x2, y2), color, 2)
                         _draw_pinch_dot(left_lms_main,  x1, y1, color)
                         _draw_pinch_dot(right_lms_main, x2, y2, color)
-                        hold_n = stretch.min_hold_frames
-                        pct = stretch_info.confirm_frames / max(1, hold_n)
+                        hold_n = stretch.min_hold_sec
+                        pct = stretch_info.confirm_sec / max(1e-6, hold_n)
                         pct = 1.0 if pct > 1.0 else pct
                         prog_w = 340
                         bx = cx - prog_w // 2
@@ -1826,13 +2136,13 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * fill_ratio), by + 12), pre_c, -1)
                             # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
-                                        f"预判定【{pre_mode}】  θ={theta_deg:.0f}° ｜ 双手≥120px 并保持3帧即可激活",
+                                        f"预判定【{pre_mode}】  θ={theta_deg:.0f}° ｜ 双手≥120px 并保持{hold_n:.2f}s即可激活",
                                         (bx, by + 20), font_scale=0.58, color=(255, 255, 255), thickness=2)
                         else:
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 12), color, -1)
                             # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
-                                        f"选中确认中… {stretch_info.confirm_frames}/{hold_n}({int(pct*100)}%)  θ={theta_deg:.0f}° → {pre_mode}",
+                                        f"选中确认中… {stretch_info.confirm_sec:.2f}/{hold_n:.2f}s({int(pct*100)}%)  θ={theta_deg:.0f}° → {pre_mode}",
                                         (bx, by + 20), font_scale=0.6, color=(255, 255, 255), thickness=2)
                     elif stretch_info.state == _DS.SCALING:
                         color = (80, 230, 255)
@@ -1878,14 +2188,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 if "Left" in hand_results:
                     _, _, _, llms_ui = hand_results["Left"]
                     try:
-                        nlx, nly = HandDetector.cursor_anchor_from_landmarks(llms_ui, "palm")
+                        nlx, nly = HandDetector.cursor_anchor_from_landmarks(llms_ui, args.anchor)
                         p1_m = (float(nlx) * w, float(nly) * h)
                     except Exception:
                         p1_m = stretch_info.p1
                 if "Right" in hand_results:
                     _, _, _, rlms_ui = hand_results["Right"]
                     try:
-                        nrx, nry = HandDetector.cursor_anchor_from_landmarks(rlms_ui, "palm")
+                        nrx, nry = HandDetector.cursor_anchor_from_landmarks(rlms_ui, args.anchor)
                         p2_m = (float(nrx) * w, float(nry) * h)
                     except Exception:
                         p2_m = stretch_info.p2
@@ -1917,8 +2227,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     _draw_open_palm_marks(llms_ui,  x1, y1)
                     _draw_open_palm_marks(rlms_ui, x2, y2)
                     if stretch_info.move_state == _DMS.MOVE_CONFIRM or (stretch_info.ui_move_active and stretch_info.move_state == _DMS.IDLE):
-                        hold_n = 3
-                        pct = stretch_info.move_confirm_frames / hold_n
+                        hold_n = MOVE_CONFIRM_SEC
+                        pct = stretch_info.move_confirm_sec / max(1e-6, hold_n)
                         pct = 1.0 if pct > 1.0 else pct
                         prog_w = 400
                         bx = cx - prog_w // 2
@@ -1930,13 +2240,13 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * 0.02), by + 14), mv_color, -1)
                             # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
-                                        f"✋预判定【移动窗口(双手)】左手掌心指向要移动的窗口 ｜ 保持五指张开3帧即可选中",
+                                        f"✋预判定【移动窗口(双手)】左手掌心指向要移动的窗口 ｜ 保持五指张开{hold_n:.2f}s即可选中",
                                         (bx, by + 24), font_scale=0.55, color=(255, 255, 255), thickness=2)
                         else:
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 14), mv_color, -1)
                             # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
-                                        f"✋选中窗口确认中… {stretch_info.move_confirm_frames}/{hold_n}({int(pct*100)}%)  → 左手掌心下窗口=目标",
+                                        f"✋选中窗口确认中… {stretch_info.move_confirm_sec:.2f}/{hold_n:.2f}s({int(pct*100)}%)  → 左手掌心下窗口=目标",
                                         (bx, by + 24), font_scale=0.58, color=(255, 255, 255), thickness=2)
                     elif stretch_info.move_state == _DMS.MOVE_ACTIVE:
                         dxv, dyv = stretch_info.move_delta_xy
@@ -1970,8 +2280,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     cv2.circle(frame, (x1, y1), 26, mv_color, 3)
                     _draw_open_palm_marks(llms_ui if ("Left" in hand_results) else rlms_ui, x1, y1)
                     if stretch_info.move_state == _DMS.MOVE_CONFIRM or (stretch_info.ui_move_active and stretch_info.move_state == _DMS.IDLE):
-                        hold_n = 3
-                        pct = stretch_info.move_confirm_frames / hold_n
+                        hold_n = MOVE_CONFIRM_SEC
+                        pct = stretch_info.move_confirm_sec / max(1e-6, hold_n)
                         pct = 1.0 if pct > 1.0 else pct
                         prog_w = 420
                         bx = x1 + 40 if cx < w // 2 else (x1 - 40 - prog_w)
@@ -1983,13 +2293,13 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * 0.02), by + 14), mv_color, -1)
                             # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
-                                        f"✋预判定【移动窗口(单手)】掌心指向要移动的窗口 ｜ 保持五指张开3帧即可选中",
+                                        f"✋预判定【移动窗口(单手)】掌心指向要移动的窗口 ｜ 保持五指张开{hold_n:.2f}s即可选中",
                                         (bx, by + 24), font_scale=0.55, color=(255, 255, 255), thickness=2)
                         else:
                             cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 14), mv_color, -1)
                             # 回滚 B-2：中文每帧必画
                             put_text_cn(frame,
-                                        f"✋选中窗口确认中(单手)… {stretch_info.move_confirm_frames}/{hold_n}({int(pct*100)}%)",
+                                        f"✋选中窗口确认中(单手)… {stretch_info.move_confirm_sec:.2f}/{hold_n:.2f}s({int(pct*100)}%)",
                                         (bx, by + 24), font_scale=0.58, color=(255, 255, 255), thickness=2)
                     elif stretch_info.move_state == _DMS.MOVE_ACTIVE:
                         dxv, dyv = stretch_info.move_delta_xy
@@ -2023,9 +2333,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             if msst == _DMS.MOVE_CONFIRM or (stretch_info.ui_move_active and msst == _DMS.IDLE):
                 s_color = (90, 255, 120)
                 if hands_mode_now == "SINGLE":
-                    s_text = f"✋ 单手五指张开-移动窗口 确认中 {stretch_info.move_confirm_frames}/3"
+                    s_text = f"✋ 单手五指张开-移动窗口 确认中 {stretch_info.move_confirm_sec:.2f}/{MOVE_CONFIRM_SEC:.2f}s"
                 else:
-                    s_text = f"✋ 双手五指张开-移动窗口 确认中 {stretch_info.move_confirm_frames}/3"
+                    s_text = f"✋ 双手五指张开-移动窗口 确认中 {stretch_info.move_confirm_sec:.2f}/{MOVE_CONFIRM_SEC:.2f}s"
             elif msst == _DMS.MOVE_ACTIVE:
                 s_color = (90, 255, 120)
                 ddx, ddy = stretch_info.move_delta_xy
@@ -2035,7 +2345,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     s_text = f"✋ 移动窗口中 Δx={int(round(float(ddx))):+d} Δy={int(round(float(ddy))):+d}  光标锁窗口中心"
             elif sst == _DS.ARMED_CONFIRM:
                 s_color = (255, 210, 80)
-                s_text = f"🤏 双手捏合拉伸-选中确认 {stretch_info.confirm_frames}/{stretch.min_hold_frames}"
+                s_text = f"🤏 双手捏合拉伸-选中确认 {stretch_info.confirm_sec:.2f}/{stretch.min_hold_sec:.2f}s"
             elif sst == _DS.SCALING:
                 s_color = (80, 230, 255)
                 s_text = f"🤏 双手捏合拉伸-窗口缩放中 X {stretch_info.ratio:.3f}  {stretch_info.win_w}×{stretch_info.win_h}"
@@ -2079,7 +2389,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             font_scale=0.8, color=(0, 230, 230), thickness=2)
 
             # ---------- 顶部模式标签 ----------
-            anchor_text = "掌心" if args.anchor == "palm" else "食指尖"
+            anchor_text = {"mcp": "指根", "palm": "掌心", "index_tip": "食指尖"}.get(
+                args.anchor, args.anchor)
             if args.cursor_mode == "absolute":
                 mode_text = "绝对指哪打哪"
             elif args.cursor_mode == "direct":

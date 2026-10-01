@@ -26,7 +26,7 @@ import numpy as np
   1) 基线 BASE 仅在 IDLE 状态下以 α=0.03 缓慢漂移（适应手的基础距离变化），
      在 PUSH_DOWN/HOLD 期间完全冻结，保证退出阈值相对稳定；
   2) EMA(α=0.3) 先对掌宽像素做滤波，抑制单帧尖峰；
-  3) COOLDOWN_FRAMES = 15：刚退出 PUSH/HOLD 后有冷却，避免释放回弹造成连击/抖动；
+  3) COOLDOWN_SEC = 0.6：刚退出 PUSH/HOLD 后的冷却墙钟时长，冷却中不响应深度事件（原 18 帧 @30fps，2026-10-01 统一墙钟）；
   4) 只有主控手（右手 = MediaPipe "Left"）参与深度点击判定，左手忽略。
 """
 
@@ -38,17 +38,17 @@ EXIT_RATIO  = 1.15   # 释放回到基线范围内：当前掌宽 < 基线 × 1.
 PALM_SMOOTH_ALPHA = 0.30      # 掌宽 EMA 滤波系数（越大越跟手，越小越稳）
 BASELINE_ALPHA_IDLE = 0.03    # IDLE 态下基线缓慢更新速率（越小越慢）
 
-# 防抖/冷却
-MIN_HOLD_FRAMES = 2           # 必须连续 N 帧满足 ENTER 才真正触发（抑制瞬间尖峰）
-COOLDOWN_FRAMES = 18          # 触发/释放后的冷却帧，冷却中不响应深度事件
+# 防抖/冷却（墙钟秒，物理时长与帧率无关）
+MIN_HOLD_SEC = 0.067         # ARMED 后必须持续多久满足 ENTER 才真正触发（原 2 帧 @30fps，抑制瞬间尖峰）
+COOLDOWN_SEC  = 0.6           # 触发/释放后的冷却时长，冷却中不响应深度事件
 
 class _S:
     """状态枚举"""
     IDLE      = "IDLE"       # 空闲，基线自适应进行中
-    ARMED     = "ARMED"      # 已达到 ENTER 阈值，正在等待 MIN_HOLD_FRAMES
+    ARMED      = "ARMED"      # 已达到 ENTER 阈值，正在等待 MIN_HOLD_SEC
     PUSH_DOWN = "PUSH_DOWN"  # 刚触发按下（mouseDown 触发的这一帧）
     HOLD      = "HOLD"       # 保持按住（拖拽中）
-    COOLDOWN  = "COOLDOWN"   # 刚释放的冷却期
+    COOLDOWN  = "COOLDOWN"   # 刚释放的冷却期（墙钟秒）
 
 # 对外发射的事件（供 MouseController / main.py 使用）
 class E:
@@ -67,8 +67,8 @@ class DepthClickDetector:
         # 滤波/基线
         self._smoothed_palm = None   # EMA 后的掌宽（像素）
         self._baseline = None        # 当前基线掌宽（像素）
-        self._armed_frames = 0       # ARMED 态计帧
-        self._cooldown_frames = 0    # 冷却计帧
+        self._armed_sec = 0.0       # ARMED 态累计秒
+        self._cooldown_until = 0.0  # 冷却截止墙钟（monotonic）
 
         # 统计（画面展示用）
         self.depress_count = 0       # 累计按下次数（=点击/拖拽次数）
@@ -76,22 +76,25 @@ class DepthClickDetector:
         self.last_release_time = None
 
     # ---------------------- 外部主接口 ----------------------
-    def update(self, palm_pixel_width: float | None) -> int:
+    def update(self, palm_pixel_width: float | None, dt: float = 0.0, now: float = -1.0) -> int:
         """每帧调用一次，返回本帧事件 E.{NONE,DEPRESS,RELEASE,DRAG_MOVE}。
 
         Args:
             palm_pixel_width: 主控手 掌宽(像素)，无手时传 None
+            dt: 距上一帧墙钟秒数（防误触用）
+            now: 当前墙钟时间（time.monotonic），<0 表示函数内自取
         Returns:
             int: 本帧事件
         """
         self.event_this_frame = E.NONE
+        if now < 0.0:
+            now = time.monotonic()
 
-        # ---- 冷却状态优先处理 ----
+        # ---- 冷却状态优先处理（墙钟秒） ----
         if self.state == _S.COOLDOWN:
-            self._cooldown_frames -= 1
-            if self._cooldown_frames <= 0:
+            if now >= self._cooldown_until:
                 self.state = _S.IDLE
-                self._armed_frames = 0
+                self._armed_sec = 0.0
             # 冷却中忽略任何输入
             self._update_baseline(palm_pixel_width, can_update=False)  # 仅平滑，但不更新基线
             return E.NONE
@@ -102,10 +105,10 @@ class DepthClickDetector:
                 # 如果之前是按下态，手突然丢了 → 自动释放
                 self.event_this_frame = E.RELEASE
                 self.last_release_time = time.time()
-                self._enter_cooldown()
+                self._enter_cooldown(now)
             else:
                 self.state = _S.IDLE
-                self._armed_frames = 0
+                self._armed_sec = 0.0
                 self._smoothed_palm = None
             return self.event_this_frame
 
@@ -130,21 +133,21 @@ class DepthClickDetector:
             self._update_baseline(self._smoothed_palm, can_update=True)
             if ratio >= ENTER_RATIO:
                 self.state = _S.ARMED
-                self._armed_frames = 1
+                self._armed_sec = 0.0
 
         elif self.state == _S.ARMED:
             # 冻结基线（进入后不再自适应，保证判定稳定）
             if ratio >= ENTER_RATIO:
-                self._armed_frames += 1
-                if self._armed_frames >= MIN_HOLD_FRAMES:
+                self._armed_sec += float(dt)
+                if self._armed_sec >= MIN_HOLD_SEC:
                     self.state = _S.PUSH_DOWN
                     self.event_this_frame = E.DEPRESS
                     self.depress_count += 1
                     self.last_press_time = time.time()
             else:
-                # 还没积累够就退了 → 回IDLE
+                # 还没保持够就退了 → 回IDLE
                 self.state = _S.IDLE
-                self._armed_frames = 0
+                self._armed_sec = 0.0
 
         elif self.state == _S.PUSH_DOWN:
             # PUSH_DOWN 是单帧触发态，之后立刻进入 HOLD
@@ -152,16 +155,16 @@ class DepthClickDetector:
                 self.state = _S.HOLD
                 self.event_this_frame = E.DRAG_MOVE
             else:
-                # 极短按下立刻松开（< 2帧）→ 也算一次完整 click = depress + release
+                # 极短按下立刻松开（< MIN_HOLD_SEC）→ 也算一次完整 click = depress + release
                 self.event_this_frame = E.RELEASE
                 self.last_release_time = time.time()
-                self._enter_cooldown()
+                self._enter_cooldown(now)
 
         elif self.state == _S.HOLD:
             if ratio <= EXIT_RATIO:
                 self.event_this_frame = E.RELEASE
                 self.last_release_time = time.time()
-                self._enter_cooldown()
+                self._enter_cooldown(now)
             else:
                 self.event_this_frame = E.DRAG_MOVE
 
@@ -178,10 +181,10 @@ class DepthClickDetector:
             + (1.0 - BASELINE_ALPHA_IDLE) * self._baseline
         )
 
-    def _enter_cooldown(self):
+    def _enter_cooldown(self, now: float):
         self.state = _S.COOLDOWN
-        self._cooldown_frames = COOLDOWN_FRAMES
-        self._armed_frames = 0
+        self._cooldown_until = float(now) + COOLDOWN_SEC
+        self._armed_sec = 0.0
 
     # ---------------------- 状态查询（画面展示）----------------------
     @property
@@ -191,6 +194,13 @@ class DepthClickDetector:
             return 1.0
         return self._smoothed_palm / max(self._baseline, 1e-6)
 
+    @property
+    def cooldown_left_sec(self) -> float:
+        """冷却剩余秒数（COOLDOWN 态以外返回 0）"""
+        if self.state != _S.COOLDOWN:
+            return 0.0
+        return max(0.0, self._cooldown_until - time.monotonic())
+
     def metrics(self) -> dict:
         return {
             "state": self.state,
@@ -198,6 +208,6 @@ class DepthClickDetector:
             "smoothed_palm_px": round(self._smoothed_palm or 0.0, 1),
             "baseline_px":     round(self._baseline     or 0.0, 1),
             "ratio":           round(self.ratio_now, 3),
-            "cooldown_left":   max(0, self._cooldown_frames),
+            "cooldown_left_sec": round(self.cooldown_left_sec, 2),
             "depress_count":   self.depress_count,
         }

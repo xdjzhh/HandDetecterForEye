@@ -44,7 +44,9 @@ class HandDetector:
 
     输出约定（两种模式共用）:
         hands_data[i] = {
-            "label":    "Left" | "Right",   # MP 原始标签（调用端再反转为用户视角）
+            "label":    "Left" | "Right",   # MP 原始标签（假定输入为镜像自拍图）；
+                                            # 同视角不镜像，由 hands_tasks.run_loop 检测出口
+                                            # 统一交换，交换后 "Left"=用户右手=控鼠手
             "landmarks": list[_LmLike],     # 21 个点，每个支持 .x/.y/.z ∈ [0,1]（归一化图像坐标）
             "world_landmarks": list[_LmLike] | None,
             #                       21 个点，.x/.y/.z 单位【米】，原点在腕部（身体坐标系，与视角无关）
@@ -117,14 +119,24 @@ class HandDetector:
 
         Args:
             lms: list[NormalizedLandmark|_LmWrapper]，21 个关键点
-            mode: "palm" = (WRIST_0 + MIDDLE_MCP_9)/2，掌心锚点，食指屈伸不飘；
-                  "index_tip" = INDEX_FINGER_TIP_8，原食指指尖锚点（兼容）
+            mode: "mcp" = 四指根 MCP(5,9,13,17) 质心【同视角默认】——手腕出画面不漂、
+                            勾按/握拳时掌骨关节位置不变（满足"点击只动手指、光标不漂"）；
+                  "palm" = (WRIST_0 + MIDDLE_MCP_9)/2，掌心锚点（面对面视角旧默认，保留可回退）；
+                  "index_tip" = INDEX_FINGER_TIP_8，原食指指尖锚点（兼容；勾按时会跟着动）
         Returns:
             (x_norm, y_norm) 在 0~1 内
         """
         if mode == "index_tip":
             return float(lms[8].x), float(lms[8].y)
-        # 默认 palm：掌心（腕部 0 + 中指掌指关节 9 的中点，业界标准）
+        if mode == "mcp":
+            # ⭐ 2026-10-01 同视角锚点：四个掌指关节质心。
+            #   同视角手从画面下方伸入、手腕常被截断（#0 会被模型"猜"出来→漂移）；
+            #   MCP 是掌骨/指骨铰接点，勾按与握拳时其位置基本不动，四点平均还抗单点遮挡。
+            return (float(lms[5].x) + float(lms[9].x)
+                    + float(lms[13].x) + float(lms[17].x)) * 0.25, \
+                   (float(lms[5].y) + float(lms[9].y)
+                    + float(lms[13].y) + float(lms[17].y)) * 0.25
+        # palm：掌心（腕部 0 + 中指掌指关节 9 的中点，业界标准）
         return (float(lms[0].x) + float(lms[9].x)) * 0.5, \
                (float(lms[0].y) + float(lms[9].y)) * 0.5
 

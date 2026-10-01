@@ -17,14 +17,14 @@ import pyautogui
                         TAP/PINCH/PEACE 前 → 锁定位置 3 帧，防止点击瞬间抖动漂移
 
 同时保留：
-  - 手势防抖 HOLD_FRAMES
+  - 手势防抖 HOLD_SEC
   - 边缘死区（通过 ROI_SCALE 实现的可调节中心裁剪）
   - 点击稳定：食指 Tap-Click（仅手指屈伸，不依赖手掌整体运动）
 """
 
 # ---------------- 防抖参数 ----------------
-# HOLD_FRAMES：用户要求恢复原设计=4帧（点击类手势保持确认）
-HOLD_FRAMES = 4
+# HOLD_SEC：用户要求的长按确认时长（墙钟秒，原 4 帧 @30fps≈0.13s，物理时长不再随帧率漂移）
+HOLD_SEC = 0.133
 # 画面 → 屏幕 的"中心 ROI 裁剪缩放比"（用户可调参数）：
 #   1.0 = 画面 100% 映射全屏（=旧 EDGE_MARGIN=0）
 #   0.85 = 画面中心 85% 的矩形区域 映射 全屏（推荐默认）
@@ -93,8 +93,8 @@ MODE_PARAMS = {
 }
 DEFAULT_PARAMS = MODE_PARAMS["OTHER"]
 # 4) Sigmoid 响应：已通过 response_k (上) 控制，见 ARSmoother._sigmoid_gain
-# 5) 点击前位置锁定帧数（防点击瞬间抖动漂移）
-CLICK_FREEZE_FRAMES = 3
+# 5) 点击前位置锁定墙钟时长（防点击瞬间抖动漂移；原 3 帧 @30fps）
+CLICK_FREEZE_SEC = 0.10
 
 # cursor 模式
 CURSOR_MODE_SMOOTH   = "smooth"    # 当前 AR 5 层平滑（悬停稳、但有滞后）
@@ -237,10 +237,10 @@ class ARSmoother:
         self._locked_x: float | None = None
         self._locked_y: float | None = None
         self._last_params = DEFAULT_PARAMS
-        # 点击前冻结（两种模式都生效）
+        # 点击前冻结（两种模式都生效；墙钟截止时刻 monotonic）
         self._freeze_x: float | None = None
         self._freeze_y: float | None = None
-        self._freeze_left = 0
+        self._freeze_until: float = 0.0
         self._last_out_x = None
         self._last_out_y = None
         # absolute 模式 Layer 1：3 帧中值杀尖峰
@@ -253,7 +253,7 @@ class ARSmoother:
         self._abs_locked_y: float | None = None   # 当前被锁死的固定光标 Y（None=未锁）
         self._abs_locked_ref_ax: float | None = None  # ⭐ 锁成立时 Layer1(ax) 参考值（用于解锁判定时比较手掌是否真的移动）
         self._abs_locked_ref_ay: float | None = None  # ⭐ 锁成立时 Layer1(ay) 参考值
-        self._abs_lock_cooldown: int = 0  # ⭐ 刚解锁后的冷却帧数：此期间不允许重新锁死（防止解锁→重锁抖动）
+        self._abs_lock_cooldown_until: float = 0.0  # ⭐ 刚解锁后的冷却截止墙钟：此之前不允许重新锁死（防止解锁-重锁抖动）
 
     # ---------- 外部：模式切换 ----------
     def set_mode(self, mode: str):
@@ -277,11 +277,11 @@ class ARSmoother:
 
     # ---------- 外部：点击前冻结 ----------
     def freeze_for_click(self):
-        """在检测到 TAP/PINCH/PEACE 即将触发点击时调用，锁定位置 N 帧。"""
-        if self._last_out_x is not None and self._freeze_left <= 0:
+        """在检测到 TAP/PINCH/PEACE 即将触发点击时调用，锁定位置 CLICK_FREEZE_SEC 墙钟时长。"""
+        if self._last_out_x is not None:
             self._freeze_x = self._last_out_x
             self._freeze_y = self._last_out_y
-            self._freeze_left = CLICK_FREEZE_FRAMES
+            self._freeze_until = time.monotonic() + CLICK_FREEZE_SEC
 
     def reset(self):
         for b in (self._median_buf_x, self._median_buf_y,
@@ -294,7 +294,7 @@ class ARSmoother:
         self._locked_y = None
         self._last_out_x = None
         self._last_out_y = None
-        self._freeze_left = 0
+        self._freeze_until = 0.0
         self._freeze_x = None
         self._freeze_y = None
         # ✨✨ absolute 模式 Layer 3 锁状态清空
@@ -302,7 +302,7 @@ class ARSmoother:
         self._abs_locked_y = None
         self._abs_locked_ref_ax = None
         self._abs_locked_ref_ay = None
-        self._abs_lock_cooldown = 0
+        self._abs_lock_cooldown_until = 0.0
 
     # ---------- 内部工具 ----------
     @staticmethod
@@ -344,9 +344,8 @@ class ARSmoother:
           - CURSOR_MODE_ABSOLUTE: 方案 A 3 层流水线 → 大范围跟手 + 小范围不晃
           - CURSOR_MODE_DIRECT  : ⭐ 严格跟随 UI 掌心绿圈（仅 3 帧中值杀飞点，无阻尼无锁）
         """
-        # 点击前冻结（三种模式都生效：点击瞬间锁死避免漂移）
-        if self._freeze_left > 0:
-            self._freeze_left -= 1
+        # 点击前冻结（三种模式都生效：墙钟时间未到则继续冻结）
+        if time.monotonic() < self._freeze_until:
             fx, fy = self._freeze_x, self._freeze_y
             self._last_out_x = fx
             self._last_out_y = fy
@@ -425,13 +424,13 @@ class ARSmoother:
             #     ③ UNLOCK_DIST 累计阈值从 2.0×降到 1.5×（更灵敏解锁）
             # ============================================================
             UNLOCK_DIST = float(ABS_LOCK_THRESH) * 1.6   # 8.0px
-            RELOCK_COOLDOWN_FRAMES = ABS_LOCK_WINDOW * 2  # ⭐ 解锁后 10 帧内不允许重锁（防止缓慢移动时解锁-重锁抖动）
+            RELOCK_COOLDOWN_SEC = ABS_LOCK_WINDOW * 2 / 30.0  # ⭐ 解锁后的冷却墙钟时长（原 20 帧 @30fps≈0.67s）
+            now = time.monotonic()
             # ⭐ 用 Layer1 原始 ax/ay 送入锁判定缓冲（真实反映手掌有没有在动）
             self._abs_lock_buf_x.append(float(ax))
             self._abs_lock_buf_y.append(float(ay))
-            # 解锁冷却计数（每帧 -1，到 0 才允许再次锁死）
-            if self._abs_lock_cooldown > 0:
-                self._abs_lock_cooldown -= 1
+            # 解锁冷却（墙钟未到则仍在冷却中）
+            in_relock_cooldown = now < self._abs_lock_cooldown_until
 
             buf_full = len(self._abs_lock_buf_x) >= ABS_LOCK_WINDOW and len(self._abs_lock_buf_y) >= ABS_LOCK_WINDOW
             # ① 已在锁死状态 → 先检查是否需要解锁（基于原始 Layer1 值判断手掌是否真动）
@@ -463,14 +462,14 @@ class ARSmoother:
                     self._abs_locked_y = None
                     self._abs_locked_ref_ax = None
                     self._abs_locked_ref_ay = None
-                    self._abs_lock_cooldown = RELOCK_COOLDOWN_FRAMES
+                    self._abs_lock_cooldown_until = now + RELOCK_COOLDOWN_SEC
                     self._abs_lock_buf_x.clear()
                     self._abs_lock_buf_y.clear()
                     self._abs_lock_buf_x.append(float(ax))
                     self._abs_lock_buf_y.append(float(ay))
                     buf_full = False
             # ② 未锁死 → 尝试满足「缓冲满 + 冷却已过 + Layer1 原始 σ < 阈值」→ 进入锁死
-            if buf_full and self._abs_locked_x is None and self._abs_lock_cooldown <= 0:
+            if buf_full and self._abs_locked_x is None and not in_relock_cooldown:
                 std_x = float(np.std(self._abs_lock_buf_x))
                 std_y = float(np.std(self._abs_lock_buf_y))
                 if std_x < ABS_LOCK_THRESH and std_y < ABS_LOCK_THRESH:
@@ -495,9 +494,8 @@ class ARSmoother:
             self.notify_gesture(gesture)
         fc_min, beta, deadzone_px, response_k = self._last_params
 
-        # -------- 点击冻结：优先返回冻结坐标 --------
-        if self._freeze_left > 0:
-            self._freeze_left -= 1
+        # -------- 点击冻结：优先返回冻结坐标（墙钟） --------
+        if time.monotonic() < self._freeze_until:
             ox, oy = float(self._freeze_x), float(self._freeze_y)
             self._last_out_x, self._last_out_y = ox, oy
             return ox, oy
@@ -830,9 +828,11 @@ class MouseController:
         self._cam_frame_h: int | None = None
         # AR 悬停 5 层平滑器（支持 smooth / absolute 两种 cursor 策略）
         self._smoother = ARSmoother(mode=cursor_mode)
-        # 防抖状态
+        # 防抖状态（墙钟秒：当前手势保持的累计时长）
         self._last_gesture = None
-        self._hold_frames = 0
+        self._hold_elapsed_sec = 0.0
+        self._last_handle_t: float = 0.0
+        self._gesture_consumed: bool = False   # 点击消费后抑制同手势再次触发（等手势切换才解除）
         # 拖拽状态
         self._drag_active = False
         # ⭐ 2026-08-22 新增：同帧共享"最新屏幕坐标缓存"
@@ -1078,8 +1078,8 @@ class MouseController:
         Args:
             gesture: 如 PEACE / PINCH / OPEN / POINT / FIST / ROCK / THUMB_UP / OTHER
             fingertip_norm: 手势识别用锚点（食指TIP 8，归一化 0~1），保留兼容旧调用
-            cursor_anchor_norm: 实际鼠标光标锚点，默认掌心 = (lms[0]+lms[9])/2。
-                                None 时回退用 fingertip_norm（兼容）。
+            cursor_anchor_norm: 实际鼠标光标锚点，由 --anchor 决定（默认 mcp=四指根 5/9/13/17 质心；
+                            palm=(lms[0]+lms[9])/2 为旧面对面锚点）；None 时回退用 fingertip_norm（兼容）。
         """
         anchor_norm = cursor_anchor_norm if cursor_anchor_norm is not None else fingertip_norm
         # 1. 坐标映射 + AR 5 层平滑
@@ -1087,21 +1087,27 @@ class MouseController:
         #      （否则：同一帧 move_only → handle → tap-click 三段各跑一次 smooth，缓冲/锁被更新 3 次 → 状态全乱）
         _, _, sx, sy, ix, iy = self._eval_anchor_once(anchor_norm, gesture_hint=gesture)
 
-        # 2. 防抖状态机
+        # 2. 防抖状态机（墙钟时长，与帧率无关）
+        now = time.monotonic()
         if gesture != self._last_gesture:
             self._last_gesture = gesture
-            self._hold_frames = 0
+            self._hold_elapsed_sec = 0.0
+            self._last_handle_t = now
+            self._gesture_consumed = False
             # ✨ 用户要求：FIST = 取消所有指令/无指令。手势切换到FIST时：
             #   - 不做任何 moveTo（哪怕 drag 没激活）
-            #   - 仅保留：若正在拖拽 → 稍后在 FIST 分支释放（这里先不 move，避免手势切换瞬间跳一下鼠标）
+            #   - 仅保留：若正在拖拽 → 稍后在 FIST 分支释放（这里先不 move，避免手势切换瞬间跳一下）
             if gesture != "FIST" and not self._drag_active:
                 pyautogui.moveTo(ix, iy)
             return
-        self._hold_frames += 1
+        # 累加本帧间隔（首次调用/手势刚切换时 dt≈0）
+        dt = max(0.0, now - self._last_handle_t)
+        self._last_handle_t = now
+        self._hold_elapsed_sec += dt
 
-        # 3. 移动类手势：未满 HOLD_FRAMES 也持续移动
+        # 3. 移动类手势：未满 HOLD_SEC 也持续移动
         # ✨ 2026-08-22 修复对齐问题：手掌倾斜/翻转时，MediaPipe 可能偶尔把 POINT/OPEN 误判成 ROCK/PINCH/PEACE/THUMB。
-        #   原代码只有 OPEN/POINT/OTHER 在稳定后才 moveTo，若手势"稳定落在"ROCK/PEACE/...（hold_frames >= N）则再也不 moveTo → 鼠标钉死，但 UI 绿圈继续移动 → 用户感知为"无规律卡顿"。
+        #   原代码只有 OPEN/POINT/OTHER 在稳定后才 moveTo，若手势"稳定落在"ROCK/PEACE/...（hold_elapsed_sec >= HOLD_SEC）则再也不 moveTo → 鼠标钉死，但 UI 绿圈继续移动 → 用户感知为"无规律卡顿"。
         #   修复原则：
         #     - 移动锚点永远 = cursor_anchor_norm（掌心），和预览画面绿圈画的坐标完全一致（Sigmoid+静止锁只负责平顺，不会改变锚点）
         #     - 手势 = 只是"是否能点击"的语义，不应该决定"鼠标移不移动"
@@ -1117,9 +1123,9 @@ class MouseController:
             pyautogui.moveTo(ix, iy)
             return
 
-        # 未满 HOLD_FRAMES 的点击类手势 → 仅移动
-        # ✨ 用户要求：FIST = 无指令 → 哪怕未满 HOLD_FRAMES（前 3 帧）也不移动（避免握拳时鼠标还漂一下）
-        if self._hold_frames < HOLD_FRAMES and gesture != "FIST":
+        # 未满 HOLD_SEC 的点击类手势 → 仅移动（已被 _consume_gesture 消费的手势不再触发）
+        # ✨ 用户要求：FIST = 无指令 → 哪怕未满 HOLD_SEC 也不移动（避免握拳时鼠标还漂一下）
+        if self._hold_elapsed_sec < HOLD_SEC and gesture != "FIST" and not self._gesture_consumed:
             pyautogui.moveTo(ix, iy)
             return
 
@@ -1147,16 +1153,17 @@ class MouseController:
                 pyautogui.mouseUp()
                 self._drag_active = False
             #   ② 不做 moveTo（握拳=鼠标不能动），不做任何点击/按下，完全空
-            #   ③ HOLD_FRAMES 满足进入也不触发任何事 = 纯空指令=取消/无操作
+            #   ③ HOLD_SEC 满足进入也不触发任何事 = 纯空指令取消/无操作
             pass
+
         # 兜底：其它未映射的新手势也移动一下
         else:
             pyautogui.moveTo(ix, iy)
 
     # ---------------- 辅助 ----------------
     def _consume_gesture(self):
-        """点击后重置计数，避免短时间内连发。"""
-        self._hold_frames = -99999  # 直到下一次手势切换前不再触发
+        """点击后抑制同一手势短时间内连发（直到手势切换才解除）。"""
+        self._gesture_consumed = True
 
     def reset(self):
         """强制释放拖拽并清空状态（画面失焦/退出时调用）。"""
@@ -1165,7 +1172,9 @@ class MouseController:
             self._drag_active = False
         self._sx = self._sy = None
         self._last_gesture = None
-        self._hold_frames = 0
+        self._hold_elapsed_sec = 0.0
+        self._last_handle_t = 0.0
+        self._gesture_consumed = False
 
     # ---------------- 深度戳点击事件接口（Push-Click via camera distance）----------------
     def handle_depth_event(self, depth_event: int, screen_pt):

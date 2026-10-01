@@ -138,8 +138,11 @@ class _MODE:
 class _MS:
     """移动窗口状态机（与_SCALE状态机独立，互斥切换）"""
     IDLE          = "IDLE"
-    MOVE_CONFIRM  = "MOVE_CONFIRM"   # 双手五指张开 确认帧
+    MOVE_CONFIRM  = "MOVE_CONFIRM"   # 双手五指张开 确认中
     MOVE_ACTIVE   = "MOVE_ACTIVE"    # 已选中掌心下的窗口 正在移动
+
+# 墙钟时长（time.monotonic 秒，2026-10-01 统一由帧计数改为秒，物理时长不再随帧率漂移）
+MOVE_CONFIRM_SEC  = 0.10   # 移动窗口确认（原 3 帧 @30fps）
 
 
 class _M:
@@ -171,7 +174,7 @@ class StretchInfo:
     diag_dist_px: float = 0.0         # 当前两掌心像素距离
     p1: Optional[Tuple[float, float]] = None  # 画面里两只掌心像素坐标（画连线/中心用）
     p2: Optional[Tuple[float, float]] = None
-    confirm_frames: int = 0
+    confirm_sec: float = 0.0           # 缩放确认累计秒数
     left_pinch_r: float = -1.0        # 左手捏合比（<0=未检测），‖TIP4-TIP8‖/palm_width，越小越紧
     right_pinch_r: float = -1.0       # 右手捏合比
     stretch_mode: str = _M.DIAGONAL   # ✨ 当前拉伸模式：水平/垂直/对角
@@ -183,7 +186,7 @@ class StretchInfo:
     ui_move_active: bool = False      # UI专用：双手+都OPEN五指张开=立刻True（提前显示移动连线，视觉先反馈）；单手+OPEN也立刻True
     move_state: str = _MS.IDLE        # 移动状态机当前状态：IDLE/MOVE_CONFIRM/MOVE_ACTIVE
     move_hwnd: int = 0                # 正在移动的窗口 HWND
-    move_confirm_frames: int = 0      # 移动确认帧进度
+    move_confirm_sec: float = 0.0     # 移动确认累计秒数
     move_window_rect: Optional[Tuple[int,int,int,int]] = None  # (left, top, right, bottom) 当前移动窗口的屏幕矩形
     move_delta_xy: Tuple[float, float] = (0.0, 0.0)           # 本次移动累计偏移 (Δx, Δy) 像素
     move_need_frame_redraw: bool = False  # UI：移动模式是否需要画提示卡片
@@ -194,21 +197,26 @@ class StretchInfo:
 # ============================================================
 class DiagonalStretchManager:
     # ✨✨ 稳定性常数（防止 ACTIVE 时单帧抖动导致"指令中断/重新识别"）：
-    #   LOST_MAX=4 帧 ≈ 30fps 下 133ms；既能覆盖 MediaPipe 偶发漏检 / OPEN-PINCH 单帧抖动，又能保证手势真正消失时及时退出
-    SCALE_LOST_MAX: int = 4   # SCALE_ACTIVE 下，连续多少帧不满足条件才真正退出到 IDLE（原：0 帧 → 一不满足立刻退）
-    MOVE_LOST_MAX:  int = 4   # MOVE_ACTIVE 下，连续多少帧不满足条件才真正退出到 IDLE
-    OPEN_STABLE_N:  int = 2   # OPEN/PINCH 手势判定的"稳定滞回帧"：连续 2 帧结果一致才切换，防单帧抖动
+    #   LOST=0.13s ≈ 4 帧 @30fps；既能覆盖 MediaPipe 偶发漏检 / OPEN-PINCH 单帧抖动，又能保证手势真正消失时及时退出
+    SCALE_LOST_MAX_SEC: float = 0.13  # SCALE_ACTIVE 下，连续多久不满足条件才真正退出到 IDLE
+    MOVE_LOST_MAX_SEC:  float = 0.13  # MOVE_ACTIVE 下，连续多久不满足条件才真正退出到 IDLE
+    # OPEN/PINCH 判定稳定（混合双条件：至少 N 个一致样本 AND 至少持续 N 秒，低帧率防单帧坏数据、高帧率不引入额外延迟）
+    OPEN_STABLE_N:   int   = 2
+    OPEN_STABLE_SEC:  float = 0.067
 
     def __init__(self, *,
-                 min_hold_frames: int = 8,
+                 min_hold_sec: float = 0.10,
                  min_diag_px: float = 120.0,  # ✨ 原 220 太严，降到 120（两手靠得稍近也能进入拉伸确认帧）
                  # ✨ 新增：双手捏合判定阈值（与 gesture_recognizer._pinch_distance 同尺度，‖TIP4-TIP8‖/palm_width）
                  #   注意：当前捏合判定已改为「非OPEN即捏合」，这里的 pinch_enter/hold 仅用于滞回（enter<=hold）兼容，实际阈值不影响判定结果
                  pinch_enter: float = 0.40,
                  pinch_hold:  float = 0.50,
-                 # 原平滑/窗口/灵敏度参数保持不变
-                 smooth_alpha: float = 0.75,
-                 max_step_per_frame: float = 0.18,
+                 # ✨ 2026-10-01 第二批墙钟化：以下两个参数改为"墙钟物理量"，低帧率不再失真
+                 #   smooth_tau_sec：EMA 时间常数（原 smooth_alpha=0.75 @30fps → τ=(1/30)/ln4≈0.024s）
+                 #     每帧 alpha = 1 - exp(-dt/τ)：30fps→0.75，10fps→0.984，120fps→0.293
+                 smooth_tau_sec: float = 0.024,
+                 # max_step_per_sec：缩放比例每秒最大变化量（原 0.18/帧 @30fps → 5.4/s），每帧限幅 = 该值×dt
+                 max_step_per_sec: float = 5.4,
                  min_win_w: int = 240, min_win_h: int = 160,
                  max_win_w: int = 5120, max_win_h: int = 2880,
                  sensitivity: float = 1.0,
@@ -217,23 +225,22 @@ class DiagonalStretchManager:
         self.info = StretchInfo()
 
         # 参数
-        self._default_min_hold_frames = int(max(1, min_hold_frames))  # 构造时的原始默认值（IDLE 时保持）
-        self.min_hold_frames          = self._default_min_hold_frames  # 运行时当前生效：双手出现→改为3，其余时间=默认
+        self.min_hold_sec   = max(0.0, float(min_hold_sec))   # 双手捏合确认墙钟时长
         self.min_diag_px        = float(max(60.0, min_diag_px))
         # 捏合阈值滞回约束：enter 必须 <= hold（经验 630282 阈值体系 enter < exit/hold 才稳定）
         if pinch_enter > pinch_hold:
             pinch_enter, pinch_hold = pinch_hold, pinch_enter
         self._pinch_enter = float(max(0.0, min(1.0, pinch_enter)))
         self._pinch_hold  = float(max(0.0, min(1.0, pinch_hold)))
-        self.smooth_alpha       = 0.2 if smooth_alpha < 0.2 else (1.0 if smooth_alpha > 1.0 else float(smooth_alpha))
-        self.max_step           = 0.01 if max_step_per_frame < 0.01 else (1.0 if max_step_per_frame > 1.0 else float(max_step_per_frame))
+        self.smooth_tau_sec   = max(1e-4, float(smooth_tau_sec))
+        self.max_step_per_sec  = max(0.01, float(max_step_per_sec))
         self.min_win_w, self.min_win_h = int(min_win_w), int(min_win_h)
         self.max_win_w, self.max_win_h = int(max_win_w), int(max_win_h)
         self.sensitivity        = 0.2 if sensitivity < 0.2 else (3.0 if sensitivity > 3.0 else float(sensitivity))
 
         # -------- ✨ 新增：移动窗口(MOVE)状态机（双手五指张开触发） --------
         self._move_state: str = _MS.IDLE
-        self._move_confirm: int = 0
+        self._move_confirm: float = 0.0   # 确认累计秒数
         self._move_hwnd: int = 0
         # 进入 MOVE_ACTIVE 瞬间的"参考手掌心屏幕坐标"（主手=左手=用户视角右手）
         self._move_ref_sx: float = 0.0
@@ -256,61 +263,64 @@ class DiagonalStretchManager:
         self._h0: float = 0.0
         self._smooth_ratio: float | None = None
         self._last_ratio: float = 1.0
-        self._confirm: int = 0
+        self._confirm: float = 0.0   # 捏合确认累计秒数
         self._left_pinch_prev: bool = False   # 上一帧左手是否处于捏合（用于滞回 hold 判定）
         self._right_pinch_prev: bool = False  # 上一帧右手是否处于捏合
 
         # ✨✨ 2026-08-13 新增：状态机抖动克星（解决用户「移动窗口到一半突然重新识别」）
-        self._scale_lost_frames: int = 0   # SCALE_ACTIVE 下：连续多少帧不满足条件（没检测到双手/距离太短/手势不对）
-        self._move_lost_frames:  int = 0   # MOVE_ACTIVE 下：连续多少帧不满足条件
-        # OPEN 手势判定的"稳定滞回缓存"：tag(手) → (稳定bool值, 连续相同计数)；连续 ≥ OPEN_STABLE_N=2 帧才切换 → 防单帧OPEN/PINCH抖动导致ACTIVE频繁退出
-        self._open_stable: dict[str, tuple[bool, int]] = {}
+        self._scale_lost_sec: float = 0.0   # SCALE_ACTIVE 下：连续多久不满足条件
+        self._move_lost_sec:  float = 0.0   # MOVE_ACTIVE 下：连续多久不满足条件
+        # OPEN 手势判定的"稳定滞回缓存"：
+        # tag(手) → (已提交输出, 候选新值, 候选样本数, 候选累计秒)；样本数+时长双条件才提交
+        self._open_stable: dict[str, tuple[bool, bool, int, float]] = {}
 
     # ------------------------------------------------------------
-    # ✨ 判定稳定滞回助手：对「手势 OPEN/PINCH」这类连续判定做"连续 N 帧一致才切换输出" → 彻底防单帧抖动
+    # ✨ 判定稳定滞回助手：对「手势 OPEN/PINCH」这类连续判定做"连续 N 个一致样本且持续 N 秒才切换输出" → 彻底防单帧抖动
     #   tag: 区分不同手/来源（"L"=左手 / "R"=右手 / "S"=单手）
     #   raw: 这一帧的原始判定结果（True/False）
-    #   return: 经过稳定化后的最终判定结果（不会一帧就变，必须连续 OPEN_STABLE_N 帧相同才切换）
+    #   return: 经过稳定化后的最终判定结果（不会一帧就变，必须样本数+时长双满足）
     # ------------------------------------------------------------
-    def _stabilize_bool(self, tag: str, raw: bool) -> bool:
+    def _stabilize_bool(self, tag: str, raw: bool, dt: float = 0.0) -> bool:
         try:
-            N = int(max(1, DiagonalStretchManager.OPEN_STABLE_N))
-            cur, cnt = self._open_stable.get(tag, (bool(raw), 0))
+            N   = int(max(1, DiagonalStretchManager.OPEN_STABLE_N))
+            SEC = float(max(0.0, DiagonalStretchManager.OPEN_STABLE_SEC))
+            cur, pend_v, pend_n, pend_sec = self._open_stable.get(
+                tag, (bool(raw), bool(raw), 0, 0.0))
             if bool(raw) == bool(cur):
-                cnt = int(cnt) + 1
-                self._open_stable[tag] = (bool(cur), int(cnt))
+                # 与已提交输出一致：清候选，输出不变
+                self._open_stable[tag] = (bool(cur), bool(cur), 0, 0.0)
                 return bool(cur)
-            # 不一样：开始攒新结果
-            if int(cnt) >= 1:   # 上一个结果至少连续过 1 帧 → 现在要切，开始计数
-                new_cnt = 1
+            # 与输出相反：累计候选（同值续计，异值重开）
+            if int(pend_n) > 0 and bool(pend_v) == bool(raw):
+                pend_n, pend_sec = int(pend_n) + 1, float(pend_sec) + float(dt)
             else:
-                new_cnt = 1
-            self._open_stable[tag] = (bool(raw), int(new_cnt))
-            # 只有连续 ≥ N 帧相同才切换
-            if int(new_cnt) >= N:
+                pend_n, pend_sec = 1, float(dt)
+            if pend_n >= N and pend_sec >= SEC:
+                # 样本数与时长双满足 → 提交翻转
+                self._open_stable[tag] = (bool(raw), bool(raw), 0, 0.0)
                 return bool(raw)
-            # 不够 N 帧 → 仍然保持旧输出（不切换！这就是防抖的关键）
+            self._open_stable[tag] = (bool(cur), bool(raw), pend_n, pend_sec)
             return bool(cur)
         except Exception:
             # 任意异常 → 直接返回原始结果（保证不会因为稳定器崩导致手势不可用）
             return bool(raw)
 
     # ------------------------------------------------------------
-    # ✨ 工具：ACTIV→LOST 容忍帧检测（MOVE/SCALE 共用逻辑）
-    #   作用：当 状态机=ACTIVE 且"当前帧条件不满足"时，不立刻reset，先记 lost 帧；达到 MAX 才真的 reset
+    # ✨ 工具：ACTIVE→LOST 容忍墙钟检测（MOVE/SCALE 共用逻辑）
+    #   作用：当 状态机=ACTIVE 且"当前帧条件不满足"时，不立刻reset，先累计 lost 秒；到 MAX 才真的 reset
     #   返回：True=已经被容忍（不要reset继续保持ACTIVE）；False=忍无可忍必须reset
     # ------------------------------------------------------------
-    def _try_tolerate_lost_scale(self) -> bool:
+    def _try_tolerate_lost_scale(self, dt: float = 0.0) -> bool:
         """SCALE_ACTIVE 用：返回 True=已容忍，保持 ACTIVE（不要 reset）"""
-        self._scale_lost_frames = int(self._scale_lost_frames) + 1
-        if int(self._scale_lost_frames) < int(DiagonalStretchManager.SCALE_LOST_MAX):
+        self._scale_lost_sec = float(self._scale_lost_sec) + float(dt)
+        if self._scale_lost_sec < float(DiagonalStretchManager.SCALE_LOST_MAX_SEC):
             return True
         return False
 
-    def _try_tolerate_lost_move(self) -> bool:
+    def _try_tolerate_lost_move(self, dt: float = 0.0) -> bool:
         """MOVE_ACTIVE 用：返回 True=已容忍，保持 ACTIVE（不要 reset）"""
-        self._move_lost_frames = int(self._move_lost_frames) + 1
-        if int(self._move_lost_frames) < int(DiagonalStretchManager.MOVE_LOST_MAX):
+        self._move_lost_sec = float(self._move_lost_sec) + float(dt)
+        if self._move_lost_sec < float(DiagonalStretchManager.MOVE_LOST_MAX_SEC):
             return True
         return False
 
@@ -516,18 +526,19 @@ class DiagonalStretchManager:
                left_lms=None,
                right_lms=None,
                left_palm_screen_xy: Optional[Tuple[float, float]] = None,
-               right_palm_screen_xy: Optional[Tuple[float, float]] = None
+               right_palm_screen_xy: Optional[Tuple[float, float]] = None,
+               dt: float = 0.0,
                ) -> StretchInfo:
         W, H = int(frame_size[0]), int(frame_size[1])
         info = self.info
         info.state = self.state
-        info.confirm_frames = self._confirm
+        info.confirm_sec = self._confirm
         info.left_pinch_r = -1.0
         info.right_pinch_r = -1.0
         info.stretch_mode = self._stretch_mode
         info.move_state = self._move_state
         info.move_hwnd = self._move_hwnd
-        info.move_confirm_frames = self._move_confirm
+        info.move_confirm_sec = self._move_confirm
 
         # ✨ 需求2：所有缩放锚点 → 不再用掌心，统一用「拇食重合点」= TIP4(4)+TIP8(8) 中点
         #   先用 lms 算捏合锚点；拿不到（lms缺失/异常）才 fallback 传进来的掌心像素。
@@ -573,10 +584,10 @@ class DiagonalStretchManager:
             move_keep  = False
             # ① SCALE_ACTIVE：先容忍（8 帧内回来就能无缝续上）
             if self.state == _S.SCALING:
-                scale_keep = bool(self._try_tolerate_lost_scale())
+                scale_keep = bool(self._try_tolerate_lost_scale(dt))
             # ② MOVE_ACTIVE：先容忍
             if self._move_state == _MS.MOVE_ACTIVE:
-                move_keep = bool(self._try_tolerate_lost_move())
+                move_keep = bool(self._try_tolerate_lost_move(dt))
             # 两边都在 ACTIVE+容忍中 → 不 reset，保持状态（UI/快照/锚点都保留，等手回来）
             if scale_keep or move_keep:
                 info.ui_pinch_active = bool(self.state == _S.SCALING)   # 继续按原状态画 UI
@@ -607,13 +618,13 @@ class DiagonalStretchManager:
         # ============================================================
         if single_ready and not both_hands_ready:
             s_open_raw = bool(DiagonalStretchManager._is_open_palm(single_lms))
-            s_open = bool(self._stabilize_bool("S", s_open_raw))   # ✨ OPEN/PINCH 稳定化（连续 2 帧一致才切换）
+            s_open = bool(self._stabilize_bool("S", s_open_raw, dt))   # ✨ OPEN/PINCH 稳定化（样本数+时长双条件）
             # ✅ 单手 OPEN → 进入 MOVE（SINGLE）模式；其他单手姿态（非OPEN=捏合/POINT/握拳）→ 都不触发 SINGLE MOVE（让单手控鼠点击正常工作）
             if not s_open:
                 info.hands_mode = "SINGLE"
                 # ✨ 关键：如果当前已是 MOVE_ACTIVE → 先容忍（等 8 帧再退），避免"单帧 OPEN/PINCH 抖一下就中断移动"
                 if self._move_state == _MS.MOVE_ACTIVE:
-                    move_keep = bool(self._try_tolerate_lost_move())
+                    move_keep = bool(self._try_tolerate_lost_move(dt))
                     if move_keep:
                         info.ui_move_active = True
                         info.ui_pinch_active = False
@@ -622,8 +633,8 @@ class DiagonalStretchManager:
                         info.need_frame_redraw = False
                         info.move_state = str(self._move_state)
                         info.state = _S.IDLE
-                        info.move_delta_xy = (0.0, 0.0)   # 容忍期：不动窗口（等手势回来再继续原来的偏移）
-                        info.move_confirm_frames = 3
+                        info.move_delta_xy = (0.0, 0.0)   # 容忍期内：不动窗口（等手势回来再继续原来的偏移）
+                        info.move_confirm_sec = MOVE_CONFIRM_SEC
                         return info
                 # 不在 MOVE_ACTIVE（或容忍超时）→ 回 IDLE（让正常单手控鼠）
                 info.ui_pinch_active = False
@@ -639,7 +650,7 @@ class DiagonalStretchManager:
                 return info
             # ===== SINGLE + OPEN = SINGLE MOVE 进入状态机 =====
             # ✨ 手势重新满足了（回来了/稳定住了）→ 清 move lost 计数（后面会正常更新窗口位置，无缝继续原来的偏移）
-            self._move_lost_frames = 0
+            self._move_lost_sec = 0.0
             info.mode = _MODE.MOVE
             info.hands_mode = "SINGLE"
             info.ui_move_active = True   # 🔴 单手+OPEN立刻显示MOVE UI（和双手MOVE同样的预判定体验）
@@ -659,6 +670,7 @@ class DiagonalStretchManager:
                 single_px_xy=single_px_xy,
                 single_screen_xy=single_screen_xy,
                 single_is_left=single_is_left,
+                dt=dt,
             )
 
         # ============================================================
@@ -671,8 +683,8 @@ class DiagonalStretchManager:
         # ✨✨ OPEN/PINCH 稳定化：连续 2 帧一致才切换输出（_stabilize_bool），从源头消除单帧抖动导致 ACTIVE 误退出
         left_open_raw  = bool(DiagonalStretchManager._is_open_palm(left_lms))
         right_open_raw = bool(DiagonalStretchManager._is_open_palm(right_lms))
-        left_open  = bool(self._stabilize_bool("L", left_open_raw))
-        right_open = bool(self._stabilize_bool("R", right_open_raw))
+        left_open  = bool(self._stabilize_bool("L", left_open_raw, dt))
+        right_open = bool(self._stabilize_bool("R", right_open_raw, dt))
 
         # ---------- SCALE 模式：双手捏合判定（非OPEN=捏合） ✨ 传 force_open=稳定后的left_open/right_open → 保证 pinch/open 结果 100% 一致 ----------
         left_pinch,  left_r  = self._hand_pinch(left_lms,  self._pinch_enter, self._pinch_hold, self._left_pinch_prev,  force_open=left_open)
@@ -697,9 +709,9 @@ class DiagonalStretchManager:
             scale_keep = False
             move_keep  = False
             if self.state == _S.SCALING:
-                scale_keep = bool(self._try_tolerate_lost_scale())
+                scale_keep = bool(self._try_tolerate_lost_scale(dt))
             if self._move_state == _MS.MOVE_ACTIVE:
-                move_keep = bool(self._try_tolerate_lost_move())
+                move_keep = bool(self._try_tolerate_lost_move(dt))
             if scale_keep or move_keep:
                 info.ui_pinch_active = bool(self.state == _S.SCALING)
                 info.ui_move_active  = bool(self._move_state == _MS.MOVE_ACTIVE)
@@ -726,8 +738,8 @@ class DiagonalStretchManager:
         # ============================================================
         if both_open:
             # ✨ 手势稳定匹配了 → 清 lost 计数（之前的容忍期作废，全新无缝继续）
-            self._move_lost_frames = 0
-            self._scale_lost_frames = 0
+            self._move_lost_sec = 0.0
+            self._scale_lost_sec = 0.0
             info.mode = _MODE.MOVE
             info.hands_mode = "DUAL"
             info.need_frame_redraw = False  # SCALE 分支 UI 关
@@ -741,14 +753,15 @@ class DiagonalStretchManager:
                 single_px_xy=None,
                 single_screen_xy=None,
                 single_is_left=True,
+                dt=dt,
             )
 
         # ============================================================
         # 🔀 模式互斥分支二：双手都非OPEN(都捏合) → 拉伸缩放 SCALE 状态机（原逻辑）
         # ============================================================
         # ✨ 手势稳定匹配了 → 清 scale lost 计数（之前容忍期作废，无缝续上原来的比例/锚点）
-        self._scale_lost_frames = 0
-        self._move_lost_frames = 0
+        self._scale_lost_sec = 0.0
+        self._move_lost_sec = 0.0
         info.mode = _MODE.SCALE
         info.move_need_frame_redraw = False
         self._reset_move_to_idle()   # 互斥：走 SCALE 时 MOVE 状态机必须 IDLE
@@ -764,7 +777,7 @@ class DiagonalStretchManager:
         if d1 < self.min_diag_px:
             # ✨ SCALING ACTIVE 时先容忍：手瞬时靠近（抖动）→ 先等 8 帧，不立刻退（避免一帧就近了就中断缩放）
             if self.state == _S.SCALING:
-                keep = bool(self._try_tolerate_lost_scale())
+                keep = bool(self._try_tolerate_lost_scale(dt))
                 if keep:
                     info.ui_pinch_active = True
                     info.need_frame_redraw = True
@@ -780,19 +793,18 @@ class DiagonalStretchManager:
         # ---------- IDLE → 计数确认 ----------
         if self.state == _S.IDLE:
             self.state = _S.ARMED_CONFIRM
-            # ✨ 用户要求：双手出现即意味不是放大缩小就是移动窗口，因此确认帧从默认降到 3 帧
-            self.min_hold_frames = 3
-            self._confirm = 1
+            # 双手出现即确认（0.10s 墙钟时长，物理手感不再随帧率漂移）
+            self._confirm = 0.0
             info.state = _S.ARMED_CONFIRM
-            info.confirm_frames = 1
+            info.confirm_sec = 0.0
             info.need_frame_redraw = True
             return info
 
-        # ---------- ARMED_CONFIRM → 累计确认帧，达标则记录初始快照 → 切 SCALING ----------
+        # ---------- ARMED_CONFIRM → 累计确认时长，达标则记录初始快照 → 切 SCALING ----------
         if self.state == _S.ARMED_CONFIRM:
-            self._confirm += 1
-            info.confirm_frames = self._confirm
-            if self._confirm >= self.min_hold_frames:
+            self._confirm += float(dt)
+            info.confirm_sec = self._confirm
+            if self._confirm >= self.min_hold_sec:
                 # 拿当前前台窗口 HWND + 初始 rect
                 hwnd = int(GetForegroundWindow() or 0)
                 rc = RECT()
@@ -866,17 +878,22 @@ class DiagonalStretchManager:
                 raw = d1 / self._d0
             # 2) 灵敏度（非线性，sensitivity=2=更灵敏，0.5=更迟钝）
             raw_pow = math.pow(raw, self.sensitivity)
-            # 3) EMA 平滑（消除 MediaPipe 单手尖峰）
+            # 3) EMA 平滑（消除 MediaPipe 单手尖峰）—— ✨ 墙钟化：alpha 由 dt 与时间常数换算
             if self._smooth_ratio is None:
                 self._smooth_ratio = raw_pow
             else:
+                # dt≤0（首帧/异常）回退按 30fps 一帧；dt>0.5s 视为重入，直接用原值
+                _dt_eff = dt if 0.0 < dt <= 0.5 else 1.0 / 30.0
+                _alpha = 1.0 - math.exp(-_dt_eff / self.smooth_tau_sec)
                 self._smooth_ratio = (
-                    self.smooth_alpha * raw_pow
-                    + (1.0 - self.smooth_alpha) * self._smooth_ratio
+                    _alpha * raw_pow
+                    + (1.0 - _alpha) * self._smooth_ratio
                 )
             # 4) 单帧限幅：防止一帧 d 突然跳 2 倍 → 窗口直接拉爆
-            lo = self._last_ratio - self.max_step
-            hi = self._last_ratio + self.max_step
+            #    ✨ 墙钟化：每秒最大变化量 × dt（dt≤0 回退 30fps 一帧）
+            _max_step = self.max_step_per_sec * _dt_eff
+            lo = self._last_ratio - _max_step
+            hi = self._last_ratio + _max_step
             clamped = lo if self._smooth_ratio < lo else (hi if self._smooth_ratio > hi else self._smooth_ratio)
             # 5) 根据主导模式决定目标 w / h（关键分岔点）
             w0, h0 = self._w0, self._h0
@@ -959,6 +976,7 @@ class DiagonalStretchManager:
                                 single_px_xy=None,
                                 single_screen_xy=None,
                                 single_is_left: bool = True,
+                                dt: float = 0.0,
                                 ) -> StretchInfo:
         # ---------- 主手掌心屏幕坐标 & 画面像素坐标：根据 SINGLE/DUAL 选择 ----------
         if hands_mode == "SINGLE":
@@ -971,17 +989,17 @@ class DiagonalStretchManager:
         # ---------- IDLE → 进入确认帧 ----------
         if self._move_state == _MS.IDLE:
             self._move_state = _MS.MOVE_CONFIRM
-            self._move_confirm = 1
+            self._move_confirm = 0.0
             info.move_state = _MS.MOVE_CONFIRM
-            info.move_confirm_frames = 1
+            info.move_confirm_sec = 0.0
             info.move_need_frame_redraw = True
             return info
 
-        # ---------- MOVE_CONFIRM → 累计 3 帧，达标进入 MOVE_ACTIVE ----------
+        # ---------- MOVE_CONFIRM → 累计确认时长，达标进入 MOVE_ACTIVE ----------
         if self._move_state == _MS.MOVE_CONFIRM:
-            self._move_confirm += 1
-            info.move_confirm_frames = self._move_confirm
-            if self._move_confirm >= 3:   # ✨ 单手/双手出现=必然要动作，确认帧少
+            self._move_confirm += float(dt)
+            info.move_confirm_sec = self._move_confirm
+            if self._move_confirm >= MOVE_CONFIRM_SEC:   # ✨ 单手/双手出现=必然要动作，确认墙钟时长
                 # ① 取主手掌心屏幕坐标 → 找该点下的窗口
                 hwnd = 0
                 hwnd_hit = 0
@@ -1100,7 +1118,7 @@ class DiagonalStretchManager:
     def _reset_move_to_idle(self):
         if self._move_state != _MS.IDLE:
             self._move_state = _MS.IDLE
-        self._move_confirm = 0
+        self._move_confirm = 0.0
         self._move_hwnd = 0
         self._move_ref_sx = 0.0
         self._move_ref_sy = 0.0
@@ -1108,27 +1126,25 @@ class DiagonalStretchManager:
         self._move_top0 = 0.0
         self._move_w0 = 0.0
         self._move_h0 = 0.0
-        self._move_lost_frames = 0   # ✨ 重置时清 lost 计数
+        self._move_lost_sec = 0.0   # ✨ 重置时清 lost 计时
 
-    # ---------- 工具：回到 IDLE（清所有快照 + 恢复 min_hold_frames 默认值 + 清空捏合滞回状态 + 清空拉伸模式） ----------
+    # ---------- 工具：回到 IDLE（清所有快照 + 清空捏合滞回状态 + 清空拉伸模式） ----------
     def _reset_to_idle(self):
         if self.state != _S.IDLE:
             self.state = _S.IDLE
-        # ✨ 离开缩放/确认态时恢复默认的 min_hold_frames，保证 IDLE/单手场景下仍遵循构造参数
-        self.min_hold_frames = self._default_min_hold_frames
         # ✨ 清空捏合滞回记忆：下次进重新按 enter 阈值严格判定
         self._left_pinch_prev  = False
         self._right_pinch_prev = False
-        # ✨ 清空拉伸模式/分量锚点：下次重新按进入瞬间判定
+        # ✨ 清空拉伸模式分量锚点：下次重新按进入瞬间判定
         self._dx0 = 0.0
         self._dy0 = 0.0
         self._stretch_mode = _M.DIAGONAL
-        self._confirm = 0
+        self._confirm = 0.0
         self._d0 = None
         self._hwnd = 0
         self._cx0 = self._cy0 = 0.0
         self._w0 = self._h0 = 0.0
         self._smooth_ratio = None
         self._last_ratio = 1.0
-        self._scale_lost_frames = 0   # ✨ 重置时清 lost 计数
+        self._scale_lost_sec = 0.0   # ✨ 重置时清 lost 计时
         self._open_stable.clear()      # ✨ 重置时清 OPEN 稳定缓存（下一轮从头开始攒）
