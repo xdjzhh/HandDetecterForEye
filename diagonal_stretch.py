@@ -190,6 +190,7 @@ class StretchInfo:
     move_window_rect: Optional[Tuple[int,int,int,int]] = None  # (left, top, right, bottom) 当前移动窗口的屏幕矩形
     move_delta_xy: Tuple[float, float] = (0.0, 0.0)           # 本次移动累计偏移 (Δx, Δy) 像素
     move_need_frame_redraw: bool = False  # UI：移动模式是否需要画提示卡片
+    cancel_fired: bool = False  # ✨ 本帧是否触发了"取消拉伸"（OK/握拳），保持当前大小直接回 IDLE（供主循环一次性提示）
 
 
 # ============================================================
@@ -203,6 +204,15 @@ class DiagonalStretchManager:
     # OPEN/PINCH 判定稳定（混合双条件：至少 N 个一致样本 AND 至少持续 N 秒，低帧率防单帧坏数据、高帧率不引入额外延迟）
     OPEN_STABLE_N:   int   = 2
     OPEN_STABLE_SEC:  float = 0.067
+    # ✨ 取消手势（OK/握拳）稳定：同样"样本数+持续秒"双条件，防止拉伸中误触即取消
+    CANCEL_STABLE_N:   int   = 2
+    CANCEL_STABLE_SEC: float = 0.07
+    # ✨ 握拳 vs 拇食指捏合的硬门：TIP8(食指尖) 到掌中心的 3D 距离 / 3D 掌宽(5→17)
+    #   握拳 = 食指卷进掌心（比值小）；捏合 = 食指尖在掌外空中对捏（比值大）。
+    #   实测标定（1400+ 帧双手数据）：干净握拳约 80% 帧 <1.0（主峰 0.4~0.9，稳定段持续 6s+），
+    #   捏合 100% 帧 >1.05（主峰 1.3~2.1）→ 阈值取两簇谷底 1.00。
+    #   只看食指 r_t8；拇指 r_t4 实测两种手势大面积重叠（0.9~1.4），不参与判定。
+    FIST_TIP_TO_PALM_MAX: float = 1.00
 
     def __init__(self, *,
                  min_hold_sec: float = 0.10,
@@ -273,6 +283,10 @@ class DiagonalStretchManager:
         # OPEN 手势判定的"稳定滞回缓存"：
         # tag(手) → (已提交输出, 候选新值, 候选样本数, 候选累计秒)；样本数+时长双条件才提交
         self._open_stable: dict[str, tuple[bool, bool, int, float]] = {}
+        # ✨ 取消手势（OK/握拳）确认门：与 OPEN 稳定门同构，只在 ARMED_CONFIRM/SCALING 下生效
+        self._cancel_candidate: Optional[str] = None   # 当前候选取消手势 "OK"/"FIST"
+        self._cancel_n: int = 0                        # 连续一致样本数
+        self._cancel_sec: float = 0.0                  # 连续累计墙钟秒
 
     # ------------------------------------------------------------
     # ✨ 判定稳定滞回助手：对「手势 OPEN/PINCH」这类连续判定做"连续 N 个一致样本且持续 N 秒才切换输出" → 彻底防单帧抖动
@@ -492,9 +506,74 @@ class DiagonalStretchManager:
 
 
     # ------------------------------------------------------------
+    # 静态辅助：3D 指尖-掌心距离判据（握拳 vs 拇食指捏合的核心区别）
+    #   wlms: MediaPipe world landmarks（≥21 点，带 .x/.y/.z）
+    #   返回 (r_t8, r_t4) = 食指尖/拇指尖 到四指 MCP 质心的 3D 距离 ÷ 3D 掌宽(5→17)
+    #   握拳：食指尖卷进掌心 → r_t8 小；捏合：食指尖在掌外空中 → r_t8 大。
+    #   判定只用 r_t8（拇指 r_t4 两种手势重叠，仅用于标定观察）
+    # ------------------------------------------------------------
+    @staticmethod
+    def _tip_to_palm_ratios(wlms) -> Optional[Tuple[float, float]]:
+        try:
+            if wlms is None or len(wlms) < 21:
+                return None
+            w = [np.array([float(p.x), float(p.y), float(p.z)], dtype=np.float64) for p in wlms]
+            palm_c = (w[5] + w[9] + w[13] + w[17]) * 0.25
+            denom = float(np.linalg.norm(w[5] - w[17]))
+            if denom < 1e-9:
+                return None
+            return (float(np.linalg.norm(w[8]  - palm_c) / denom),
+                    float(np.linalg.norm(w[4]  - palm_c) / denom))
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------
+    # 静态辅助：拉伸取消手势分类（只在 ARMED_CONFIRM/SCALING 下调用）
+    #   返回 "OK"  = 食指+拇指都伸直张开、其余三指（中/无名/小）至少 2 根弯曲（OK 手势）
+    #        "FIST" = 食指弯、其余三指至少 2 根弯，且 TIP8 卷进掌心（3D r_t8 距离门）
+    #                 —— 捏合时食指尖在掌外空中（实测 100% 帧 r_t8>1.05），门拦不住
+    #        None   = 其他（含拇食指捏合：食指弯+其余伸直；3D 数据缺失时回退纯角度判据）
+    # ------------------------------------------------------------
+    @staticmethod
+    def _classify_cancel(lms, wlms=None) -> Optional[str]:
+        if lms is None:
+            return None
+        try:
+            def P(i):
+                return np.array([lms[i].x, lms[i].y], dtype=np.float64)
+            def _bend(im, ip, it):
+                return DiagonalStretchManager._angle_deg(P(ip) - P(im), P(it) - P(ip))
+            b_idx   = _bend(5, 6, 8)
+            b_mid   = _bend(9, 10, 12)
+            b_ring  = _bend(13, 14, 16)
+            b_pinky = _bend(17, 18, 20)
+            b_thumb = _bend(1, 2, 4)
+            for v in (b_idx, b_mid, b_ring, b_pinky, b_thumb):
+                if not math.isfinite(v):
+                    return None
+            idx_straight   = b_idx   < 30.0
+            thumb_straight = b_thumb < 35.0   # 与 OPEN 判定的拇指 35° 阈值一致
+            others_curl = sum(not (b < 30.0) for b in (b_mid, b_ring, b_pinky))
+            if idx_straight and thumb_straight and others_curl >= 2:
+                return "OK"
+            if (not idx_straight) and others_curl >= 2:
+                # ✨ 硬门（标定阈值 1.00）：食指尖必须卷进掌心才算握拳；
+                # 捏合时食指尖在掌外空中（r_t8 实测全部 >1.05），只看食指 r_t8（拇指 r_t4 两种手势重叠）
+                ratios = DiagonalStretchManager._tip_to_palm_ratios(wlms)
+                if ratios is None:
+                    # world 缺失（老摄像头/异常遮挡）：回退旧的纯角度判据，保证不退化
+                    return "FIST"
+                r_t8, _r_t4 = ratios
+                if r_t8 < DiagonalStretchManager.FIST_TIP_TO_PALM_MAX:
+                    return "FIST"
+            return None
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------
     # 静态辅助：单手"捏合锚点"像素坐标 = 拇指TIP(4) + 食指TIP(8) 的几何中点（归一化坐标乘 W/H）
-    #   ✨ 需求：所有缩放/距离计算/连线/锚点 不再用掌心，统一用"拇食重合点"，跟用户实际捏合操作点严格同步
-    #   返回 None 代表 lms 缺失（fallback 到传入的掌心兜底）
+    #   仅用于 UI 捏合点显示，以及调用方未传入测距锚点时的兜底；
+    #   正式测距/连线锚点已改用调用方传入的 MCP 鼠标锚点（update 开头）
     # ------------------------------------------------------------
     @staticmethod
     def _pinch_anchor_px(lms, W: int, H: int) -> Optional[Tuple[float, float]]:
@@ -528,6 +607,9 @@ class DiagonalStretchManager:
                left_palm_screen_xy: Optional[Tuple[float, float]] = None,
                right_palm_screen_xy: Optional[Tuple[float, float]] = None,
                dt: float = 0.0,
+               # ✨ 3D world landmarks（带 .x/.y/.z 的 MediaPipe 对象，≥21 点）：用于区分握拳 vs 拇食指捏合
+               left_world_lms=None,
+               right_world_lms=None,
                ) -> StretchInfo:
         W, H = int(frame_size[0]), int(frame_size[1])
         info = self.info
@@ -539,14 +621,18 @@ class DiagonalStretchManager:
         info.move_state = self._move_state
         info.move_hwnd = self._move_hwnd
         info.move_confirm_sec = self._move_confirm
+        info.cancel_fired = False   # ✨ 每帧开头先复位，仅取消手势真正触发的那一帧为 True（供主循环一次性提示）
 
-        # ✨ 需求2：所有缩放锚点 → 不再用掌心，统一用「拇食重合点」= TIP4(4)+TIP8(8) 中点
-        #   先用 lms 算捏合锚点；拿不到（lms缺失/异常）才 fallback 传进来的掌心像素。
+        # ✨ 需求：缩放测距锚点 = 调用方传入的"鼠标锚点"（双手=四指 MCP 质心，与光标锚点同源），
+        #   握拳/捏合切换时 MCP 掌根几乎不动，比例基准稳定，不再用 TIP4+TIP8 捏点（指尖一弯就飞，窗口疯抖）
+        #   仅当调用方没给锚点时，才用捏合点兜底；SINGLE MOVE 也直接吃传入的 MCP 锚点
         pinch_left = self._pinch_anchor_px(left_lms, W, H)
         pinch_right = self._pinch_anchor_px(right_lms, W, H)
-        left_px_xy  = pinch_left  if pinch_left  is not None else left_px_xy
-        right_px_xy = pinch_right if pinch_right is not None else right_px_xy
-        info.p1 = left_px_xy   # UI 连线点也同步用捏合锚点（用户手在哪，圆圈就画在哪，不漂移）；SINGLE MOVE 下 p2=None
+        if left_px_xy is None:
+            left_px_xy = pinch_left
+        if right_px_xy is None:
+            right_px_xy = pinch_right
+        info.p1 = left_px_xy   # UI 连线点 = 实际测距锚点（双手=四指 MCP 质心，与鼠标锚点同源，捏合/握拳不漂移）；SINGLE MOVE 下 p2=None
         info.p2 = right_px_xy
 
         # ---------- 条件 0-①：两只手都就绪 → 进入"双手互斥"模式（SCALE缩放 / DUAL MOVE双手张开移动） ----------
@@ -702,6 +788,31 @@ class DiagonalStretchManager:
 
         info.ui_move_active  = both_open
         info.ui_pinch_active = both_pinched and not both_open   # 避免两者同时 True（理论上互斥）
+
+        # ✨✨ 取消手势（OK / 握拳）：双手同一手势、持续 N 样本+N 秒 → 终止本次拉伸，保持当前大小
+        #   仅在 ARMED_CONFIRM / SCALING 下生效（IDLE/MOVE 不响应）；必须放在 OPEN/PINCH 混合分支之前，
+        #   因为 OK(食指拇指张、其余卷) 和 FIST(全卷) 在旧分类里都算"非OPEN捏合"
+        if self.state in (_S.ARMED_CONFIRM, _S.SCALING):
+            cg_l = self._classify_cancel(left_lms, left_world_lms)
+            cg_r = self._classify_cancel(right_lms, right_world_lms)
+            cg = cg_l if (cg_l is not None and cg_l == cg_r) else None
+            if cg is not None:
+                if self._cancel_candidate == cg:
+                    self._cancel_n += 1
+                    self._cancel_sec += max(0.0, float(dt))
+                else:
+                    self._cancel_candidate, self._cancel_n, self._cancel_sec = cg, 1, max(0.0, float(dt))
+                if (self._cancel_n >= self.CANCEL_STABLE_N
+                            and self._cancel_sec >= self.CANCEL_STABLE_SEC):
+                        info.cancel_fired = True
+                        info.need_frame_redraw = True
+                        self._reset_to_idle()   # 不还原窗口：reset 只清内部状态，当前窗口大小原样保留
+                        info.state = _S.IDLE    # reset 只同步 self.state，这里补同步返回帧的 info
+                        return info
+            else:
+                self._cancel_candidate, self._cancel_n, self._cancel_sec = None, 0, 0.0
+        else:
+            self._cancel_candidate, self._cancel_n, self._cancel_sec = None, 0, 0.0
 
         if not (both_open or both_pinched):
             # 一只张开一只捏合 → 混杂姿态
@@ -948,6 +1059,13 @@ class DiagonalStretchManager:
                 )
             except Exception:
                 pass  # Win32 异常就跳过，下一帧继续
+            # 8) ✨ 拉伸全程每帧把光标钉在窗口中心 (cx0,cy0)，与 MOVE_ACTIVE 行为一致：
+            #    防止 SCALING 期间系统光标跟随右手 MCP 锚点移动，取消/结束时光标突然跳走
+            try:
+                SetCursorPos(wintypes.INT(int(round(self._cx0))),
+                             wintypes.INT(int(round(self._cy0))))
+            except Exception:
+                pass
             self._last_ratio = clamped
             info.state = _S.SCALING
             info.hwnd = self._hwnd
@@ -1148,3 +1266,7 @@ class DiagonalStretchManager:
         self._last_ratio = 1.0
         self._scale_lost_sec = 0.0   # ✨ 重置时清 lost 计时
         self._open_stable.clear()      # ✨ 重置时清 OPEN 稳定缓存（下一轮从头开始攒）
+        # ✨ 清取消手势确认门
+        self._cancel_candidate = None
+        self._cancel_n = 0
+        self._cancel_sec = 0.0

@@ -1623,7 +1623,10 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             #   注：此处读的是【上一帧】move_state（stretch.update 在后面 L1708 才跑），
             #   进入/退出 MOVE_ACTIVE 各有 1 帧交接，帧内同点 SetCursorPos 幂等、肉眼不可见。
             _cursor_locked_by_window_move = bool(
-                stretch_info is not None and stretch_info.move_state == _DMS.MOVE_ACTIVE
+                stretch_info is not None and (
+                    stretch_info.move_state == _DMS.MOVE_ACTIVE
+                    or stretch_info.state == _DS.SCALING
+                )
             )
 
             # ======================================================================
@@ -2029,6 +2032,12 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             right_palm_screen: tuple | None = None
             left_lms_main = None
             right_lms_main = None
+            # ✨ 3D world landmarks：供拉伸模块区分"握拳"与"拇食指捏合"（两指尖是否卷进掌心）
+            world_lms_map: dict = {}
+            for _h in hands_data:
+                _wl = _h.get("world_landmarks")
+                if _wl is not None and len(_wl) >= 21:
+                    world_lms_map[_h["label"]] = _wl
             if "Left" in hand_results:
                 _, _, _, lms = hand_results["Left"]
                 left_lms_main = lms
@@ -2053,7 +2062,15 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             stretch_info = stretch.update(left_px, right_px, (w, h),
                                           left_lms_main, right_lms_main,
                                           left_palm_screen, right_palm_screen,
-                                          dt=_frame_dt)
+                                          dt=_frame_dt,
+                                          left_world_lms=world_lms_map.get("Left"),
+                                          right_world_lms=world_lms_map.get("Right"))
+            # ✨ 取消手势（OK/握拳）触发的一次性控制台提示（cancel_fired 只在触发帧为 True）
+            try:
+                if getattr(stretch_info, "cancel_fired", False):
+                    print("[stretch] ✋ 取消拉伸（双手 OK 手势或握拳 0.07s）：已终止本次操作，窗口保持当前大小")
+            except Exception:
+                pass
 
             _t2 = time.perf_counter()
 
@@ -2168,8 +2185,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             (f"X {ratio:.3f}  比例", ratio_c, 0.95),
                             (f"窗口: HWND 0x{int(stretch_info.hwnd):08X}   {stretch_info.win_w}×{stretch_info.win_h}",
                              (230, 230, 230), 0.55),
+                            ("👌双手OK / ✊双拳 保持0.07s = 取消（保持当前大小）", (180, 220, 255), 0.6),
                         ]
-                        card_w, card_h = 520, 100
+                        card_w, card_h = 520, 128
                         bx = cx - card_w // 2
                         by = cy - card_h // 2 - 16
                         # 回滚 B-2：卡片黑底 + 边框 + 3 行中文 每帧必画（卡片外框颜色每帧画）
