@@ -15,9 +15,12 @@ server.py  —— 极简 Flask 壳，按用户「三步拆解」严格实现，�
 """
 
 import os
+import sys
 import json
 import time
+import socket
 import threading
+import urllib.request
 
 # =========================================================================
 # ⓪ 日志系统必须【最早】安装：先读 config.json 的 log_enabled，再 import 业务模块
@@ -79,6 +82,79 @@ if os.path.exists(CONFIG_PATH):
         print(f"[server.py] Flask 监听: {_flask_host}:{_flask_port}  preview_default={_preview_default}")
     except Exception as e:
         print(f"[server.py] 读取 config.json 失败，忽略（默认 0/8000）：{e}")
+
+# =========================================================================
+# ⓪.5 单实例启动锁（2026-10-04）
+#   病根：Windows 的 SO_REUSEADDR（Werkzeug 默认会设）允许【不同进程】同时 bind+listen
+#   同一端口，入站连接被随机分发。于是重复 `python server.py` 会留下多个僵尸实例：
+#   旧进程一直用旧内存代码处理 /run、/stop，新代码永远不生效（当天日志实锤 3 个
+#   server.py 同听 8000，新埋点会话全被旧进程接走）。
+#   两道防线：
+#     1) 启动先 HTTP 探活 /status：已有本服务（JSON 含 service_started）→ 直接退出；
+#     2) 进程生命期持有 SO_EXCLUSIVEADDRUSE 独占监听 socket 作 OS 级兜底：
+#        即使两个进程同时启动、探活双双落空，后绑者也会 WSAEADDRINUSE 失败。
+# =========================================================================
+def _probe_existing_server(host: str, port: int):
+    """None=端口空闲可启动；'ours'=本服务已在跑；'other-http'=端口被别的程序占用。"""
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(0.5)
+    try:
+        if probe.connect_ex((probe_host, port)) != 0:
+            return None  # 没人监听 = 端口空闲
+    finally:
+        probe.close()
+    # 端口已有人监听：分清"本服务旧实例"还是"其他程序"（禁走系统代理）。
+    # 用首页固定标题做特征：/status 运行中会被重填（字段不稳定）且响应可能数十 KB，
+    # 不能读截断的半截 JSON 去解析。
+    try:
+        _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with _opener.open(f"http://{probe_host}:{port}/", timeout=1.5) as resp:
+            body = resp.read(2048)
+        if b"HandDetecter" in body:
+            return "ours"
+        return "other-http"
+    except Exception:
+        return "other-http"
+
+
+def _acquire_single_instance_lock(host: str, port: int) -> socket.socket:
+    """持住独占监听 socket 直到进程退出；发现已有实例/端口被占则直接退出进程。"""
+    reason = _probe_existing_server(host, port)
+    if reason == "ours":
+        print("\n" + "!" * 70)
+        print(f"[server.py] ❌ 已有一个本服务在 http://{host}:{port}/ 运行——单实例锁拦截，本次不重复启动。")
+        print("    /stop 只停摄像头线程、不会退出 Flask 进程；重复启动会留下僵尸实例，")
+        print("    旧实例继续用旧代码处理 /run、/stop，新代码永远不生效。")
+        print("    → 请直接用浏览器打开现有页面操作；确需重启：原窗口 Ctrl+C")
+        print("      （或任务管理器结束旧 python.exe）后再启动。")
+        print("!" * 70 + "\n")
+        sys.exit(2)
+    if reason is not None:
+        print(f"\n[server.py] ❌ 端口 {host}:{port} 已被【其他程序】占用（不是本服务）。"
+              f"请退出占用程序，或改 config.json 的 flask_port 后重试。\n")
+        sys.exit(3)
+    # OS 级兜底：独占绑定，持有到进程退出
+    lock_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if sys.platform == "win32":
+            # Windows：EXCLUSIVE 拒绝任何后来者（哪怕对方设了 REUSEADDR）抢占
+            lock_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            # POSIX：REUSEADDR 只允许复用 TIME_WAIT，不允许复用活动监听，等价安全
+            lock_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lock_sock.bind((host, port))
+        lock_sock.listen(128)
+    except OSError as e:
+        print(f"\n[server.py] ❌ 独占绑定 {host}:{port} 失败（可能另一实例正在抢占启动）：{e}。"
+              f"请确认没有重复 server.py 后重试。\n")
+        lock_sock.close()
+        sys.exit(4)
+    print(f"[server.py] 🔒 单实例锁已持有 {host}:{port}（独占监听，进程退出自动释放）")
+    return lock_sock
+
+
+_single_instance_sock = _acquire_single_instance_lock(_flask_host, _flask_port)
 
 # 解析参数 + clamp（不调 main.py），从 config.json 读 server_argv，没有就用默认
 _server_argv = ["--use-tasks", "--roi-scale", "0.70"]
@@ -340,7 +416,18 @@ r();
 # 入口：python server.py  →  跑 Flask（主线程），默认端口 8000
 # =========================================================================
 if __name__ == "__main__":
-    # threaded=True 让 Flask 可以并发处理 /status 和 /stop 请求（虽然就这几个接口，threaded=False 也没事）
-    # use_reloader=False → 不启动子进程重新 import（否则会 init_models 两次，浪费时间+容易出问题）
+    # threaded=False 与历史行为一致（/status、/stop 串行处理，接口极少无所谓）
+    # use_reloader=False → 不启动子进程重新 import（否则会 init_models 两次）
+    #
+    # ⭐ 不用 app.run：Werkzeug 自建 socket 会设 SO_REUSEADDR，在 Windows 上挡不住跨进程
+    #   重复绑定（僵尸实例病根）。改为 make_server 先绑一个临时端口，再把服务 socket
+    #   换成单实例锁持有的 SO_EXCLUSIVEADDRUSE 监听 socket（同一进程内替换，无竞态窗口）。
+    from werkzeug.serving import make_server
     print("[server.py] ✅ Flask 启动：http://{}:{}/  （Ctrl+C 退出）\n".format(_flask_host, _flask_port))
-    app.run(host=_flask_host, port=_flask_port, debug=False, threaded=False, use_reloader=False)
+    _httpd = make_server(_flask_host, 0, app, threaded=False)
+    _httpd.socket.close()          # 释放 Werkzeug 的临时 REUSEADDR socket
+    _httpd.socket = _single_instance_sock   # 挂上独占监听 socket（已 bind+listen）
+    try:
+        _httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[server.py] 收到 Ctrl+C，退出（自动释放单实例锁）")

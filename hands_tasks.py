@@ -33,7 +33,8 @@ from gesture_recognizer import recognize_gesture
 from mouse_controller import MouseController
 from draw_cn_text import put_text_cn
 from finger_tap_click_detector import (FingerTapClickDetector, TwoFingerRightClickDetector,
-                                       _S as _TS, E as _TEV, TWO_FINGER_TIP_ENTRY_R)
+                                       _S as _TS, E as _TEV, TWO_FINGER_TIP_ENTRY_R,
+                                       RF_OBSERVE_ONLY)
 from diagonal_stretch import (DiagonalStretchManager, _S as _DS, _MODE as _DM,
                            _MS as _DMS, MOVE_CONFIRM_SEC)
 
@@ -398,6 +399,41 @@ def _bend_from_points(p_wrist, p_mcp, p_pip, p_dip, p_tip,
         final = final * scale_fix
 
     return float(round(final, 6))
+
+
+def _bend3d_probe(lms2d, wlms, palm_2d: float,
+                  joint_ids=(5, 6, 7, 8)) -> dict | None:
+    """⭐ 2026-10-04 [BEND3D] 纯观测探针：3D world 弯度 + 透视压缩标志。
+    【判定链路绝不使用本函数任何输出】，仅供 [TAP-SEG]/[2F-SEG]/[BEND3D-JIT] 埋点。
+
+    - bend：与 2D 完全同公式同映射(0.20弯~0.88直)，但关节向量取 world (x,y,z) 真实夹角，
+      无 5% 距离兜底(palm 无关)、无掌宽 scale_fix；噪声门/Δ放大保留 → 两口径数值可直接比较。
+    - dip/pip：3D 关节夹角(度，伸直≈180)，看朝镜头勾时 3D 是否照样折下去。
+    - comp：画面投影 |DIP-TIP| / 2D 掌宽。侧对镜头伸直≈0.4~0.6；指尖朝镜头深度折叠时塌缩。
+    - phal_mm：world 末节指骨长度 |DIP-TIP|（毫米），检验个人指骨长度帧间稳定性。
+    - tip3：world TIP 坐标，供调用方算逐帧跳变（模型猜测点的时间连续性）。
+    """
+    try:
+        _jm, _jp, _jd, _jt = joint_ids
+        w0 = np.array([float(wlms[0].x),  float(wlms[0].y),  float(wlms[0].z)])
+        wm = np.array([float(wlms[_jm].x), float(wlms[_jm].y), float(wlms[_jm].z)])
+        wp = np.array([float(wlms[_jp].x), float(wlms[_jp].y), float(wlms[_jp].z)])
+        wd = np.array([float(wlms[_jd].x), float(wlms[_jd].y), float(wlms[_jd].z)])
+        wt = np.array([float(wlms[_jt].x), float(wlms[_jt].y), float(wlms[_jt].z)])
+        bend = _bend_from_points(w0, wm, wp, wd, wt,
+                                 palm_denom=None, dist_bend_fallback=None)
+        dip_deg = _three_point_angle(wp, wd, wt)
+        pip_deg = _three_point_angle(wm, wp, wd)
+        comp = None
+        if palm_2d is not None and palm_2d > 1e-6:
+            _v = np.array([lms2d[_jd].x - lms2d[_jt].x,
+                           lms2d[_jd].y - lms2d[_jt].y], dtype=np.float64)
+            comp = float(np.linalg.norm(_v) / palm_2d)
+        phal_mm = float(np.linalg.norm(wt - wd) * 1000.0)
+        return {"bend": float(bend), "dip": float(dip_deg), "pip": float(pip_deg),
+                "comp": comp, "phal_mm": phal_mm, "tip3": wt}
+    except Exception:
+        return None
 
 
 def _draw_tap_bar(frame, tm: dict, det: FingerTapClickDetector | None = None):
@@ -1226,10 +1262,24 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     #       现在 α=0.85（15% 历史权重）→ 跟手优先（几乎 1:1 跟随），把"平滑去噪"工作留给 mouse_controller 内部的
     #       「中值杀尖峰 + Sigmoid 微移阻尼 + 静止方差锁」3 层流水线处理（那边只针对鼠标坐标，不影响UI绘制）。
     #       另外：掌心一次性位移 > _EMA_RESET_TOL（归一化）时，直接清空该手 EMA 缓存，强制硬跟手（彻底消除拖尾）。
-    _EMA_ALPHA = 0.85
+    # ⭐⭐ 2026-10-02 墙钟化（MOUSE-STAT 基线：静瞄 p50 1.4~1.9px / 大跳 max 83px 穿透）：
+    #   固定 α=0.85 在 18fps 实测帧率下 τ 仅 ~27ms ≈ 无平滑；改为 α=1-exp(-dt/τ)，τ=60ms：
+    #   30fps→α≈0.43，18fps→α≈0.60，物理平滑强度帧率无关。
+    #   · 跳帧复用的是【同一旧观测】→ α=0（不拿旧数据再平均一次，消除前冲-回拉锯齿）
+    #   · 硬重置改为【双帧确认】：连续两帧掌位跳 >tol 才真重置（真快速移动第2帧仍确认，延迟≤1帧）；
+    #     单帧飞点不重置 EMA 状态，配合鼠标端中值窗被彻底滤除
+    _LM_EMA_TAU_SEC = 0.060
     _EMA_RESET_TOL = 0.015                 # 掌心单帧归一化位移超过此值 → 清 EMA 缓存（≈1280×720下≈10像素）
+
+    def _lm_ema_alpha(dt: float) -> float:
+        _d = dt if dt > 0.0 else 1.0 / 30.0   # 首帧/异常 dt 回退 30fps
+        if _d > 0.5:
+            _d = 0.5
+        return 1.0 - _mt.exp(-_d / _LM_EMA_TAU_SEC)
+
     _ema_landmarks: dict[str, list] = {}   # key = Left/Right, value = 21 个 [x,y,z] 列表
     _ema_miss_count: dict[str, int] = {}   # 连续丢失计数，超过阈值清空 EMA
+    _ema_reset_pending: dict[str, bool] = {}  # 上一帧是否已出现掌位大跳（双帧确认硬重置）
     # ⭐ 同视角身份时序稳定器（2026-09-30）：手背入镜/手掌旋转时锁定左右手身份，
     #   防止 MP handedness 单帧横跳 → EMA 串手 / 控鼠手瞬切 / 双手拉伸左右对调
     _hand_id_stab = HandIdentityStabilizer()
@@ -1259,6 +1309,65 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     _skip_was_skipped = False               # 刚刚发生了跳帧（写 status_store 用）
     _skip_total_frames = 0                  # 累计主循环帧数
     _skip_skipped_frames = 0                # 累计跳过推理帧数
+
+    # ⭐ 2026-10-02 丢手诊断（纯观测，零行为变更）：
+    #   每 20s 一行 [DET-STAT]，把"丢手"拆成可归因的计数：
+    #   · 检测层（detector.take_det_diag）：实际推理数 / 80ms回调超时 / 有结果但空手 / 延迟
+    #   · 主循环 bend=None 归因：no_left=本帧无控鼠手标签（检测空手/跟踪丢失/跳帧前已丢）
+    #                           fist=几何握拳/确认态压制  fist_wm=world 3D点缺失被默认握拳
+    #                           palm=掌宽≈0（手太远/关键点残缺）
+    #   · 跳帧率：_skip_was_skipped 帧占比（跳帧复用不产生新检测，高跳帧率+高超时=推理拥塞线索）
+    #   · 帧亮度：黑帧（均值<_CAM_BLACK_MEAN_THR，与预热同口径）计数 + 窗口 min/avg，
+    #             用于区分"检测空手"是手真不在还是相机阶段性吐黑/暗帧（read 成功但画面黑）
+    _DET_STAT_SEC = 20.0
+    _det_stat_t0 = time.monotonic()
+    _det_rs = {"frames": 0, "skip": 0,
+               "no_left": 0, "palm": 0, "fist": 0, "fist_wm": 0, "other": 0,
+               # 亮度（与预热同口径：全帧 BGR 均值；黑帧=_CAM_BLACK_MEAN_THR）
+               # black_run/black_run_max：黑帧连续段长度（区分"零星黑帧"与"相机持续吐黑=假死"）
+               "black": 0, "b_sum": 0.0, "b_min": None,
+               "black_run": 0, "black_run_max": 0,
+               # 2026-10-02 卡顿定位：cap.read() 单次耗时 max + >150ms 慢读次数；waitKey max
+               "read_max_ms": 0.0, "read_slow": 0, "wk_max_ms": 0.0}
+    # 2026-10-03 [TAP-SEG] 段生命周期埋点：ARM 时刻屏幕坐标 + 段内 bend=None 原因累计
+    _seg_arm_xy = None
+    _seg_none_rs: dict = {}
+    # 2026-10-03 [2F-SEG] 右键段埋点：ARM 时刻坐标 + 食/中指独立弯度段内极值
+    _rf_arm_xy = None
+    _rf_arm_idx = None
+    _rf_arm_mid = None
+    _rf_idx_min = _rf_idx_max = None
+    _rf_mid_min = _rf_mid_max = None
+    # TIP/DIP 实测比值段内极值 + ARM 前滚动窗（看指尖"实测多开"、资格何时取得）
+    _rf_tip_min = _rf_tip_max = None
+    _rf_dip_min = _rf_dip_max = None
+    _rf_pre_tip: list = []       # ARM 前最近 ~12 个有效帧 (TIP比值, 空间)
+    _rf_arm_pretip: list = []    # 本次 ARM 快照
+    _rf_pre_2d = 0
+    # 2026-10-04 [2F-OBS] 左键段内的指尖距/中弯原始数据（验证"单指点击时两尖相隔≥1指节"）：
+    #   左键 ARM 当帧快照 + 段内极值，随每条 [TAP-SEG] 打印
+    _lseg_tip_arm = None
+    _lseg_tip_min = None
+    _lseg_mid_arm = None
+    _lseg_mid_min = _lseg_mid_max = None
+    # 2026-10-04 [BEND3D] 左键段双口径（2D vs 3D world）纯观测：
+    #   b3d 段内谷底、3D DIP 角谷底、压缩比 min、2D-3D 最大差（发生时的压缩比）、
+    #   world TIP 逐帧跳变 max、末节指骨长度
+    _lseg_b2d_arm = None
+    _lseg_b3d_arm = None
+    _lseg_b3d_min = None
+    _lseg_comp_min = None
+    _lseg_dip3d_min = None
+    _lseg_diff_max = None
+    _lseg_diff_comp = None
+    _lseg_jump_max = None
+    _lseg_phal = None
+    # [BEND3D] 右键段 3D 双指单元合成弯度（与 2D r 同映射）
+    _rf_b3d_arm = None
+    _rf_b3d_min = None
+    # [BEND3D-JIT] 悬停双口径噪声：仅 IDLE 帧入队，约每 2s 打一行 mean±std
+    _jit3d_q: deque = deque(maxlen=64)
+    _jit3d_sec = 0.0
 
     cap = None
     try:
@@ -1323,6 +1432,53 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
         # ✨ 2026-10-01 全项目墙钟化：主循环统一时间源（monotonic），下传给所有"帧数→秒数"状态机
         _last_frame_wall = time.monotonic()
         _frame_dt = 0.0   # 上一帧→当前帧的墙钟间隔（首帧0；含异常保护，永不抛错）
+
+        # ✨ 2026-10-02 卡顿看门狗（纯观测）：主循环若在任一同步调用
+        #   （cap.read / UIA 右键探测 / HighGUI waitKey）上阻塞 >1s，
+        #   独立线程立刻打印【阻塞阶段】；恢复时打印本次卡顿总时长。
+        #   背景：21:22 会话某 20s 窗口仅跑 59 帧（正常 360~435）且无空帧日志，
+        #   说明线程卡在某个"既不返回也不报错"的调用里，20s 聚合统计无法区分卡点。
+        _hb_wall = [time.monotonic()]
+        _hb_stage = ["init"]
+        def _watchdog_loop():
+            _stall_since = None
+            _stall_stage = None
+            _last_holler = 0.0
+            while stop_event is None or not stop_event.is_set():
+                time.sleep(0.5)
+                try:
+                    _age = time.monotonic() - _hb_wall[0]
+                    if _age >= 1.0:
+                        _now = time.monotonic()
+                        if _stall_since is None:
+                            _stall_since = _now - _age  # 近似真实卡死起点（心跳最后更新时刻）
+                            _stall_stage = _hb_stage[0]
+                            print(f"[WATCHDOG] ⚠ 主循环卡顿已{_age:.1f}s，阻塞阶段={_stall_stage}",
+                                  flush=True)
+                            _last_holler = _now
+                        elif _now - _last_holler >= 2.0:
+                            print(f"[WATCHDOG] ⚠ 卡顿持续{_now-_stall_since:.1f}s，"
+                                  f"阶段={_hb_stage[0]}", flush=True)
+                            _last_holler = _now
+                    elif _stall_since is not None:
+                        print(f"[WATCHDOG] ✅ 恢复（本次卡 {time.monotonic()-_stall_since:.1f}s，"
+                              f"卡顿时阶段={_stall_stage}，恢复时阶段={_hb_stage[0]}）", flush=True)
+                        _stall_since = None
+                        _stall_stage = None
+                except Exception:
+                    pass
+        threading.Thread(target=_watchdog_loop, name="loop-watchdog", daemon=True).start()
+
+        if RF_OBSERVE_ONLY:
+            print("=" * 64, flush=True)
+            print("[2F-OBS] 右键观测模式已开启：右键不会弹出、不会抢占左键（左键恢复正常点击）",
+                  flush=True)
+            print("[2F-OBS] 请按顺序做动作：① 正常单指点击 10 次（含慢双击几组）；"
+                  "② 刻意做 5 次双指并拢勾按（右键姿势）；然后 /stop", flush=True)
+            print("[2F-OBS] 日志看 [TAP-SEG] 末尾 TIP= 与 [2F-SEG] 的 TIP段内，"
+                  "用于按真机数据定指尖距门限", flush=True)
+            print("=" * 64, flush=True)
+
         while True:
             # 🔴 新增：stop_event 命中 → 立即干净退出
             if stop_event is not None and stop_event.is_set():
@@ -1339,9 +1495,19 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _frame_dt = 0.0
 
             _bg_heartbeat_cnt += 1
+            _hb_wall[0] = time.monotonic()  # 看门狗心跳：走到此处=上一帧全部工作已完成
+            _hb_stage[0] = "cap.read"
             _t0 = time.perf_counter()
             ok, frame = cap.read()
             _t1 = time.perf_counter()
+            try:  # 读帧耗时统计（含失败路径；read 若硬阻塞看门狗会先报阶段=cap.read）
+                _rms = (_t1 - _t0) * 1000.0
+                if _rms > _det_rs["read_max_ms"]:
+                    _det_rs["read_max_ms"] = _rms
+                if _rms > 150.0:
+                    _det_rs["read_slow"] += 1
+            except Exception:
+                pass
             if not ok or frame is None:
                 # ---- 第一级：偶发空帧，短等重试 ----
                 if _cam_read_fail_since is None:
@@ -1379,6 +1545,23 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 break
             # 读到好帧：连续失败计时立即清零（偶发失败不跨帧累计）
             _cam_read_fail_since = None
+            _hb_stage[0] = "business"
+
+            # ---- 诊断：运行期帧亮度（与预热同口径；纯观测，不影响任何判定）----
+            try:
+                _frm_mean = float(frame.mean())
+                _det_rs["b_sum"] += _frm_mean
+                _det_rs["b_min"] = (_frm_mean if _det_rs["b_min"] is None
+                                    else min(_det_rs["b_min"], _frm_mean))
+                if _frm_mean < _CAM_BLACK_MEAN_THR:
+                    _det_rs["black"] += 1
+                    _det_rs["black_run"] += 1
+                    if _det_rs["black_run"] > _det_rs["black_run_max"]:
+                        _det_rs["black_run_max"] = _det_rs["black_run"]
+                else:
+                    _det_rs["black_run"] = 0
+            except Exception:
+                pass
 
             # ---------- 第一人称同视角：画面【不】做水平镜像 ----------
             # 头戴相机视线与人眼一致：手向右动 → 画面 x 向右增，光标自然同向。
@@ -1433,6 +1616,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             # 🔥 landmarks EMA 指数滑动平均：去关节抖动，提升小范围瞄准稳定性
             # ================================================================
             from hand_detector import _LmWrapper
+            # 本帧 EMA 增益：跳帧复用同一旧观测 → α=0（状态外推而非再平均）
+            _ema_a = 0.0 if _skip_was_skipped else _lm_ema_alpha(_frame_dt)
             _cur_labels_in_frame: set = set()
             for _hand in hands_data:
                 _lab = _hand["label"]
@@ -1456,23 +1641,32 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     _cy0_prev = 0.25 * (_last_arr[5][1] + _last_arr[9][1]
                                            + _last_arr[13][1] + _last_arr[17][1])
                     if abs(_cx0_cur - _cx0_prev) > _EMA_RESET_TOL or abs(_cy0_cur - _cy0_prev) > _EMA_RESET_TOL:
-                        _reset_this_hand = True
+                        # 双帧确认：本帧跳且上帧也跳 → 认定真快速移动，硬重置；
+                        # 仅单帧跳 → 当飞点，不重置（EMA 自然削幅），清除 pending 等下一帧
+                        if _ema_reset_pending.get(_lab, False):
+                            _reset_this_hand = True
+                            _ema_reset_pending[_lab] = False
+                        else:
+                            _ema_reset_pending[_lab] = True
+                    else:
+                        _ema_reset_pending[_lab] = False
 
                 if _lab in _ema_landmarks and not _reset_this_hand:
                     _last_arr = _ema_landmarks[_lab]
                     _smoothed = [
-                        [_EMA_ALPHA * _cur_arr[i][0] + (1 - _EMA_ALPHA) * _last_arr[i][0],
-                         _EMA_ALPHA * _cur_arr[i][1] + (1 - _EMA_ALPHA) * _last_arr[i][1],
-                         _EMA_ALPHA * _cur_arr[i][2] + (1 - _EMA_ALPHA) * _last_arr[i][2]]
+                        [_ema_a * _cur_arr[i][0] + (1 - _ema_a) * _last_arr[i][0],
+                         _ema_a * _cur_arr[i][1] + (1 - _ema_a) * _last_arr[i][1],
+                         _ema_a * _cur_arr[i][2] + (1 - _ema_a) * _last_arr[i][2]]
                         for i in range(21)
                     ]
                 else:
-                    # 首次出现 / 丢失后重新出现 / 掌心大位移硬重置 → 用当前原数值（不拖历史尾巴）
+                    # 首次出现 / 丢失后重新出现 / 掌心大位移硬重置（双帧确认）→ 用当前原数值（不拖历史尾巴）
                     if _reset_this_hand and _lab in _ema_landmarks:
                         pass  # 马上会用 _cur_arr 覆盖掉
                     _smoothed = _cur_arr
                 _ema_landmarks[_lab] = _smoothed
                 _ema_miss_count[_lab] = 0
+                _ema_reset_pending.setdefault(_lab, False)
                 # 把平滑后的 wrapped 回填到 hand["landmarks"]（后续所有业务都用平滑值）
                 _hand["landmarks"] = [_LmWrapper(_v[0], _v[1], _v[2]) for _v in _smoothed]
             # 丢失的手：miss_count 累计，超时清空
@@ -1482,6 +1676,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     if _ema_miss_count[_lab] > 8:
                         _ema_landmarks.pop(_lab, None)
                         _ema_miss_count.pop(_lab, None)
+                        _ema_reset_pending.pop(_lab, None)
 
             hand_results = {}
 
@@ -1720,11 +1915,19 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
             # ---------- 食指 Tap-Click（仅右手） ----------
             index_bend: float | None = None
+            _bend_none_reason: str | None = None  # 诊断：本帧 bend=None 的归因（fist/palm）；None=正常有值或无控鼠手
             _fist_forced_ev = 0   # 握拳门在 PRESSED 态强制抬键时，本帧直接输出的事件（E.LONG_UP）
             two_finger_bend: float | None = None  # 双指右键：双指单元合成伸直度（四关节中点，0.20弯~0.88直）
             two_finger_together: bool | None = None  # 双指右键：食/中四排关节是否都并拢（None=本帧不可判定）
             two_finger_gap: float | None = None      # 双指右键：四排关节距 max（诊断/判定共用）
             two_finger_gap_parts: tuple | None = None  # (MCP,PIP,DIP,TIP) 四排指距比值，仅诊断日志用
+            # ⭐ 2026-10-03 [2F-SEG] 纯观测：食/中指尖各自到 MCP5 的归一距（历史单指 bend 口径），
+            #   右键段全程跟踪两者摆幅——中指摆幅≈0 而食指大摆幅即"单指点击误判右键"实锤
+            rf_idx_b: float | None = None
+            rf_mid_b: float | None = None
+            # ⭐ 2026-10-04 [BEND3D] 纯观测：3D world 食指探针(dict) / 双指 3D 合成弯度
+            _b3d_probe: dict | None = None
+            rf_bend3d: float | None = None
             right_screen_pt = None
             if "Left" in hand_results:
                 _, _, _, lms = hand_results["Left"]
@@ -1879,6 +2082,10 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             #   确认态保持是为了挂起段继续压制 + force_long_up 时机
                             if _fist_curl_active or _fist_shape_now:
                                 index_bend = None
+                                # 细分：确认态/几何握拳 vs world 3D 点缺失被默认判握拳
+                                _world_ok = (_wl is not None and len(_wl) >= 21)
+                                _bend_none_reason = "fist" if (
+                                    _fist_curl_active or _world_ok) else "fist_wm"
                             # ----------------------------------------------------------
                             # ⭐ 2026-09-17 食中双指并拢右键 v2：不再分别算食指/中指 bend
                             #   用户要求：前置条件已是并拢 → 食中两指对应关节(PIP/PIP, DIP/DIP, TIP/TIP)
@@ -1912,6 +2119,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                 #     挡住单指点击"弯到底才碰巧并拢"导致的左键被抢杀。
                                 _wlms = hand.get("world_landmarks")
                                 _gap_space = "3D"
+                                _w = None   # 2026-10-04 [BEND3D]：3D 分支构建 (21,3) 数组，供探针复用
                                 if _wlms is not None and len(_wlms) >= 18:
                                     _w = np.array([[float(p.x), float(p.y), float(p.z)]
                                                    for p in _wlms], dtype=np.float64)
@@ -1947,11 +2155,45 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                 two_finger_bend = _bend_from_points(
                                     _p0, _mcp_mid, _pip_mid, _dip_mid, _tip_mid,
                                     palm_denom=denom, dist_bend_fallback=_dist_fb)
+                                # ⭐ 2026-10-03 [2F] 食/中指【独立关节角弯度】（与左键同公式，
+                                #   0.20弯~0.88直）：右键双门用——资格帧两指须近直(≥0.80)、
+                                #   手势中两指须都弯(≤0.80)。替代旧 dist(尖,5)/掌宽 2D 口径
+                                #   （手靠近镜头时该值 2.2~3.14 无物理意义，只能看热闹）。
+                                rf_idx_b = _index_bend_from_joint_angles(
+                                    lms, palm_denom=denom, joint_ids=(5, 6, 7, 8))
+                                rf_mid_b = _index_bend_from_joint_angles(
+                                    lms, palm_denom=denom, joint_ids=(9, 10, 11, 12))
+
+                                # ---- ⭐ 2026-10-04 [BEND3D] 纯观测探针（不参与任何判定）----
+                                # 3D 食指弯度/关节角/压缩比/末节指骨长 + TIP 逐帧跳变(mm/帧)
+                                if _w is not None and len(_w) >= 21:
+                                    _b3d_probe = _bend3d_probe(lms, _wlms, palm_n_raw)
+                                if _b3d_probe is not None:
+                                    _prev_tip3 = getattr(run_loop, "_b3d_prev_tip3", None)
+                                    if _prev_tip3 is not None:
+                                        _b3d_probe["jump_mm"] = float(
+                                            np.linalg.norm(_b3d_probe["tip3"] - _prev_tip3)
+                                            * 1000.0)
+                                    else:
+                                        _b3d_probe["jump_mm"] = None
+                                    run_loop._b3d_prev_tip3 = _b3d_probe["tip3"]
+                                    # 双指单元 3D 合成弯度（食/中对应关节 3D 中点，同映射）
+                                    rf_bend3d = _bend_from_points(
+                                        _w[0],
+                                        (_w[5] + _w[9]) * 0.5,
+                                        (_w[6] + _w[10]) * 0.5,
+                                        (_w[7] + _w[11]) * 0.5,
+                                        (_w[8] + _w[12]) * 0.5,
+                                        palm_denom=None, dist_bend_fallback=None)
                             except Exception:
                                 two_finger_bend = None
                                 two_finger_together = None
                                 two_finger_gap = None
                                 two_finger_gap_parts = None
+                                rf_idx_b = None
+                                rf_mid_b = None
+                                _b3d_probe = None
+                                rf_bend3d = None
                             if not palm_stable:
                                 # ⭐ 食指 bend 已放开（关节角主导）；但双指并拢判据的四排指距用 3D world
                                 #   【原始掌宽】归一，掌宽不稳帧不可信 → 沿用旧策略不给右键检测器喂数据，
@@ -1960,13 +2202,19 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                 two_finger_together = None
                                 two_finger_gap = None
                                 two_finger_gap_parts = None
+                                # 独立弯度与上面同信任域：掌宽不稳帧同样不许参与双指门裁决
+                                rf_idx_b = None
+                                rf_mid_b = None
                 else:
                     # palm_n_raw 太小（手离镜头特别远/截断）→ 直接丢弃
                     index_bend = None
+                    _bend_none_reason = "palm"
                     two_finger_bend = None
                     two_finger_together = None
                     two_finger_gap = None
                     two_finger_gap_parts = None
+                    rf_idx_b = None
+                    rf_mid_b = None
 
                 # ⭐ 2026-08-22 核心修复：Tap-Click 段直接复用 move_only() 同帧计算出来的"缓存平滑后坐标"
                 #   之前的问题：
@@ -1981,6 +2229,67 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
             # 快路径双击(DOUBLE_TAP)挂起的首击落点（2026-09-19 位置门控，见下方 WAIT_DBL 捕获）
             _pending_first_xy = None
+
+            # ---------- 丢手诊断：逐帧归因 bend=None（纯计数，不影响任何判定） ----------
+            _det_rs["frames"] += 1
+            if _skip_was_skipped:
+                _det_rs["skip"] += 1
+            if index_bend is None:
+                if "Left" not in hand_results:
+                    _det_rs["no_left"] += 1
+                elif _bend_none_reason == "fist":
+                    _det_rs["fist"] += 1
+                elif _bend_none_reason == "fist_wm":
+                    _det_rs["fist_wm"] += 1
+                elif _bend_none_reason == "palm":
+                    _det_rs["palm"] += 1
+                else:
+                    _det_rs["other"] += 1
+            if time.monotonic() - _det_stat_t0 >= _DET_STAT_SEC:
+                _dd = detector.take_det_diag()
+                _n = max(1, _det_rs["frames"])
+                _ni = max(1, _dd["infer"])
+                _none_tot = (_det_rs["no_left"] + _det_rs["palm"]
+                             + _det_rs["fist"] + _det_rs["fist_wm"]
+                             + _det_rs["other"])
+                _b_avg = _det_rs["b_sum"] / _n
+                _b_min = _det_rs["b_min"]
+                print(
+                    f"[DET-STAT] 循环帧{_det_rs['frames']} 跳帧{_det_rs['skip']}"
+                    f"({100.0*_det_rs['skip']/_n:.0f}%) | "
+                    f"推理{_dd['infer']} 超时{_dd['timeout']}"
+                    f"({100.0*_dd['timeout']/_ni:.0f}%) 空手{_dd['empty']}"
+                    f"({100.0*_dd['empty']/_ni:.0f}%) 有手{_dd['hand1']} | "
+                    f"逆光增强{_dd['enh']}帧 暗占max{100.0*_dd['dark_max']:.0f}% | "
+                    f"等待avg{_dd['lat_avg_ms']}/p90{_dd['lat_p90_ms']}ms | "
+                    f"bend=None共{_none_tot}({100.0*_none_tot/_n:.0f}%): "
+                    f"无控鼠手{_det_rs['no_left']} 握拳{_det_rs['fist']} "
+                    f"world缺失握拳{_det_rs['fist_wm']} 掌宽过小{_det_rs['palm']} "
+                    f"其他{_det_rs['other']} | "
+                    f"黑帧{_det_rs['black']}(最长连{_det_rs['black_run_max']}) 亮度min"
+                    f"{_b_min if _b_min is not None else 0:.0f}/avg{_b_avg:.0f} | "
+                    f"读帧max{_det_rs['read_max_ms']:.0f}ms/慢帧{_det_rs['read_slow']} "
+                    f"waitKeyMax{_det_rs['wk_max_ms']:.0f}ms",
+                    flush=True)
+                _det_stat_t0 = time.monotonic()
+                _det_rs = {"frames": 0, "skip": 0,
+                           "no_left": 0, "palm": 0, "fist": 0,
+                           "fist_wm": 0, "other": 0,
+                           "black": 0, "b_sum": 0.0, "b_min": None,
+                           "black_run": 0, "black_run_max": 0,
+                           "read_max_ms": 0.0, "read_slow": 0, "wk_max_ms": 0.0}
+                # ---- 鼠标微震基线：原始锚点位移 vs 平滑后输出位移 + 静止锁进出统计 ----
+                _md = mouse._smoother.take_mouse_diag()
+                print(
+                    f"[MOUSE-STAT] 有手帧{_md['frames']} 锁定{_md['locked_pct']:.0f}% "
+                    f"入锁{_md['enters']}次 解锁{_md['unlocks']}次 | "
+                    f"原始位移px p50/{_md['raw_p50']} p90/{_md['raw_p90']} max/{_md['raw_max']} | "
+                    f"输出位移px p50/{_md['out_p50']} p90/{_md['out_p90']} max/{_md['out_max']} | "
+                    f"解锁时 drift_max/{_md['unl_dist_max']} p90/{_md['unl_dist_p90']} "
+                    f"3帧漂移max/{_md['unl_trend_max']}(阈8.96) σavg/{_md['unl_std_avg']}(进锁阈5.6)",
+                    flush=True)
+
+            _tap_updated = False
             if disable_click_for_stretch_global:
                 tap_detector.reset()
                 right_tap_detector.reset()
@@ -1988,21 +2297,46 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 right_tap_event = 0
             else:
                 # ⭐ 2026-09-17 双指并拢右键 v2：单 bend 输入（双指单元合成值）+ together 门控
+                # ⭐ 2026-10-04 仲裁重做（四份真机日志实锤旧规则祸首）：
+                #   旧规"右检测器 ARM 当帧即 freeze_left + cancel 左键"在用户自然悬停
+                #   两尖本就并拢（TIP0.27~0.49）的手型下，把正常左键段/双击第二击大量杀死
+                #   （单会话 27 次"外部抢占取消"）。现改为：
+                #     · 右检测器 ARM/HOLD/冷却全程【不再冻结、不再取消】左键 → 单击/双击恢复；
+                #     · 互斥只保留在右键【真正送达那一帧】：当帧丢弃进行中的左键段，
+                #       保证同一个物理动作不会左右键同响。
                 right_tap_event = right_tap_detector.update(two_finger_bend,
                                                             two_finger_together, two_finger_gap,
-                                                            two_finger_gap_parts)
+                                                            two_finger_gap_parts,
+                                                            rf_idx_b, rf_mid_b)
+                # ⭐ 2026-10-04 右键"真送达"信号必须在观测清零【之前】记录：
+                #   观测模式只吞系统右键事件，不能把左右互斥也一起吞掉——否则做右键勾按时
+                #   食指弯勾被左键检测器在同位置连发单击、甚至原子合成双击（真机日志：
+                #   一次右键动作带出 ev=1 + rescue2 doubleClick 误打开文件夹）。
+                _rf_fire_this_frame = (right_tap_event == _TEV.RIGHT_TAP)
+                # ⭐ 2026-10-04 [2F-OBS] 观测模式：右键事件只记录不送达（绝不弹系统菜单）
+                if RF_OBSERVE_ONLY:
+                    if right_tap_event != 0:
+                        print(f"[2F-OBS] 若启用本帧将送右键 ev={right_tap_event} "
+                              f"点={right_screen_pt}（观测模式已吞）", flush=True)
+                    right_tap_event = 0
                 if _fist_forced_ev:
-                    # 握拳门强制抬键优先级最高：物理键必须抬起，不能被双指 freeze_left 吞掉
+                    # 握拳门强制抬键优先级最高
                     tap_event = _fist_forced_ev
                     tap_detector.update(index_bend)
-                elif right_tap_detector.freeze_left:
-                    # 双指手势占用期 + 右键触发后的冷却尾帧都冻结左指：
-                    #   触发帧起双指回弹的 bend 值若漏喂左指，会被它当成独立食指勾按（虚构 Tap → 误双击）
-                    if right_tap_detector.armed_this_frame:
+                    _tap_updated = True
+                elif _rf_fire_this_frame:
+                    # 右键送达帧唯一互斥点（观测/正式两模式都执行）：杀掉同帧可能正在
+                    # 识别的左键段（不补发单击），保证观测行为与正式启用完全一致。
+                    if tap_detector.state in (_TS.BEND_ARMED, _TS.BEND_HOLD):
                         tap_detector.cancel_in_progress()
+                        if RF_OBSERVE_ONLY:
+                            print("[2F-OBS] 右键送达帧互斥：已取消进行中的左键段（观测模式联动验证）",
+                                  flush=True)
                     tap_event = 0
                 else:
+                    # 其余全部帧（含右键 ARM/HOLD 期）左键照常识别
                     tap_event = tap_detector.update(index_bend)
+                    _tap_updated = True
                     # ⭐ 2026-09-19：首击回弹进 WAIT_DBL 当帧记录落点（掌心位置=被点目标），
                     #   供 DOUBLE_TAP 事件按 10px 门控判"同目标双击 / 不同目标两次独立单击"
                     _pending_first_xy = getattr(run_loop, "_first_tap_xy", None)
@@ -2012,6 +2346,269 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     else:
                         run_loop._first_tap_xy = None
 
+            # -------- 2026-10-04 [BEND3D-JIT] 悬停双口径噪声（纯观测，约每 2.0s 一行） --------
+            #   回答"3D 的 z 抖动会不会冲过 2.5% 差分噪声门"：IDLE 悬停帧 2D/3D 弯度 mean±std。
+            #   手丢/非 IDLE/握拳帧不入队且清空计时，避免跨动作污染。
+            if _b3d_probe is None:
+                run_loop._b3d_prev_tip3 = None
+            if (not disable_click_for_stretch_global
+                    and tap_detector.state == _TS.IDLE
+                    and index_bend is not None and _b3d_probe is not None):
+                _jit3d_q.append((float(index_bend), float(_b3d_probe["bend"]),
+                                 _b3d_probe["comp"]))
+                _jit3d_sec += _frame_dt
+                if _jit3d_sec >= 2.0 and len(_jit3d_q) >= 8:
+                    _a2 = np.array([_q[0] for _q in _jit3d_q], dtype=np.float64)
+                    _a3 = np.array([_q[1] for _q in _jit3d_q], dtype=np.float64)
+                    _ac = np.array([_q[2] for _q in _jit3d_q if _q[2] is not None],
+                                   dtype=np.float64)
+                    _cs = (f" comp中位{float(np.median(_ac)):.2f}/min{float(_ac.min()):.2f}"
+                           if len(_ac) else "")
+                    print(f"[BEND3D-JIT] {_jit3d_sec:.1f}s n={len(_jit3d_q)} "
+                          f"2D弯 {_a2.mean():.3f}±{_a2.std():.4f} | "
+                          f"3D弯 {_a3.mean():.3f}±{_a3.std():.4f} | "
+                          f"均值差2D-3D{(_a2.mean() - _a3.mean()):+.3f}{_cs}",
+                          flush=True)
+                    _jit3d_q.clear()
+                    _jit3d_sec = 0.0
+            else:
+                if _jit3d_q:
+                    _jit3d_q.clear()
+                _jit3d_sec = 0.0
+
+            # -------- 2026-10-03 [TAP-SEG] 弯曲段生命周期跟踪（纯观测埋点） --------
+            # 目的：标题栏慢点击/重复尝试时，看见失败段（尖峰/浅弯/抢占）的完整过程，
+            #   并把 ARM 瞬间坐标 vs 段末坐标的漂移、段内 None 归因打出来。
+            if _tap_updated and tap_detector.armed_this_frame:
+                _seg_arm_xy = right_screen_pt
+                _seg_none_rs = {}
+                # ⭐ 2026-10-04 [2F-OBS] 左键段起势快照：两指尖距比值 + 中指独立弯度
+                _lseg_tip_arm = two_finger_gap_parts[3] if two_finger_gap_parts else None
+                _lseg_tip_min = _lseg_tip_arm
+                _lseg_mid_arm = rf_mid_b
+                _lseg_mid_min = _lseg_mid_max = rf_mid_b
+                # ⭐ 2026-10-04 [BEND3D] 起势快照（2D 弯度 + 3D 探针全套）
+                _lseg_b2d_arm = index_bend
+                if _b3d_probe is not None:
+                    _lseg_b3d_arm = _b3d_probe["bend"]
+                    _lseg_b3d_min = _b3d_probe["bend"]
+                    _lseg_comp_min = _b3d_probe["comp"]
+                    _lseg_dip3d_min = _b3d_probe["dip"]
+                    _lseg_diff_max = None
+                    _lseg_diff_comp = None
+                    _lseg_jump_max = _b3d_probe.get("jump_mm")
+                    _lseg_phal = _b3d_probe["phal_mm"]
+                else:
+                    _lseg_b3d_arm = None
+                    _lseg_b3d_min = _lseg_comp_min = _lseg_dip3d_min = None
+                    _lseg_diff_max = _lseg_diff_comp = None
+                    _lseg_jump_max = _lseg_phal = None
+            # 左键段进行中：累计 TIP 段内最小值与中弯摆幅（数据缺失帧跳过）
+            if (_tap_updated
+                    and tap_detector.state in (_TS.BEND_ARMED, _TS.BEND_HOLD, _TS.PRESSED)):
+                if two_finger_gap_parts is not None:
+                    _ltv = two_finger_gap_parts[3]
+                    if _ltv is not None:
+                        _lseg_tip_min = (float(_ltv) if _lseg_tip_min is None
+                                         else min(_lseg_tip_min, float(_ltv)))
+                if rf_mid_b is not None:
+                    _lseg_mid_min = (float(rf_mid_b) if _lseg_mid_min is None
+                                     else min(_lseg_mid_min, float(rf_mid_b)))
+                    _lseg_mid_max = (float(rf_mid_b) if _lseg_mid_max is None
+                                     else max(_lseg_mid_max, float(rf_mid_b)))
+                # ⭐ 2026-10-04 [BEND3D] 段内累计：3D 谷底/3D DIP 角谷底/压缩 min/
+                #   同帧 2D-3D 弯度差 max（正值=3D 看到了 2D 没看到的弯）/TIP 跳变 max
+                if _b3d_probe is not None:
+                    _bv = float(_b3d_probe["bend"])
+                    _lseg_b3d_min = _bv if _lseg_b3d_min is None else min(_lseg_b3d_min, _bv)
+                    _lseg_dip3d_min = (_b3d_probe["dip"] if _lseg_dip3d_min is None
+                                       else min(_lseg_dip3d_min, _b3d_probe["dip"]))
+                    if _b3d_probe["comp"] is not None:
+                        _cv = float(_b3d_probe["comp"])
+                        _lseg_comp_min = _cv if _lseg_comp_min is None else min(_lseg_comp_min, _cv)
+                    if index_bend is not None:
+                        _df = float(index_bend) - _bv
+                        if _lseg_diff_max is None or _df > _lseg_diff_max:
+                            _lseg_diff_max = _df
+                            _lseg_diff_comp = _b3d_probe["comp"]
+                    _jm = _b3d_probe.get("jump_mm")
+                    if _jm is not None:
+                        _lseg_jump_max = _jm if _lseg_jump_max is None else max(_lseg_jump_max, _jm)
+                    _lseg_phal = _b3d_probe["phal_mm"]
+            if (_tap_updated and index_bend is None
+                    and tap_detector.state in (_TS.BEND_ARMED, _TS.BEND_HOLD, _TS.PRESSED)):
+                if "Left" not in hand_results:
+                    _nr = "无控鼠手"
+                else:
+                    _nr = {"fist": "握拳", "fist_wm": "world缺失误判握拳",
+                           "palm": "掌宽过小"}.get(_bend_none_reason or "", "其他")
+                _seg_none_rs[_nr] = _seg_none_rs.get(_nr, 0) + 1
+            for _sr in tap_detector.take_seg_logs():
+                try:
+                    _sh = max(1, int(getattr(mouse, "sh", 1080)))
+                    if right_screen_pt is not None:
+                        _ex, _ey = right_screen_pt
+                        _ez = ("顶部标题栏" if _ey / _sh < 0.06
+                               else ("底部任务栏" if _ey / _sh > 0.94 else "中部内容区"))
+                        _ep = f"({int(_ex)},{int(_ey)})"
+                        if _seg_arm_xy is not None:
+                            _drift = _mt.hypot(_ex - _seg_arm_xy[0], _ey - _seg_arm_xy[1])
+                            _ap = f"ARM({int(_seg_arm_xy[0])},{int(_seg_arm_xy[1])})→"
+                        else:
+                            _drift = -1.0
+                            _ap = ""
+                    else:
+                        _ez, _ep, _drift, _ap = "-", "无点", -1.0, ""
+                    _nrs = "".join(f"{k}{v} " for k, v in sorted(_seg_none_rs.items())).strip()
+                    _gates = ""
+                    if _sr.get("ratio") is not None:
+                        _gates = (f" 谷底{_sr['seg_min']} ratio{_sr['ratio']}(门0.88)"
+                                  f" raw{_sr.get('raw_frac')}(门0.985)"
+                                  f" 回升{_sr.get('rise')}(门0.30)")
+                    _fz = f" 冻结{_sr['freeze_ms']}ms" if _sr.get("none_n") else ""
+                    _dr = f" 漂{_drift:.0f}px" if _drift >= 0 else ""
+                    # ⭐ 2026-10-04 [2F-OBS] 附本段起势两指尖距/段内 min/中弯摆幅（单指 vs 双指分组依据）
+                    def _lf(_v):
+                        return f"{_v:.2f}" if isinstance(_v, (int, float)) else "n/a"
+                    _swm = ((_lseg_mid_max - _lseg_mid_min)
+                            if _lseg_mid_min is not None and _lseg_mid_max is not None
+                            else None)
+                    _lobs = (f" | TIP起{_lf(_lseg_tip_arm)}/段内min{_lf(_lseg_tip_min)}"
+                             f" 中弯起{_lf(_lseg_mid_arm)}/摆{_lf(_swm)}")
+                    # ⭐ 2026-10-04 [BEND3D] 双口径对比：3D 起/谷 vs 2D 谷、3D DIP 角、
+                    #   压缩 min、2D-3D 差 max(及该帧压缩比)、末节骨长、TIP 跳变 max
+                    _lobs3d = ""
+                    if _lseg_b3d_arm is not None:
+                        _lobs3d = (f" | 3D起{_lf(_lseg_b3d_arm)}/谷{_lf(_lseg_b3d_min)}"
+                                   f"(2D起{_lf(_lseg_b2d_arm)}/谷{_lf(_sr.get('seg_min'))})"
+                                   f" DIP3D谷{_lf(_lseg_dip3d_min)}°"
+                                   f" 压缩min{_lf(_lseg_comp_min)}"
+                                   f" 2D-3D差max{_lf(_lseg_diff_max)}@压{_lf(_lseg_diff_comp)}"
+                                   f" 末节{_lf(_lseg_phal)}mm 跳max{_lf(_lseg_jump_max)}mm")
+                    print(
+                        f"[TAP-SEG] {_sr['result']}({_sr['ctx']}) 区={_ez} "
+                        f"段{_sr['wall_ms']}ms{_fz} None{_sr['none_n']}帧"
+                        f"{('[' + _nrs + ']') if _nrs else ''} "
+                        f"{_ap}末点{_ep}{_dr}{_gates}{_lobs}{_lobs3d}",
+                        flush=True)
+                except Exception:
+                    pass
+
+            # -------- 2026-10-04 [2F-ENTRY]/[2F-SEG] 右键检测器埋点（纯观测，零判定变更） --------
+            #   起势资格：TIP≤0.50 掌宽比 + 合成 bend≥0.55 + 食/中独立弯度都≥0.80 连续 0.11s；
+            #   段终点：合成 r 全程 + 食/中独立弯度摆幅 + TIP 段内谷底。
+            #   注：10-03 同弯门已被真机数据证伪并删除（真右键中弯摆幅仅 0.02~0.07），
+            #   10-04 起 ARM 后持续校验指尖距（TWO_FINGER_TIP_HOLD_R=0.60，结局 *_TIP*作废）。
+            #   另有检测器本体直打 [2F-ARM!]/[2F-END!]，不受本块 try/except 影响。
+            def _b2f(_v):
+                return f"{_v:.2f}" if isinstance(_v, (int, float)) else "n/a"
+            try:
+                # 每有效帧滚动记录 TIP 实测值（ARM 前 12 帧≈0.66s 轨迹，纯观测）
+                if (not disable_click_for_stretch_global
+                        and two_finger_gap_parts is not None
+                        and len(two_finger_gap_parts) >= 4):
+                    _sp = getattr(run_loop, "_cached_two_finger_gap_space", "3D")
+                    _rf_pre_tip.append((float(two_finger_gap_parts[3]), _sp))
+                    if len(_rf_pre_tip) > 12:
+                        _rf_pre_tip.pop(0)
+                if right_tap_detector.armed_this_frame:
+                    _rf_arm_xy = right_screen_pt
+                    _rf_arm_idx, _rf_arm_mid = rf_idx_b, rf_mid_b
+                    _rf_idx_min = _rf_idx_max = rf_idx_b
+                    _rf_mid_min = _rf_mid_max = rf_mid_b
+                    _rf_arm_pretip = list(_rf_pre_tip)
+                    # ⭐ 2026-10-04 [BEND3D] 右键段 3D 合成弯度快照
+                    _rf_b3d_arm = rf_bend3d
+                    _rf_b3d_min = rf_bend3d
+                    if two_finger_gap_parts is not None and len(two_finger_gap_parts) >= 4:
+                        _rf_tip_min = _rf_tip_max = float(two_finger_gap_parts[3])
+                        _rf_dip_min = _rf_dip_max = float(two_finger_gap_parts[2])
+                    else:
+                        _rf_tip_min = _rf_tip_max = None
+                        _rf_dip_min = _rf_dip_max = None
+                elif right_tap_detector.is_active and not disable_click_for_stretch_global:
+                    if rf_idx_b is not None:
+                        _rf_idx_min = rf_idx_b if _rf_idx_min is None else min(_rf_idx_min, rf_idx_b)
+                        _rf_idx_max = rf_idx_b if _rf_idx_max is None else max(_rf_idx_max, rf_idx_b)
+                    if rf_mid_b is not None:
+                        _rf_mid_min = rf_mid_b if _rf_mid_min is None else min(_rf_mid_min, rf_mid_b)
+                        _rf_mid_max = rf_mid_b if _rf_mid_max is None else max(_rf_mid_max, rf_mid_b)
+                    if two_finger_gap_parts is not None and len(two_finger_gap_parts) >= 4:
+                        _tv, _dv = float(two_finger_gap_parts[3]), float(two_finger_gap_parts[2])
+                        _rf_tip_min = _tv if _rf_tip_min is None else min(_rf_tip_min, _tv)
+                        _rf_tip_max = _tv if _rf_tip_max is None else max(_rf_tip_max, _tv)
+                        _rf_dip_min = _dv if _rf_dip_min is None else min(_rf_dip_min, _dv)
+                        _rf_dip_max = _dv if _rf_dip_max is None else max(_rf_dip_max, _dv)
+                    # ⭐ 2026-10-04 [BEND3D] 右键段中累计 3D 合成弯度谷底
+                    if rf_bend3d is not None:
+                        _rf_b3d_min = (rf_bend3d if _rf_b3d_min is None
+                                       else min(_rf_b3d_min, rf_bend3d))
+            except Exception:
+                pass
+            for _rl in right_tap_detector.take_rf_logs():
+                try:
+                    _sh = max(1, int(getattr(mouse, "sh", 1080)))
+                    _pt0 = right_screen_pt
+                    _rz = "-"
+                    if _pt0 is not None:
+                        _rx, _ry = _pt0
+                        _rz = ("顶部标题栏" if _ry / _sh < 0.06
+                               else ("底部任务栏" if _ry / _sh > 0.94 else "中部内容区"))
+                    _gs = getattr(run_loop, "_cached_two_finger_gap_space", "?")
+                    _parts = _rl.get("parts")
+                    if _parts and len(_parts) >= 4:
+                        _pstr = (f"MCP{_parts[0]:.2f} PIP{_parts[1]:.2f} "
+                                 f"DIP{_parts[2]:.2f}(门1.30) TIP{_parts[3]:.2f}")
+                    else:
+                        _pstr = "parts n/a"
+                    _xy = f"({int(_rx)},{int(_ry)})" if _pt0 is not None else "无点"
+                    _arm_xy_s = (f"({int(_rf_arm_xy[0])},{int(_rf_arm_xy[1])})"
+                                 if _rf_arm_xy is not None else "无")
+                    if _rl.get("result") == "起势资格":
+                        print(
+                            f"[2F-ENTRY] 资格取得 区={_rz} 空间={_gs} @{_xy} "
+                            f"TIP{_b2f(_rl.get('entry_tip'))}(门0.50) "
+                            f"合成bend{_b2f(_rl.get('entry_bend'))}(门0.55) {_pstr} | "
+                            f"食弯{_b2f(rf_idx_b)} 中弯{_b2f(rf_mid_b)}(资格直门0.80)",
+                            flush=True)
+                        continue
+                    _sw_i = (_rf_idx_max - _rf_idx_min
+                             if _rf_idx_min is not None and _rf_idx_max is not None else None)
+                    _sw_m = (_rf_mid_max - _rf_mid_min
+                             if _rf_mid_min is not None and _rf_mid_max is not None else None)
+                    _extra = ""
+                    if _rl.get("total") is not None:
+                        _extra = (f" 总{_rl['total']:.2f}s 保持{_rl.get('hold', 0):.2f}s"
+                                  f" Σ↑{_rl.get('di_up', 0):.2f}")
+                    if _rl.get("dip") is not None:
+                        _extra += f" 解散DIP{_rl['dip']:.2f}"
+                    if _rl.get("idx") is not None or _rl.get("mid") is not None:
+                        _extra += (f" 解散帧食弯{_b2f(_rl.get('idx'))}"
+                                   f" 中弯{_b2f(_rl.get('mid'))}(弯门0.80)")
+                    # ARM 前滚动窗 TIP 轨迹（! = 该帧走 2D 兜底，拿 PIP 冒充 TIP）
+                    _pre_vals = ",".join(f"{_v:.2f}{'!' if _s == '2D!' else ''}"
+                                         for _v, _s in _rf_arm_pretip) or "无"
+                    _pre_2d_n = sum(1 for _, _s in _rf_arm_pretip if _s == "2D!")
+                    print(
+                        f"[2F-SEG] {_rl['result']} 区={_rz} 空间={_gs} "
+                        f"段{_rl.get('wall_ms', 0)}ms None{_rl.get('none_n', 0)}帧"
+                        f" 入口={_rl.get('kind') or '?'}{_extra} | "
+                        f"起势TIP{_b2f(_rl.get('entry_tip'))} 资格bend{_b2f(_rl.get('entry_bend'))} | "
+                        f"ARM r{_b2f(_rl.get('arm_r'))} 谷底{_b2f(_rl.get('min_r'))} "
+                        f"末r{_b2f(_rl.get('r'))} | {_pstr} | "
+                        f"TIP段内{_b2f(_rf_tip_min)}~{_b2f(_rf_tip_max)}(门0.50) "
+                        f"DIP段内{_b2f(_rf_dip_min)}~{_b2f(_rf_dip_max)}(门1.30) | "
+                        f"ARM前12帧TIP[{_pre_vals}]{(' 含2D兜底x' + str(_pre_2d_n)) if _pre_2d_n else ''} | "
+                        f"食弯 ARM{_b2f(_rf_arm_idx)} 段内{_b2f(_rf_idx_min)}~{_b2f(_rf_idx_max)}"
+                        f"摆{_b2f(_sw_i)} | "
+                        f"中弯 ARM{_b2f(_rf_arm_mid)} 段内{_b2f(_rf_mid_min)}~{_b2f(_rf_mid_max)}"
+                        f"摆{_b2f(_sw_m)} | "
+                        f"3D合成r ARM{_b2f(_rf_b3d_arm)} 谷{_b2f(_rf_b3d_min)}(2D谷{_b2f(_rl.get('min_r'))}) | "
+                        f"ARM{_arm_xy_s}→末点{_xy}",
+                        flush=True)
+                except Exception:
+                    pass
+
             if not disable_click_for_stretch_global and stretch.state != _DS.SCALING:
                 # 1=单击(窗口超时补发) 2=长按按下 5=双击(快速原子) 6=慢节奏补救双击 7=双指右键：都要求鼠标钉在当前位置完成动作
                 if tap_event in (1, 2, 5, 6) or right_tap_event == _TEV.RIGHT_TAP:
@@ -2019,11 +2616,36 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     mouse._smoother.freeze_for_click()
                 if tap_event != 0:
                     # handle_finger_tap_event 内部 click / drag / mouseDown 用的就是对齐后的 right_screen_pt
+                    _hb_stage[0] = "tap发送/右键UIA探测"
                     mouse.handle_finger_tap_event(tap_event, right_screen_pt,
                                                   first_xy=_pending_first_xy)
+                    _hb_stage[0] = "business"
+                    # ⭐ 2026-10-02 逐击诊断（纯观测）：落点屏幕区域 × ARM→送达耗时，
+                    #   定位"标题栏点击大延迟、文件区秒反应"是否与屏幕区域相关
+                    if tap_event in (1, 5, 6):
+                        try:
+                            _hit_x = int(right_screen_pt[0])
+                            _hit_y = int(right_screen_pt[1])
+                            _sh = max(1, int(getattr(mouse, "sh", 1080)))
+                            _yr = _hit_y / _sh
+                            _zone = ("顶部标题栏" if _yr < 0.06
+                                     else ("底部任务栏" if _yr > 0.94 else "中部内容区"))
+                            _cms = tap_detector._click_ms
+                            _deliver_ms = round(float(_cms[-1]), 0) if len(_cms) else -1
+                            _m = tap_detector.metrics()
+                            print(
+                                f"[TAP-HIT] ev={tap_event} 点({_hit_x},{_hit_y}) 区={_zone} "
+                                f"ARM→送达{_deliver_ms:.0f}ms hold={_m['hold_sec']}s "
+                                f"ratio={_m['bend_ratio']}(门0.88) base={_m['baseline']} "
+                                f"bend={_m['bend']} 差分按={'是' if _m['armed_by_delta'] else '否'}",
+                                flush=True)
+                        except Exception:
+                            pass
                 if right_tap_event != 0:
                     # 双指并拢勾按回弹 → 右键单击
+                    _hb_stage[0] = "tap发送/右键UIA探测"
                     mouse.handle_finger_tap_event(right_tap_event, right_screen_pt)
+                    _hb_stage[0] = "business"
 
             # ---------- 双手拉伸 / 移动 ----------
             left_px: tuple | None = None
@@ -2496,7 +3118,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 preview_active=bool(preview),
                 # 优化诊断字段
                 opt_infer_size=480,
-                opt_ema_alpha=float(_EMA_ALPHA),
+                opt_ema_alpha=float(_ema_a),  # 2026-10-02 墙钟化：最近一帧实际 α（τ=60ms，随帧率变化；跳帧=0）
                 opt_mv_window=int(_MV_WINDOW),
                 opt_skip_total=int(_skip_total_frames),
                 opt_skip_skipped=int(_skip_skipped_frames),
@@ -2505,10 +3127,22 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
             # ---------- imshow / waitKey（仅 preview=True） ----------
             if preview:
+                _hb_stage[0] = "imshow"
                 cv2.imshow("DualHand -> Mouse (双手体感鼠标)", frame)
                 # waitKey(1) 必须在创建窗口的同一线程调用，所以这里直接调
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                # （拖动 HighGUI 窗口标题栏/弹出系统菜单时，消息泵会进入模态循环，
+                #   waitKey 可在此阻塞数秒~数十秒——watchdog 会以阶段=imshow 抓到）
+                _wk_t0 = time.perf_counter()
+                _wk_key = cv2.waitKey(1) & 0xFF
+                try:
+                    _wk_ms = (time.perf_counter() - _wk_t0) * 1000.0
+                    if _wk_ms > _det_rs["wk_max_ms"]:
+                        _det_rs["wk_max_ms"] = _wk_ms
+                except Exception:
+                    pass
+                if _wk_key == ord("q"):
                     break
+                _hb_stage[0] = "帧间"
             else:
                 # ⚠️ 2026-08-26 核心修复（无预览=不能控制鼠标根因）：
                 #   无任何 imshow / namedWindow 的情况下，Windows 版 OpenCV 的 cv2.waitKey(1)

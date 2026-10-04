@@ -101,8 +101,12 @@ CURSOR_MODE_SMOOTH   = "smooth"    # 当前 AR 5 层平滑（悬停稳、但有�
 CURSOR_MODE_ABSOLUTE = "absolute"  # ✨ 掌心绝对坐标（方案A 3层：中值杀尖峰 + Sigmoid微移阻尼 + 静止方差锁，兼顾稳+跟手）
 CURSOR_MODE_DIRECT   = "direct"    # ⭐ 2026-08-22 新增：严格跟随 UI 掌心绿圈——只保留 3 帧中值杀 1-2 帧飞点，无 Sigmoid 阻尼、无静止锁，无论手掌如何翻转都 1:1 跟手不卡顿
 
-# absolute 模式下为了避免 MediaPipe 1~2 帧偶发尖峰跳到屏幕角落，保留一个轻量的 3 帧中值
-ABS_MEDIAN_WINDOW = 3
+# absolute 模式下为了避免 MediaPipe 1~2 帧偶发尖峰跳到屏幕角落，保留一个轻量中值滤波
+# ⭐ 2026-10-02 MOUSE-STAT 基线：静瞄期仍出现 max 64~83px 单/双帧大跳且 3 帧中值挡不住双帧跳，
+#   absolute 提到 5 帧（杀 2 帧飞点；18fps 下额外滞后约 55ms，仅大跳相关，正常移动 Sigmoid 不受影响）；
+#   direct 保持 3 帧（严格跟手指向，延迟零增加）
+ABS_MEDIAN_WINDOW = 5
+DIRECT_MEDIAN_WINDOW = 3
 
 # ✨✨ 方案 A 新增：absolute 模式「大范围跟手 + 小范围不晃」的 3 层流水线参数（只作用在 absolute 模式，不影响 smooth）
 #   Layer 2 Sigmoid：微移阻尼增益（响应曲线拐点，k 越大=拐点越陡=越严格压制小抖动）
@@ -138,6 +142,12 @@ TAP_DBL_SNAP_PX = 10
 # · 慢节奏双击补救（OS_DOUBLE_CLICK=False 延迟模式）：补救窗内第二击距 click#1 ≤ 本阈值
 #   → 原子 doubleClick 打开同一目标；超阈值 → 第二击降级普通 click（不点旧目标）。
 RESCUE_DBL_SNAP_PX = 10
+# ⭐⭐ 2026-10-03 真机日志定案（慢双击第二击落点漂移 17~75px，10px 硬门把真双击几乎全部降级；
+#   而相邻独立目标点击相距 90~154px）：10px~本值之间的"中距离"第二击不做距离硬判，
+#   改用 MSAA 探测两点下的 UI 元素——两点【同名同角色】才是同一目标（手晃/姿态噪声），
+#   吸到 click#1 原子双击；名称不同/空白/探测失败 → 仍按 2026-09-19 决定降级普通 click，
+#   相邻图标（列表行高~18px、名称必不同）绝不会被强制吸回旧目标。>本值直接判独立点击。
+RESCUE_DBL_TARGET_PX = 90
 # ⭐ 点击诊断日志开关：True 时打印 [CLICK-DIAG]（双击间隔/漂移/吸附、补救双击判定）。
 #   2026-09-15：日常使用默认关闭（每次点击打印+flush 会在控制台 I/O 上阻塞主循环）；排查双击问题时临时改 True
 CLICK_DIAG = False
@@ -244,8 +254,8 @@ class ARSmoother:
         self._last_out_x = None
         self._last_out_y = None
         # absolute 模式 Layer 1：3 帧中值杀尖峰
-        self._abs_buf_x: deque[float] = deque(maxlen=ABS_MEDIAN_WINDOW)
-        self._abs_buf_y: deque[float] = deque(maxlen=ABS_MEDIAN_WINDOW)
+        self._abs_buf_x: deque[float] = deque(maxlen=max(ABS_MEDIAN_WINDOW, DIRECT_MEDIAN_WINDOW))
+        self._abs_buf_y: deque[float] = deque(maxlen=max(ABS_MEDIAN_WINDOW, DIRECT_MEDIAN_WINDOW))
         # ✨✨ absolute 模式 Layer 3：静止方差锁（样本缓冲 + 锁位置）
         self._abs_lock_buf_x: deque[float] = deque(maxlen=ABS_LOCK_WINDOW)
         self._abs_lock_buf_y: deque[float] = deque(maxlen=ABS_LOCK_WINDOW)
@@ -254,6 +264,70 @@ class ARSmoother:
         self._abs_locked_ref_ax: float | None = None  # ⭐ 锁成立时 Layer1(ax) 参考值（用于解锁判定时比较手掌是否真的移动）
         self._abs_locked_ref_ay: float | None = None  # ⭐ 锁成立时 Layer1(ay) 参考值
         self._abs_lock_cooldown_until: float = 0.0  # ⭐ 刚解锁后的冷却截止墙钟：此之前不允许重新锁死（防止解锁-重锁抖动）
+        # ⭐⭐ 2026-10-02 静止锁迟滞重写（MOUSE-STAT 基线：锁定 0~5%，入锁即被 cum_disp 误杀，
+        #   解锁时 dist 仅 0.93px / σ 2.15）：
+        #   · 删除 L1 累计 cum_disp（零均值抖动也会累加成大数）→ 改测【最近 3 帧 Layer1 均值漂移】，
+        #     只有单向真实移动才解锁（1~2 帧飞点被 Layer1 的 5 帧中值挡在均值外）
+        #   · 锁点钉整数像素；解锁后保留上一锁点，重锁点距旧点 <2px 则沿用旧点（消台阶微震）
+        self._abs_last_lock_x: float | None = None  # 最近一次锁点（解锁后保留，供重锁沿用）
+        self._abs_last_lock_y: float | None = None
+        # ⭐ 2026-10-02 鼠标微震诊断（纯观测；take_mouse_diag 取窗清零）：
+        #   raw/out 位移 = 每帧（实际重算的一次）屏幕像素帧间位移，取 p50/p90/max
+        #   locked = absolute 静止锁输出帧；enters/unlocks = 入锁/锁→解锁次数
+        #   解锁瞬间记录单点 dist / 3帧漂移 drift / 缓冲 σ（验证迟滞解锁行为）
+        self._diag_raw_d: list[float] = []
+        self._diag_out_d: list[float] = []
+        self._diag_locked = 0
+        self._diag_enters = 0
+        self._diag_unlocks = 0
+        self._diag_unl_dist: list[float] = []
+        self._diag_unl_trend: list[float] = []
+        self._diag_unl_std: list[float] = []
+
+    def note_frame_disp(self, raw_d: float, out_d: float):
+        """每帧实际执行一次平滑后由 MouseController 调用：记录原始/输出帧间屏幕位移(px)。"""
+        self._diag_raw_d.append(float(raw_d))
+        self._diag_out_d.append(float(out_d))
+
+    @staticmethod
+    def _pct(sorted_vals: list[float], q: float) -> float:
+        n = len(sorted_vals)
+        if not n:
+            return 0.0
+        return float(sorted_vals[min(n - 1, int(round(q * (n - 1))))])
+
+    def take_mouse_diag(self) -> dict:
+        """取出窗口诊断并清零（纯观测，不影响平滑/锁逻辑）。"""
+        r = sorted(self._diag_raw_d)
+        o = sorted(self._diag_out_d)
+        d = sorted(self._diag_unl_dist)
+        n = len(o)
+        snap = {
+            "frames": n,
+            "locked_pct": round(100.0 * self._diag_locked / max(1, n), 0),
+            "raw_p50": round(self._pct(r, 0.50), 2),
+            "raw_p90": round(self._pct(r, 0.90), 2),
+            "raw_max": round(r[-1] if r else 0.0, 2),
+            "out_p50": round(self._pct(o, 0.50), 2),
+            "out_p90": round(self._pct(o, 0.90), 2),
+            "out_max": round(o[-1] if o else 0.0, 2),
+            "enters": self._diag_enters,
+            "unlocks": self._diag_unlocks,
+            "unl_dist_max": round(d[-1] if d else 0.0, 2),
+            "unl_dist_p90": round(self._pct(d, 0.90), 2),
+            "unl_trend_max": round(max(self._diag_unl_trend) if self._diag_unl_trend else 0.0, 2),
+            "unl_std_avg": round(sum(self._diag_unl_std) / max(1, len(self._diag_unl_std)), 2),
+        }
+        self._diag_raw_d.clear()
+        self._diag_out_d.clear()
+        self._diag_locked = 0
+        self._diag_enters = 0
+        self._diag_unlocks = 0
+        self._diag_unl_dist.clear()
+        self._diag_unl_trend.clear()
+        self._diag_unl_std.clear()
+        return snap
+
 
     # ---------- 外部：模式切换 ----------
     def set_mode(self, mode: str):
@@ -303,6 +377,8 @@ class ARSmoother:
         self._abs_locked_ref_ax = None
         self._abs_locked_ref_ay = None
         self._abs_lock_cooldown_until = 0.0
+        self._abs_last_lock_x = None
+        self._abs_last_lock_y = None
 
     # ---------- 内部工具 ----------
     @staticmethod
@@ -369,9 +445,9 @@ class ARSmoother:
             # Layer 1：3 帧中值（仅杀偶发 1 帧飞点，不引入任何延迟）
             self._abs_buf_x.append(float(raw_x))
             self._abs_buf_y.append(float(raw_y))
-            if len(self._abs_buf_x) >= ABS_MEDIAN_WINDOW and len(self._abs_buf_y) >= ABS_MEDIAN_WINDOW:
-                mx = float(np.median(self._abs_buf_x))
-                my = float(np.median(self._abs_buf_y))
+            if len(self._abs_buf_x) >= DIRECT_MEDIAN_WINDOW and len(self._abs_buf_y) >= DIRECT_MEDIAN_WINDOW:
+                mx = float(np.median(list(self._abs_buf_x)[-DIRECT_MEDIAN_WINDOW:]))
+                my = float(np.median(list(self._abs_buf_y)[-DIRECT_MEDIAN_WINDOW:]))
             else:
                 mx = float(raw_x)
                 my = float(raw_y)
@@ -385,12 +461,13 @@ class ARSmoother:
         # ============================================================
         if self._mode == CURSOR_MODE_ABSOLUTE:
             # ============================================================
-            # Layer 1：3 帧中值（杀 MediaPipe 1~2 帧偶发尖峰，和原逻辑一致）
-            #   作用：过滤 ±30px 的 1 帧"飞点"（比如手掌瞬间识别错位跳到角落）
+            # Layer 1：中值滤波（5 帧，杀 MediaPipe 1~2 帧偶发尖峰）
+            #   作用：过滤 ±30~80px 的 1~2 帧"飞点"（识别错位/跟踪换手跳到角落）
+            #   热身 3 帧起即对已收集样本取中值，窗口随后渐扩到 5
             # ============================================================
             self._abs_buf_x.append(float(raw_x))
             self._abs_buf_y.append(float(raw_y))
-            if len(self._abs_buf_x) >= ABS_MEDIAN_WINDOW and len(self._abs_buf_y) >= ABS_MEDIAN_WINDOW:
+            if len(self._abs_buf_x) >= DIRECT_MEDIAN_WINDOW and len(self._abs_buf_y) >= DIRECT_MEDIAN_WINDOW:
                 ax = float(np.median(self._abs_buf_x))
                 ay = float(np.median(self._abs_buf_y))
             else:
@@ -417,14 +494,17 @@ class ARSmoother:
 
             # ============================================================
             # Layer 3：静止方差锁（对准小按钮的核心杀招 → 光标"钉住"完全不动）
-            #   ⚠️ 2026-08-22 关键修复：
-            #     ① 判定/解锁全部改用 Layer1 原始 (ax,ay)，不再用 Sigmoid 压缩后的 sx/sy——
-            #        之前用 sx/sy 导致 Sigmoid 把真实移动压小，解锁累计量永远凑不够→鼠标死锁不动
-            #     ② 锁点本身仍取最近 Layer2 (sx,sy) 均值（保证输出连续不跳）
-            #     ③ UNLOCK_DIST 累计阈值从 2.0×降到 1.5×（更灵敏解锁）
+            # ⭐⭐ 2026-10-02 迟滞重写（MOUSE-STAT 基线实锤旧逻辑"进得去留不住"）：
+            #   旧：解锁 = 单点 dist>8.96 或缓冲 L1 累计 cum_disp>13.4。
+            #       cum_disp 把零均值抖动全累加（σ≈1.5px 时 10 帧×2维≈24px），
+            #       实测手偏 0.93px、σ=2.15 也被误杀 → 锁定帧仅 0~5%、入锁必解锁。
+            #   新：解锁 = 最近 3 帧 Layer1【均值】相对锁参考点漂移 >8.96px。
+            #       Layer1 已是 5 帧中值输出：1~2 帧飞点在中值窗内（3 旧 vs 2 新）根本进不了均值，
+            #       无需再叠多帧确认 → 均值超阈当帧即解锁（起手黏滞≈3帧/160ms@18fps）。
             # ============================================================
-            UNLOCK_DIST = float(ABS_LOCK_THRESH) * 1.6   # 8.0px
-            RELOCK_COOLDOWN_SEC = ABS_LOCK_WINDOW * 2 / 30.0  # ⭐ 解锁后的冷却墙钟时长（原 20 帧 @30fps≈0.67s）
+            UNLOCK_DIST = float(ABS_LOCK_THRESH) * 1.6   # 8.96px：3 帧均值漂移解锁距离
+            RELOCK_COOLDOWN_SEC = 0.15                   # 解锁后冷却（旧 0.67s 是为防 cum_disp 误杀抖动，新迟滞不需要）
+            RELOCK_STICKY_PX = 2.0                       # 重锁点距上一锁点 <2px → 沿用旧整数锁点（消台阶）
             now = time.monotonic()
             # ⭐ 用 Layer1 原始 ax/ay 送入锁判定缓冲（真实反映手掌有没有在动）
             self._abs_lock_buf_x.append(float(ax))
@@ -433,56 +513,77 @@ class ARSmoother:
             in_relock_cooldown = now < self._abs_lock_cooldown_until
 
             buf_full = len(self._abs_lock_buf_x) >= ABS_LOCK_WINDOW and len(self._abs_lock_buf_y) >= ABS_LOCK_WINDOW
-            # ① 已在锁死状态 → 先检查是否需要解锁（基于原始 Layer1 值判断手掌是否真动）
+            # ① 已在锁死状态 → 先检查是否需要解锁（最近 3 帧均值漂移 + 双帧确认）
             if self._abs_locked_x is not None and self._abs_locked_y is not None:
-                # 单点距离：原始 Layer1 (ax,ay) 到「锁点对应的原始参考点」的距离
+                # 单点距离（仅诊断用）
                 dist_to_lock = float(np.sqrt(
                     (float(ax) - float(self._abs_locked_ref_ax)) ** 2 +
                     (float(ay) - float(self._abs_locked_ref_ay)) ** 2
                 ))
-                # 累计位移趋势解锁：缓冲内所有 Layer1 原始点相对参考点的累计
-                cum_disp = 0.0
-                try:
-                    for xi, yi in zip(self._abs_lock_buf_x, self._abs_lock_buf_y):
-                        cum_disp += abs(float(xi) - float(self._abs_locked_ref_ax)) + abs(float(yi) - float(self._abs_locked_ref_ay))
-                except Exception:
-                    cum_disp = 0.0
-                # ⭐ 累计阈值从 2.0×UNLOCK 降到 1.5×：手掌持续移动能更快解锁
-                unlock_trend = cum_disp > (1.5 * UNLOCK_DIST)
+                # 真实漂移量：最近 3 帧 Layer1 均值 → 锁参考点
+                _nx3 = min(3, len(self._abs_lock_buf_x), len(self._abs_lock_buf_y))
+                _bx = list(self._abs_lock_buf_x)[-_nx3:]
+                _by = list(self._abs_lock_buf_y)[-_nx3:]
+                _m3x = float(sum(_bx)) / len(_bx)
+                _m3y = float(sum(_by)) / len(_by)
+                drift = float(np.sqrt(
+                    (_m3x - float(self._abs_locked_ref_ax)) ** 2 +
+                    (_m3y - float(self._abs_locked_ref_ay)) ** 2
+                ))
 
-                if dist_to_lock <= UNLOCK_DIST and not unlock_trend:
-                    # 仍然在锁点附近 + 累计也没动 → 继续锁死，输出固定光标位置
+                if drift <= UNLOCK_DIST:
+                    # 抖动/未漂移 → 维持锁死
                     lx, ly = float(self._abs_locked_x), float(self._abs_locked_y)
                     self._last_out_x = lx
                     self._last_out_y = ly
+                    self._diag_locked += 1
                     return lx, ly
-                else:
-                    # 真实动作 → 解锁；清空锁缓冲 + 启动冷却（N 帧内不再重锁）
-                    self._abs_locked_x = None
-                    self._abs_locked_y = None
-                    self._abs_locked_ref_ax = None
-                    self._abs_locked_ref_ay = None
-                    self._abs_lock_cooldown_until = now + RELOCK_COOLDOWN_SEC
-                    self._abs_lock_buf_x.clear()
-                    self._abs_lock_buf_y.clear()
-                    self._abs_lock_buf_x.append(float(ax))
-                    self._abs_lock_buf_y.append(float(ay))
-                    buf_full = False
+                # 3 帧均值持续漂移超阈（1~2 帧飞点已被 5 帧中值挡在均值外）→ 解锁
+                self._diag_unlocks += 1
+                self._diag_unl_dist.append(dist_to_lock)
+                self._diag_unl_trend.append(drift)
+                try:
+                    self._diag_unl_std.append(0.5 * (
+                        float(np.std(self._abs_lock_buf_x))
+                        + float(np.std(self._abs_lock_buf_y))))
+                except Exception:
+                    pass
+                self._abs_locked_x = None
+                self._abs_locked_y = None
+                self._abs_locked_ref_ax = None
+                self._abs_locked_ref_ay = None
+                self._abs_lock_cooldown_until = now + RELOCK_COOLDOWN_SEC
+                self._abs_lock_buf_x.clear()
+                self._abs_lock_buf_y.clear()
+                self._abs_lock_buf_x.append(float(ax))
+                self._abs_lock_buf_y.append(float(ay))
+                buf_full = False
             # ② 未锁死 → 尝试满足「缓冲满 + 冷却已过 + Layer1 原始 σ < 阈值」→ 进入锁死
             if buf_full and self._abs_locked_x is None and not in_relock_cooldown:
                 std_x = float(np.std(self._abs_lock_buf_x))
                 std_y = float(np.std(self._abs_lock_buf_y))
                 if std_x < ABS_LOCK_THRESH and std_y < ABS_LOCK_THRESH:
-                    # 锁光标位置 = 最近的 Layer2 (sx,sy) 均值（不跳）
                     # 参考点（用于解锁判断）= 最近的 Layer1 (ax,ay) 均值
                     self._abs_locked_ref_ax = float(np.mean(self._abs_lock_buf_x))
                     self._abs_locked_ref_ay = float(np.mean(self._abs_lock_buf_y))
-                    lock_x = float(sx)
-                    lock_y = float(sy)
+                    # 锁光标 = 当前 Layer2 输出钉到整数像素；
+                    # 距上一锁点 <2px 则沿用旧锁点（反复锁-放不再有整数台阶）
+                    lock_x = float(round(float(sx)))
+                    lock_y = float(round(float(sy)))
+                    if (self._abs_last_lock_x is not None
+                            and self._abs_last_lock_y is not None
+                            and abs(lock_x - self._abs_last_lock_x) < RELOCK_STICKY_PX
+                            and abs(lock_y - self._abs_last_lock_y) < RELOCK_STICKY_PX):
+                        lock_x = float(self._abs_last_lock_x)
+                        lock_y = float(self._abs_last_lock_y)
                     self._abs_locked_x = lock_x
                     self._abs_locked_y = lock_y
+                    self._abs_last_lock_x = lock_x
+                    self._abs_last_lock_y = lock_y
                     self._last_out_x = lock_x
                     self._last_out_y = lock_y
+                    self._diag_enters += 1
+                    self._diag_locked += 1
                     return lock_x, lock_y
             # ③ 正常（不满足锁死条件）→ 输出 Layer2 结果
             self._last_out_x = float(sx)
@@ -660,10 +761,11 @@ def _vtbl_fn(vtbl_ptr, idx, restype, *argtypes):
     return proto(slot)
 
 
-def probe_ui_target(x: int, y: int) -> tuple[bool, str]:
-    """探测屏幕 (x,y) 下是否为具名可选目标。返回 (has_target, 描述串)。任何失败都安全降级为 False。"""
+def probe_ui_target(x: int, y: int) -> tuple:
+    """探测屏幕 (x,y) 下是否为具名可选目标。返回 (has_target, 描述串, 元素key)。
+    key=(role, 小写名称)：无名称/失败为 None，供双击"两点是否同一目标"比对。任何失败安全降级。"""
     if ctypes.sizeof(ctypes.c_void_p) != 8:
-        return False, "MSAA 探测仅支持 64 位 Python → 按空右键处理"
+        return False, "MSAA 探测仅支持 64 位 Python → 按空右键处理", None
     try:
         _init_msaa_prototypes()
         user32 = ctypes.windll.user32
@@ -682,7 +784,7 @@ def probe_ui_target(x: int, y: int) -> tuple[bool, str]:
         vchild = _VARIANT()
         hr = oleacc.AccessibleObjectFromPoint(pt, ctypes.byref(pacc), ctypes.byref(vchild))
         if hr != 0 or not pacc.value:
-            return False, f"无对象(hr=0x{hr & 0xFFFFFFFF:08X}) class='{cls}'"
+            return False, f"无对象(hr=0x{hr & 0xFFFFFFFF:08X}) class='{cls}'", None
 
         p_use = pacc
         var_use = vchild
@@ -697,7 +799,7 @@ def probe_ui_target(x: int, y: int) -> tuple[bool, str]:
                 p_extra = ctypes.c_void_p()
                 if qi(p_disp, ctypes.byref(_IID_IACCESSIBLE), ctypes.byref(p_extra)) != 0 \
                         or not p_extra.value:
-                    return False, f"子对象 QI 失败 class='{cls}'"
+                    return False, f"子对象 QI 失败 class='{cls}'", None
                 p_use = p_extra
                 var_use = _VARIANT()
                 var_use.vt = _VT_I4
@@ -736,11 +838,39 @@ def probe_ui_target(x: int, y: int) -> tuple[bool, str]:
         role_txt = _MSAA_ROLE_NAMES.get(role, f"role{role}")
         desc = f"{role_txt} name='{name.strip()[:40]}' class='{cls}'"
         has_target = bool(name.strip()) and role in _MSAA_TARGET_ROLES
+        # 元素同一性 key：仅具名对象可比（空白客户端区 name='' 不参与，避免两处空白误判同目标）
+        _ui_key = (role_txt, name.strip()[:64].casefold()) if name.strip() else None
         if has_target and cls in _MSAA_SKIP_SELECT_CLASSES:
-            return False, f"{desc}（任务栏/开始键：原生右键即可，跳过选中）"
-        return has_target, desc
+            return False, f"{desc}（任务栏/开始键：原生右键即可，跳过选中）", _ui_key
+        return has_target, desc, _ui_key
     except Exception as e:
-        return False, f"MSAA 探测异常({e!r}) → 按空右键处理"
+        return False, f"MSAA 探测异常({e!r}) → 按空右键处理", None
+
+
+def rescue_dbl_target_decision(ix: int, iy: int, xy0) -> tuple:
+    """慢节奏双击第二击 vs click#1 是否同一目标（2026-10-03 距离门+MSAA 双级裁决）。
+    返回 (same_target, dpos, reason)；只读探测、不产生任何鼠标输入，任何异常安全降级为不同目标。
+      · ≤RESCUE_DBL_SNAP_PX(10)         → 像素近邻，直接同目标；
+      · 10 < d ≤ RESCUE_DBL_TARGET_PX(90) → 两点下 MSAA 元素【同名同角色】才同目标；
+      · >90px / 名称不同 / 空白 / 探测失败 → 不同目标（保住 2026-09-19 相邻图标防误吸决定）。
+    """
+    if xy0 is None:
+        return True, 0.0, "无click#1记录"
+    dpos = ((ix - xy0[0]) ** 2 + (iy - xy0[1]) ** 2) ** 0.5
+    if dpos <= RESCUE_DBL_SNAP_PX:
+        return True, dpos, f"近邻{dpos:.0f}px≤{RESCUE_DBL_SNAP_PX}"
+    if dpos > RESCUE_DBL_TARGET_PX:
+        return False, dpos, f"远离{dpos:.0f}px>{RESCUE_DBL_TARGET_PX}"
+    try:
+        _, _, k0 = probe_ui_target(int(xy0[0]), int(xy0[1]))
+        _, _, k1 = probe_ui_target(int(ix), int(iy))
+    except Exception:
+        k0 = k1 = None
+    if k0 is not None and k0 == k1:
+        return True, dpos, f"同名目标'{k0[1][:24]}' {dpos:.0f}px"
+    if k0 is None or k1 is None:
+        return False, dpos, f"目标不可命名/空白 {dpos:.0f}px"
+    return False, dpos, f"'{k0[1][:16]}'≠'{k1[1][:16]}' {dpos:.0f}px"
 
 
 # ============================================================================
@@ -844,6 +974,27 @@ class MouseController:
         self.last_screen_norm: tuple[float, float] | None = None  # 上次跑 smooth 用的归一化锚点（用于判"是否同帧同坐标"）
         self.last_screen_px:   tuple[float, float] | None = None  # 上次输出屏幕像素坐标（gx,gy 原始 raw 像素）
         self.last_smoothed_px: tuple[float, float] | None = None  # 上次输出平滑后屏幕像素坐标（sx,sy 已过 smoother）
+        # ⭐ 2026-10-02 像素量化滞回：亚像素在整数边界两侧来回时不再 0/1 横跳，
+        #   新像素值需越过当前像素 ±0.75 才跳（对真实移动仅多 0.25px 门槛，不可感知）
+        self._quant_ix: int | None = None
+        self._quant_iy: int | None = None
+
+    def _quantize_px(self, sx: float, sy: float) -> tuple[int, int]:
+        rx, ry = int(round(sx)), int(round(sy))
+        if self._quant_ix is None or self._quant_iy is None:
+            self._quant_ix, self._quant_iy = rx, ry
+            return rx, ry
+        qx, qy = self._quant_ix, self._quant_iy
+        if rx > qx and sx >= qx + 0.75:
+            qx = rx
+        elif rx < qx and sx <= qx - 0.75:
+            qx = rx
+        if ry > qy and sy >= qy + 0.75:
+            qy = ry
+        elif ry < qy and sy <= qy - 0.75:
+            qy = ry
+        self._quant_ix, self._quant_iy = qx, qy
+        return qx, qy
 
     # ---------------- 外部：ROI / cursor 模式切换 ----------------
     def set_roi_scale(self, roi_scale: float):
@@ -954,14 +1105,23 @@ class MouseController:
                 and self.last_smoothed_px is not None):
             gx, gy = self.last_screen_px
             sx, sy = self.last_smoothed_px
-            return gx, gy, sx, sy, int(round(sx)), int(round(sy))
+            ix, iy = self._quantize_px(sx, sy)
+            return gx, gy, sx, sy, ix, iy
         # 缓存未命中 → 实际执行映射 + 平滑一次 → 写缓存
         gx, gy = self._norm_to_screen(nx, ny)
         sx, sy = self._smoother.filter(gx, gy, gesture=gesture_hint)
+        # ⭐ 诊断：帧间屏幕位移（仅在每帧真正重算时记录一次，同帧缓存命中不计）
+        if self.last_screen_px is not None and self.last_smoothed_px is not None:
+            _rd = float(np.hypot(gx - self.last_screen_px[0],
+                                 gy - self.last_screen_px[1]))
+            _od = float(np.hypot(sx - self.last_smoothed_px[0],
+                                 sy - self.last_smoothed_px[1]))
+            self._smoother.note_frame_disp(_rd, _od)
         self.last_screen_norm = (nx, ny)
         self.last_screen_px   = (float(gx), float(gy))
         self.last_smoothed_px = (float(sx), float(sy))
-        return float(gx), float(gy), float(sx), float(sy), int(round(sx)), int(round(sy))
+        ix, iy = self._quantize_px(float(sx), float(sy))
+        return float(gx), float(gy), float(sx), float(sy), ix, iy
 
     def invalidate_anchor_cache(self):
         """外部在一帧完全处理完后可调用，清空缓存以强制下一帧重新评估；
@@ -969,6 +1129,8 @@ class MouseController:
         self.last_screen_norm = None
         self.last_screen_px = None
         self.last_smoothed_px = None
+        self._quant_ix = None
+        self._quant_iy = None
 
     def _smooth(self, nx: float, ny: float, gesture: str | None = None):
         """⚠️ 直接调用 _smooth 会绕过同帧缓存——请优先使用 _eval_anchor_once()。
@@ -1249,7 +1411,7 @@ class MouseController:
             # ⭐ 2026-09-17 极速：用 Win32 SendInput 把 左选+右键 全部事件塞进一次调用，
             #   左选与右键之间无 Python 层延迟、无 sleep（OS 消息队列顺序派发，选中态即时落账）。
             _t0 = time.time()
-            has_target, target_desc = probe_ui_target(ix, iy)
+            has_target, target_desc, _ = probe_ui_target(ix, iy)
             _probe_ms = (time.time() - _t0) * 1000.0
             try:
                 _fast_click_sequence(ix, iy, select_first=has_target)
@@ -1311,52 +1473,55 @@ class MouseController:
             self._drag_active = False
         elif tap_event == _TE.DOUBLE_TAP:
             # 双击窗口（0.38s）内完成第二次"勾指回弹"。
-            # ⭐ 2026-09-19 位置门控（同补救路径 10px 规则）：第二击落点距挂起的第一击 >
-            #   RESCUE_DBL_SNAP_PX = 手已移到别的目标 → 先把挂起的 click#1 补在【第一击位置】，
-            #   再在新落点普通单击（两次独立 click，绝不在新目标上 doubleClick）；
-            #   ≤阈值才是同一目标 → 原子 doubleClick（第一次单击挂起未发，物理点击恰好 2 次）。
-            _d0 = 0.0 if first_xy is None else \
-                ((ix - first_xy[0]) ** 2 + (iy - first_xy[1]) ** 2) ** 0.5
-            if first_xy is not None and _d0 > RESCUE_DBL_SNAP_PX:
-                if CLICK_DIAG:
-                    print(f"[CLICK-DIAG] 快路径第二击 落点({ix},{iy}) 距首击({int(first_xy[0])},"
-                          f"{int(first_xy[1])}) {_d0:.1f}px>{RESCUE_DBL_SNAP_PX}px → 不同目标："
-                          f"补发click#1于首击位置 + 新目标普通click", flush=True)
+            # ⭐ 2026-09-19 位置门控 + 2026-10-03 MSAA 同名放宽：第二击落点距挂起的第一击
+            #   ≤10px → 同一目标；10~90px 须两点下是同名 UI 元素（快窗口 0.38s 内漂移通常很小，
+            #   此处仅兜底）；否则手已移到别的目标 → click#1 补在首击位置 + 新落点普通单击。
+            _same, _d0, _why = rescue_dbl_target_decision(ix, iy, first_xy)
+            if not _same:
+                print(f"[DBL-RESCUE] 快窗口第二击 ({ix},{iy}) vs 首击"
+                      f"({int(first_xy[0])},{int(first_xy[1])}) {_why} "
+                      f"→ 两次独立click（不双击旧目标）", flush=True)
                 pyautogui.click(int(first_xy[0]), int(first_xy[1]), button="left")
                 pyautogui.click(ix, iy, button="left")
                 self._dbg_last_click_t = time.time()
                 self._dbg_last_click_xy = (ix, iy)
             else:
-                pyautogui.doubleClick(ix, iy, button="left")
+                # 原子 doubleClick 落在首击像素（物理点击恰好 2 次，OS 必判双击）
+                if first_xy is not None:
+                    _tx, _ty = int(first_xy[0]), int(first_xy[1])
+                else:
+                    _tx, _ty = ix, iy
+                pyautogui.doubleClick(_tx, _ty, button="left")
+                if _d0 > RESCUE_DBL_SNAP_PX:
+                    print(f"[DBL-RESCUE] 快窗口第二击 ({ix},{iy}) vs 首击({_tx},{_ty}) {_why} "
+                          f"→ doubleClick@首击", flush=True)
             if self._drag_active:
                 try: pyautogui.mouseUp()
                 except Exception: pass
             self._drag_active = False
         elif tap_event == _TE.RESCUE_DBL_TAP:
-            # 慢节奏双击补救：补发 click#1 后 3.0s 补救窗内的第二击（真机两次勾指间隔 1.5~3.3s）。
-            # 位置门控：落点与 click#1 ≤ RESCUE_DBL_SNAP_PX = 同一图标双击意图 → 原子 doubleClick
-            # （内部两次点击间隔几十ms，OS 必判双击打开，规避"选中后慢点击=重命名"）；
-            # 落点已移到别处 = 普通单击别的图标。
+            # 慢节奏双击补救：补发 click#1 后 2.5s 补救窗内的第二击（真机两次勾指间隔 1.5~3.3s）。
+            # ⭐ 2026-10-03 真机日志：慢双击两击落点自然差 17~75px（勾指整手晃动+弯指锚点姿态差），
+            #   旧 10px 硬门把绝大多数真双击降级成普通单击。新裁决（rescue_dbl_target_decision）：
+            #   ≤10px 直接同目标；10~90px 两点 MSAA 同名同角色才吸回 click#1 原子 doubleClick；
+            #   相邻/不同名/空白/>90px → 普通单击（保住 09-19"相邻目标不被吸回"的决定）。
             _xy0 = getattr(self, "_dbg_last_click_xy", None)
-            if _xy0 is not None:
-                _dpos = ((ix - _xy0[0]) ** 2 + (iy - _xy0[1]) ** 2) ** 0.5
-            else:
-                _dpos = 0.0
-            if _xy0 is not None and _dpos <= RESCUE_DBL_SNAP_PX:
+            _same, _dpos, _why = rescue_dbl_target_decision(ix, iy, _xy0)
+            if _same and _xy0 is not None:
                 # 同一图标 → 吸附到 click#1 精确像素，原子双击打开
-                if CLICK_DIAG:
-                    print(f"[CLICK-DIAG] 🔁 补救双击(慢节奏) 落点({ix},{iy}) 距click#1 {_dpos:.1f}px≤{RESCUE_DBL_SNAP_PX}px "
-                          f"→ doubleClick({_xy0[0]},{_xy0[1]}) 原子双击打开", flush=True)
-                pyautogui.doubleClick(_xy0[0], _xy0[1], button="left")
+                pyautogui.doubleClick(int(_xy0[0]), int(_xy0[1]), button="left")
+                print(f"[DBL-RESCUE] 慢补救第二击 ({ix},{iy}) vs click#1"
+                      f"({int(_xy0[0])},{int(_xy0[1])}) {_why} "
+                      f"→ doubleClick@click#1 原子打开", flush=True)
                 # 双击已由本次原子操作完成，清点击记录避免后续干扰
                 self._dbg_last_click_xy = None
                 self._dbg_last_click_t = None
             else:
-                # 手已移到别的图标 → 降级普通单击
-                if CLICK_DIAG:
-                    print(f"[CLICK-DIAG] 补救第二击 落点({ix},{iy}) 距click#1 {_dpos:.1f}px>{RESCUE_DBL_SNAP_PX}px "
-                          f"→ 判定为不同目标，降级普通click", flush=True)
+                # 手已移到别的图标 / 空白 / 探测不可信 → 降级普通单击
                 pyautogui.click(ix, iy, button="left")
+                _p1 = (f"({int(_xy0[0])},{int(_xy0[1])})" if _xy0 is not None else "无记录")
+                print(f"[DBL-RESCUE] 慢补救第二击 ({ix},{iy}) vs click#1{_p1} {_why} "
+                      f"→ 降级普通click", flush=True)
                 self._dbg_last_click_t = time.time()
                 self._dbg_last_click_xy = (ix, iy)
             if self._drag_active:
