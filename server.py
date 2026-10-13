@@ -7,6 +7,9 @@ server.py  —— 极简 Flask 壳，按用户「三步拆解」严格实现，�
   Step 2：POST /run 接口 → 启动后台线程调用 hands_tasks.run_loop（打开摄像头+识别手势）
   Step 3：Step 2 的全部逻辑主体已经在 hands_tasks.py 里（本文件只是薄壳）
 
+  Step 4：服务就绪后自动以【无预览】方式调一次 /run（后台静默识别，不弹窗）；
+          若要预览窗口，在首页先点「停止」再点「启动（带预览）」自行切换。
+
 本文件刻意做得"简陋"：
   · 全局就 3 个变量：_run_thread / _stop_event / _status_store
   · 完全没有自定义类（没有什么 GestureServiceThread / PreviewThread）
@@ -21,6 +24,7 @@ import time
 import socket
 import threading
 import urllib.request
+import urllib.parse
 
 # =========================================================================
 # ⓪ 日志系统必须【最早】安装：先读 config.json 的 log_enabled，再 import 业务模块
@@ -197,7 +201,7 @@ _status_store.update(dict(
     running=False, fps=0.0, current_camera_id=_default_camera_id,
     start_time_ms=None, uptime_ms=0,
     last_left_gesture=None, last_right_gesture=None,
-    stretch_mode="IDLE", error=None, preview_active=False,
+    error=None, preview_active=False,
     service_started=True,
     # 把当前生效的配置也暴露出来，前端/排障一眼就能看到
     config_path=CONFIG_PATH,
@@ -249,7 +253,7 @@ def run():
             running=False, fps=0.0, current_camera_id=camera_id,
             start_time_ms=None, uptime_ms=0,
             last_left_gesture=None, last_right_gesture=None,
-            stretch_mode="IDLE", error=None, preview_active=False,
+            error=None, preview_active=False,
         ))
 
         # 🔥 每次 /run 都用**全新组件**（因为 detector.close() 后不能再用；
@@ -371,9 +375,10 @@ def index():
 <ul>
   <li><b>POST /run?camera_id={_default_camera_id}&preview=1</b> → 启动识别（打开摄像头）</li>
   <li><b>POST /stop</b> → 停止识别（关闭摄像头+预览窗口）</li>
-  <li><b>GET  /status</b> → 实时状态（FPS、手势、stretch模式、错误等）</li>
+  <li><b>GET  /status</b> → 实时状态（FPS、手势、错误等）</li>
   <li><b>GET  /cameras</b> → 枚举系统相机清单（index + 友好名，选摄像头前先点它）</li>
 </ul>
+<p>ℹ️ 服务启动后会<b>自动以无预览方式后台运行</b>；如需预览窗口，请先点「停止」，再点「启动（带预览）」。</p>
 <div id="st" style="background:#f5f5f5;padding:12px;border-radius:6px;white-space:pre-wrap;font-family:Consolas,monospace;font-size:13px">点击「刷新状态」查看</div>
 <br>
 <button onclick="r()">刷新状态</button>
@@ -413,6 +418,43 @@ r();
 
 
 # =========================================================================
+# ④.5 启动即【无预览】自动运行：服务就绪后自己 POST 一次 /run?preview=0
+#   · 默认形态 = 后台静默识别，不弹 cv2 预览窗口
+#   · 要预览窗口：首页点「停止」再点「启动（带预览）」（按钮与接口均未改动）
+#   · 走真实 HTTP 接口（而非直接调视图函数），与页面点按钮完全同链路；
+#     失败只记日志、不影响 Flask，仍可在页面手动启动
+# =========================================================================
+def _autostart_no_preview():
+    probe_host = "127.0.0.1" if _flask_host in ("0.0.0.0", "::", "") else _flask_host
+    base = f"http://{probe_host}:{_flask_port}"
+    cid = urllib.parse.quote(str(_default_camera_id), safe="")
+    _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 本机自调，绕过系统代理
+    # 独占锁 socket 先于 Flask 完成 listen，光探端口会误判就绪 → 轮询 /status 直到返回 200
+    ready, err = False, None
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        try:
+            with _opener.open(base + "/status", timeout=1) as resp:
+                if resp.status == 200:
+                    ready = True
+                    break
+        except Exception as e:
+            err = e
+            time.sleep(0.3)
+    if not ready:
+        print(f"[server.py 自动启动] ⚠ 等待服务就绪超时，跳过自动无预览启动（可在页面手动启动）：{err}")
+        return
+    try:
+        req = urllib.request.Request(base + f"/run?camera_id={cid}&preview=0", method="POST")
+        with _opener.open(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", "replace")
+        print(f"[server.py 自动启动] ✅ 已自动调用无预览接口 POST /run?camera_id={cid}&preview=0，响应：{body}")
+        print("[server.py 自动启动] 识别已在后台静默运行（无预览窗口）；如需预览窗口，页面先「停止」再「启动（带预览）」。")
+    except Exception as e:
+        print(f"[server.py 自动启动] ⚠ 自动无预览 /run 失败（不影响服务，可在页面手动启动）：{e}")
+
+
+# =========================================================================
 # 入口：python server.py  →  跑 Flask（主线程），默认端口 8000
 # =========================================================================
 if __name__ == "__main__":
@@ -427,6 +469,8 @@ if __name__ == "__main__":
     _httpd = make_server(_flask_host, 0, app, threaded=False)
     _httpd.socket.close()          # 释放 Werkzeug 的临时 REUSEADDR socket
     _httpd.socket = _single_instance_sock   # 挂上独占监听 socket（已 bind+listen）
+    # 🔥 启动即无预览自动运行：后台静默识别；要预览窗口去页面先停止再带预览启动
+    threading.Thread(target=_autostart_no_preview, name="AutoRunNoPreview", daemon=True).start()
     try:
         _httpd.serve_forever()
     except KeyboardInterrupt:

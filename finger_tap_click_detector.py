@@ -1516,7 +1516,7 @@ class TwoFingerRightClickDetector:
 
     # ------------------------------------------------------------
     def reset(self) -> None:
-        """双手出现 / 拉伸缩放等全局禁用场景调用：清空全部进行中状态。"""
+        """双手同时在镜等全局禁用场景调用：清空全部进行中状态。"""
         self.state = _S.IDLE
         self.event_this_frame = E.NONE
         self._sm = None

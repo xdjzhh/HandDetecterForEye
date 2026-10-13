@@ -5,7 +5,7 @@ hands_tasks.py  —— 体感鼠标全部业务逻辑的纯封装（零复杂线
 四件套：
   1. parse_args()                → 解析命令行参数（与原 main.py 完全一致）
   2. clamp_args(args)            → 对 args 做硬约束范围裁剪（原地修改）
-  3. init_models(args)           → 创建 detector/mouse/tap/stretch 等全部组件
+  3. init_models(args)           → 创建 detector/mouse/tap/right_tap 等全部组件
   4. run_loop(components, ...)   → 对应原 main() 里「打开摄像头 → 识别循环 → 清理」的全部逻辑
 
 设计原则（极简）：
@@ -35,8 +35,6 @@ from draw_cn_text import put_text_cn
 from finger_tap_click_detector import (FingerTapClickDetector, TwoFingerRightClickDetector,
                                        _S as _TS, E as _TEV, TWO_FINGER_TIP_ENTRY_R,
                                        RF_OBSERVE_ONLY)
-from diagonal_stretch import (DiagonalStretchManager, _S as _DS, _MODE as _DM,
-                           _MS as _DMS, MOVE_CONFIRM_SEC)
 
 # ---------------- 常量（原 main.py 顶部，原样搬） ----------------
 HAND_COLORS = {"Left": (255, 100, 0), "Right": (0, 140, 255)}
@@ -592,7 +590,7 @@ def init_models(args):
     创建所有识别/控制组件（**不打开摄像头**）。
 
     返回 dict，key 即组件名：
-      {args, detector, mouse, tap_detector, stretch, mode_label, mode_color}
+      {args, detector, mouse, tap_detector, right_tap_detector, mode_label, mode_color}
     """
     detector_kwargs = dict(max_hands=args.max_hands,
                            # ⭐ 2026-09-21 黑帧根因治理：video 模式下 tracking 置信度低于门限时 MediaPipe
@@ -624,7 +622,6 @@ def init_models(args):
     tap_detector = FingerTapClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)
     # 食中双指并拢勾按 → 右键（与左键同 hardness/speed 档位手感）
     right_tap_detector = TwoFingerRightClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)
-    stretch = DiagonalStretchManager()
 
     return dict(
         args=args,
@@ -632,7 +629,6 @@ def init_models(args):
         mouse=mouse,
         tap_detector=tap_detector,
         right_tap_detector=right_tap_detector,
-        stretch=stretch,
         mode_label=mode_label,
         mode_color=mode_color,
     )
@@ -1213,7 +1209,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
       uptime_ms          : int    —— 已运行毫秒数
       last_left_gesture  : str or None
       last_right_gesture : str or None
-      stretch_mode       : str    —— "IDLE" / "ARMED_CONFIRM" / "SCALING" / "MOVE_CONFIRM" / "MOVE_ACTIVE"
       error              : str or None —— 异常信息（正常为 None）
       preview_active     : bool
     """
@@ -1222,7 +1217,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     mouse           = components["mouse"]
     tap_detector    = components["tap_detector"]
     right_tap_detector = components["right_tap_detector"]
-    stretch         = components["stretch"]
     mode_label      = components["mode_label"]
     mode_color      = components["mode_color"]
 
@@ -1235,15 +1229,12 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
         running=False, fps=0.0, current_camera_id=camera_id,
         start_time_ms=start_ms, uptime_ms=0,
         last_left_gesture=None, last_right_gesture=None,
-        stretch_mode="IDLE", error=None,
+        error=None,
         preview_active=bool(preview),
     ))
 
     combo_hint = ""
     combo_hint_counter = 0
-    # ⭐ 上一帧 stretch 状态（move_only 最前置在本帧 stretch.update 之前执行，只能读上一帧结果；
-    #   首帧用 None 哨兵）
-    stretch_info = None
     _fps_smooth = None
     _fps_last_t = time.perf_counter()
     _fps_frame_cnt = 0
@@ -1582,14 +1573,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _skip_was_skipped = True
                 _frame_inferred_this_time = False
                 hands_data = _cp.deepcopy(_skip_last_hands_data)
-                # 跳帧也必须画关节连线（用户感知不到推理被跳过）
-                for _h in hands_data:
-                    _pts = [(int(float(_l.x) * w), int(float(_l.y) * h)) for _l in _h["landmarks"]]
-                    for (_px, _py) in _pts:
-                        cv2.circle(frame, (_px, _py), 3, (255, 0, 255), 2)
-                    for _a, _b in HAND_CONNECTIONS:
-                        if _a < len(_pts) and _b < len(_pts):
-                            cv2.line(frame, _pts[_a], _pts[_b], (0, 255, 0), 2)
+                # 骨架统一在下方 EMA 之后绘制（跳帧/正常帧同一出口，所见即平滑值）
             else:
                 _skip_was_skipped = False
                 # ---------- 正常：双手检测 ----------
@@ -1677,6 +1661,19 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         _ema_landmarks.pop(_lab, None)
                         _ema_miss_count.pop(_lab, None)
                         _ema_reset_pending.pop(_lab, None)
+
+            # ================================================================
+            # 骨架绘制（EMA 平滑后唯一出口）：画面骨架 = 下游手势/鼠标/点击
+            # 实际使用的同一份平滑关键点，正常帧与跳帧复用帧都走这里。
+            # ================================================================
+            for _h in hands_data:
+                _pts = [(int(float(_l.x) * w), int(float(_l.y) * h))
+                        for _l in _h["landmarks"]]
+                for (_px, _py) in _pts:
+                    cv2.circle(frame, (_px, _py), 3, (255, 0, 255), 2)
+                for _a, _b in HAND_CONNECTIONS:
+                    if _a < len(_pts) and _b < len(_pts):
+                        cv2.line(frame, _pts[_a], _pts[_b], (0, 255, 0), 2)
 
             hand_results = {}
 
@@ -1782,61 +1779,23 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             # Pass B：基于**完整的 hand_results** 统一计算 全局门控
             #          （原 main.py 里这段放在 for 里=顺序错误，现在统一算一次，100% 顺序正确）
             # ======================================================================
-            # (B1) 全局 disable：影响「Tap-Click」和「block_mouse_move_for_stretch」
+            # (B1) 全局手势布尔：
+            #   any_fist_global   —— 任一手握拳：光标冻结/点击取消（握拳守卫）
+            #   both_hands_global —— 双手同时在镜：屏蔽点击（旧拉伸/移窗防误触语义；
+            #                        2026-10-14 拉伸模块整体删除后保留此最小双手门，
+            #                        也为后续 FIST+POINT 滚轮和弦预留互斥位）
             left_gesture_global   = hand_results.get("Left",  (None,))[0]
             right_gesture_global  = hand_results.get("Right", (None,))[0]
-            left_pinch_global  = bool(left_gesture_global  is not None and left_gesture_global  != "OPEN")
-            right_pinch_global = bool(right_gesture_global is not None and right_gesture_global != "OPEN")
-            left_open_global   = bool(left_gesture_global  == "OPEN")
-            right_open_global  = bool(right_gesture_global == "OPEN")
             any_fist_global = bool(left_gesture_global == "FIST" or right_gesture_global == "FIST")
-            left_near_fist_global  = bool(("Left"  in hand_results) and sum(1 for x in hand_results["Left"][1]  if not x) >= 4)
-            right_near_fist_global = bool(("Right" in hand_results) and sum(1 for x in hand_results["Right"][1] if not x) >= 4)
-            any_near_fist_global   = left_near_fist_global or right_near_fist_global
-            single_hand_exists = bool(("Left" in hand_results) ^ ("Right" in hand_results))
-            single_open_global = bool(single_hand_exists and ((left_open_global and ("Left" in hand_results)) or (right_open_global and ("Right" in hand_results))))
             both_hands_global     = ("Left" in hand_results) and ("Right" in hand_results)
-            pure_two_hand_stretch = bool(both_hands_global and left_pinch_global and right_pinch_global)
-            pure_two_hand_move    = bool(both_hands_global and left_open_global  and right_open_global)
-            disable_click_for_stretch_global = (
-                both_hands_global
-                or pure_two_hand_stretch
-                or pure_two_hand_move
-                # ⚠️ 2026-08-26 两次修复（点击完全失效根因最终版）：
-                #   V1 删除 stretch.state/_move_state != IDLE：单手移动时 move_state 恒非IDLE=正常行为，不能禁点击
-                #   V2 删除 any_fist_global / any_near_fist_global：
-                #        near_fist_bend_count 统计「弯曲指节数≥4」会误判 POINT/OTHER 手势(仅食指伸=其他4指弯=0)
-                #        → ext=(0,1,0,0,0) → count=4/5 → any_nfist=True → 每帧reset detector → bratio恒0/DI恒0
-                #   仅保留纯双手语义手势条件(both_hands/pure_stretch/pure_move)：拉伸场景禁点击100%覆盖，单手点击通畅✅
-            )
-            block_mouse_move_for_stretch = disable_click_for_stretch_global
-
-            # ⭐ 2026-09-17 修复「五指张开移窗时，光标在窗口中心↔掌心位置来回闪动」：
-            #   MOVE_ACTIVE 期间 diagonal_stretch 每帧 SetCursorPos 锁窗口中心（防误触），
-            #   而掌心跟随 move_only 又每帧把光标写回掌心映射点——两个写入源交替=闪动。
-            #   锁定期本帧一切掌心光标写入全部跳过，光标只允许窗口中心锁这一个写入源。
-            #   注：此处读的是【上一帧】move_state（stretch.update 在后面 L1708 才跑），
-            #   进入/退出 MOVE_ACTIVE 各有 1 帧交接，帧内同点 SetCursorPos 幂等、肉眼不可见。
-            _cursor_locked_by_window_move = bool(
-                stretch_info is not None and (
-                    stretch_info.move_state == _DMS.MOVE_ACTIVE
-                    or stretch_info.state == _DS.SCALING
-                )
-            )
 
             # ======================================================================
-            # ⭐ B-1 优化：鼠标移动急活【最前置】
-            #   目标：彻底消除"慢活（stretch.update/Tap 累积/每手循环 near_fist 计数/拉伸窗口确认）阻塞 move_only → 鼠标钉住 + 之后大跳"。
-            #   位置：全局门控算完（any_fist_global 已可用）→ 任何慢活（Pass C 每手局部处理、Tap、stretch.update、绘制）之前。
-            #   等价语义：和 Pass C 右手分支完全一致（cursor_anchor_norm + gesture_hint=FIST/gesture），只是更早；
-            #             通过 _eval_anchor_once 的同帧缓存，即使后面原代码再 move_only 一次，也只是 pyautogui.moveTo(同坐标) 幂等，不会额外重算平滑。
+            # ⭐ B-1：鼠标移动急活【最前置】
+            #   全局门控算完（any_fist_global 已可用）→ Pass C / Tap 等慢活之前，
+            #   先让掌心光标出帧，消除慢活阻塞造成的“鼠标钉住 + 之后大跳”。
             # ======================================================================
             _pre_move_only_done_right = False
-            if _cursor_locked_by_window_move:
-                # 移窗锁定期：本帧掌心 move_only 禁止执行；同时置位"已处理"，
-                # 阻止 Pass C 兜底再调一次 moveTo
-                _pre_move_only_done_right = True
-            elif "Left" in hand_results:
+            if "Left" in hand_results:
                 try:
                     _gesture, _ext, _ratios, _lms = hand_results["Left"]
                     _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
@@ -1846,64 +1805,28 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 except Exception:
                     _pre_move_only_done_right = False
 
-            # (B2) 双手/纯双手判定（每只手局部用，值一样，放外面统一算）
-            both_hands_now = both_hands_global
-            is_pure_two_hand_mode = pure_two_hand_stretch
-
             # ======================================================================
             # Pass C：对每只手做 鼠标映射 + 画「光标锚点 绿/橙圆」
-            #          （因为门控都已算好了，这一段完全顺序正确，没有未定义变量）
             # ======================================================================
-            stretch_click_gestures = ("PEACE", "PINCH", "ROCK", "THUMB")
             for label, (gesture, ext, _ratios, lms) in hand_results.items():
-                # --- 这只手自己的 safe_gesture 判定（与原逻辑一致）---
-                disable_click_for_stretch = (
-                    both_hands_now
-                    or stretch.state != _DS.IDLE
-                    or is_pure_two_hand_mode
-                )
-                safe_gesture = gesture
-                if disable_click_for_stretch and gesture in stretch_click_gestures:
-                    safe_gesture = "POINT"
-                bent_count_this = sum(1 for x in ext if not x)
-                near_fist_this_hand = (bent_count_this >= 4)
-                if near_fist_this_hand and gesture in stretch_click_gestures:
-                    safe_gesture = "POINT"
-
-                # --- 鼠标事件：⭐ 2026-08-22 严格『先移动、后判断点击』---
-                #   为什么之前不对齐（无规律卡顿）：
-                #     原 if (not block_mouse_move_for_stretch) and ... 把『移动』和『点击』两个语义绑在一起判断：
-                #       只要手掌翻转时被 MediaPipe 偶判成 OPEN（single_open_global=True）/ 出现双手 / 拉伸状态非 IDLE
-                #       → block_mouse_move_for_stretch=True → 整个分支跳过（不调 mouse.handle）
-                #       → 但绿圈仍用最新 cursor_anchor_norm 画在画面上 → 视觉脱节：绿圈动了，鼠标钉死
-                #   修复原则（用户说：手势识别不影响鼠标移动——先看鼠标位置，再判断手势指令）：
-                #     移动：只要 label=="Left"（即这帧有右手掌心），就无条件先调 mouse.move_only() → 和绿圈 1:1 对齐
-                #           例外：全局有 FIST → 握拳=取消指令，不动；FIST 之外全部强制跟绿圈同步
-                #     点击：继续保留原有的 block_mouse_move_for_stretch / stretch.state 门控（双手/拉伸/OPEN 等只禁止点击，不禁止移动）
+                # --- 鼠标事件：先移动、后判断点击 ---
+                #   移动：label=="Left"（控鼠手=用户右手）每帧先 move_only()，与绿圈 1:1 对齐；
+                #         全局有 FIST 时 hint=FIST 冻结光标。
+                #   点击：双手同时在镜(both_hands_global)屏蔽旧手势点击；tap 拖拽(PRESSED)期间
+                #         鼠标键所有权归食指 tap 状态机，旧路径整体跳过（防每帧 up/down 被 OS
+                #         判成多次双击；见 2026-09-21 长按开三窗修复）。
                 if label == "Left":
                     # ↓↓ 先取锚点（画绿圈 + 移动鼠标用的**同一份**坐标，绝对保证对齐）↓↓
                     cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
                     # move_only 例外判 FIST（全局 FIST 任何手都取消移动）
                     move_gesture_hint = "FIST" if any_fist_global else gesture
-                    # ⭐ B-1 优化：若【全局门控后 move_only 最前置】已经跑过 → 这里不再重复 moveTo（同帧缓存已保证 smoother 状态只更新一次）
-                    #            只有前置段异常（try 失败）时才兜底再跑一次，保证向后兼容。
-                    if (not _pre_move_only_done_right) and (not _cursor_locked_by_window_move):
+                    # ⭐ B-1：最前置已跑过就不再重复 moveTo（仅前置异常时兜底）
+                    if not _pre_move_only_done_right:
                         mouse.move_only(cursor_anchor_norm, gesture_hint=move_gesture_hint)
-                    # 门控只拦"点击/拖拽语义"（调 handle 走点击分支）——但该帧鼠标已经 move_only 移动过了，不会再卡
-                    # ⭐ 移窗锁定帧额外跳过 handle：OPEN 稳定分支内部也会 moveTo，否则与窗口中心锁打架闪动
-                    # ⭐⭐⭐ 2026-09-21 铁证修复（长按开出三个窗口）：旧手势路径 handle() 的
-                    #   OPEN/POINT/OTHER 分支【每帧】见 _drag_active 就 mouseUp。食指勾按长按期间
-                    #   手势必落 POINT/OTHER → 它先抬键，本帧稍后 handle_finger_tap_event(DRAG_MOVE)
-                    #   发现 drag=0 又补 mouseDown → 同一图标上每帧 up/down 一次，密集 up/down 被 OS
-                    #   判成多次双击连开多窗。tap 拖拽期间(PRESSED)鼠标键所有权归食指 tap 状态机，
-                    #   旧路径整体跳过（move_only 已负责移动；FIST 取消也让位于 tap 自己的回直释放）。
-                    if ((not _cursor_locked_by_window_move)
-                            and (not block_mouse_move_for_stretch)
-                            and (not is_pure_two_hand_mode)
-                            and (tap_detector.state != _TS.PRESSED)
-                            and stretch.state != _DS.SCALING):
+                    if ((not both_hands_global)
+                            and (tap_detector.state != _TS.PRESSED)):
                         fingertip_norm = (lms[8].x, lms[8].y)
-                        mouse.handle(safe_gesture, fingertip_norm, cursor_anchor_norm=cursor_anchor_norm)
+                        mouse.handle(gesture, fingertip_norm, cursor_anchor_norm=cursor_anchor_norm)
                     # ↓↓ 画锚点（绿圈=光标锚点 args.anchor，默认 mcp 指根；橙圈=食指TIP）
                     # ——和 move_only 用的 cursor_anchor_norm 完全同一份 ↓↓
                     mx, my = HandDetector.landmark_to_pixel(lms[8], w, h)
@@ -2290,7 +2213,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     flush=True)
 
             _tap_updated = False
-            if disable_click_for_stretch_global:
+            if both_hands_global:
                 tap_detector.reset()
                 right_tap_detector.reset()
                 tap_event = 0
@@ -2351,7 +2274,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             #   手丢/非 IDLE/握拳帧不入队且清空计时，避免跨动作污染。
             if _b3d_probe is None:
                 run_loop._b3d_prev_tip3 = None
-            if (not disable_click_for_stretch_global
+            if ((not both_hands_global)
                     and tap_detector.state == _TS.IDLE
                     and index_bend is not None and _b3d_probe is not None):
                 _jit3d_q.append((float(index_bend), float(_b3d_probe["bend"]),
@@ -2504,7 +2427,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 return f"{_v:.2f}" if isinstance(_v, (int, float)) else "n/a"
             try:
                 # 每有效帧滚动记录 TIP 实测值（ARM 前 12 帧≈0.66s 轨迹，纯观测）
-                if (not disable_click_for_stretch_global
+                if (not both_hands_global
                         and two_finger_gap_parts is not None
                         and len(two_finger_gap_parts) >= 4):
                     _sp = getattr(run_loop, "_cached_two_finger_gap_space", "3D")
@@ -2526,7 +2449,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     else:
                         _rf_tip_min = _rf_tip_max = None
                         _rf_dip_min = _rf_dip_max = None
-                elif right_tap_detector.is_active and not disable_click_for_stretch_global:
+                elif right_tap_detector.is_active and not both_hands_global:
                     if rf_idx_b is not None:
                         _rf_idx_min = rf_idx_b if _rf_idx_min is None else min(_rf_idx_min, rf_idx_b)
                         _rf_idx_max = rf_idx_b if _rf_idx_max is None else max(_rf_idx_max, rf_idx_b)
@@ -2609,7 +2532,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 except Exception:
                     pass
 
-            if not disable_click_for_stretch_global and stretch.state != _DS.SCALING:
+            if not both_hands_global:
                 # 1=单击(窗口超时补发) 2=长按按下 5=双击(快速原子) 6=慢节奏补救双击 7=双指右键：都要求鼠标钉在当前位置完成动作
                 if tap_event in (1, 2, 5, 6) or right_tap_event == _TEV.RIGHT_TAP:
                     # freeze_for_click 冻结位置 = 同帧 move_only 输出位置（smoother 已被冻结，后续几帧都返回相同像素点）
@@ -2647,53 +2570,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     mouse.handle_finger_tap_event(right_tap_event, right_screen_pt)
                     _hb_stage[0] = "business"
 
-            # ---------- 双手拉伸 / 移动 ----------
-            left_px: tuple | None = None
-            right_px: tuple | None = None
-            left_palm_screen: tuple | None = None
-            right_palm_screen: tuple | None = None
-            left_lms_main = None
-            right_lms_main = None
-            # ✨ 3D world landmarks：供拉伸模块区分"握拳"与"拇食指捏合"（两指尖是否卷进掌心）
-            world_lms_map: dict = {}
-            for _h in hands_data:
-                _wl = _h.get("world_landmarks")
-                if _wl is not None and len(_wl) >= 21:
-                    world_lms_map[_h["label"]] = _wl
-            if "Left" in hand_results:
-                _, _, _, lms = hand_results["Left"]
-                left_lms_main = lms
-                # ⭐ 2026-10-01 拉伸掌位与光标锚点同源（mcp）：手腕出画时双手距离/移动量不漂
-                nx, ny = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
-                left_px = (float(nx) * w, float(ny) * h)
-                try:
-                    sx, sy = mouse._norm_to_screen(float(nx), float(ny))
-                    left_palm_screen = (float(sx), float(sy))
-                except Exception:
-                    left_palm_screen = None
-            if "Right" in hand_results:
-                _, _, _, lms = hand_results["Right"]
-                right_lms_main = lms
-                nx, ny = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
-                right_px = (float(nx) * w, float(ny) * h)
-                try:
-                    sx, sy = mouse._norm_to_screen(float(nx), float(ny))
-                    right_palm_screen = (float(sx), float(sy))
-                except Exception:
-                    right_palm_screen = None
-            stretch_info = stretch.update(left_px, right_px, (w, h),
-                                          left_lms_main, right_lms_main,
-                                          left_palm_screen, right_palm_screen,
-                                          dt=_frame_dt,
-                                          left_world_lms=world_lms_map.get("Left"),
-                                          right_world_lms=world_lms_map.get("Right"))
-            # ✨ 取消手势（OK/握拳）触发的一次性控制台提示（cancel_fired 只在触发帧为 True）
-            try:
-                if getattr(stretch_info, "cancel_fired", False):
-                    print("[stretch] ✋ 取消拉伸（双手 OK 手势或握拳 0.07s）：已终止本次操作，窗口保持当前大小")
-            except Exception:
-                pass
-
             _t2 = time.perf_counter()
 
             # ---------- 绘制：Tap 条 ----------
@@ -2723,285 +2599,6 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                 font_scale=0.55, color=_rcol, thickness=2)
             except Exception:
                 pass
-
-            # ---------- 绘制：SCALE 拉伸 UI ----------
-            mode_now = getattr(stretch_info, 'mode', 'SCALE')
-            if mode_now == _DM.SCALE and (stretch_info.need_frame_redraw or stretch_info.ui_pinch_active):
-                p1, p2 = stretch_info.p1, stretch_info.p2
-                if p1 is not None and p2 is not None:
-                    x1, y1 = int(p1[0]), int(p1[1])
-                    x2, y2 = int(p2[0]), int(p2[1])
-                    cx = (x1 + x2) // 2
-                    cy = (y1 + y2) // 2
-                    import math as _mt_tmp
-                    dx_abs = abs(x2 - x1); dy_abs = abs(y2 - y1)
-                    theta_deg = abs(_mt_tmp.degrees(_mt_tmp.atan2(float(dy_abs), float(max(dx_abs, 1)))))
-                    if theta_deg <= 20.0:
-                        pre_mode = "水平(拉宽/拉窄)"; pre_c = (40, 180, 255)
-                    elif theta_deg >= 70.0:
-                        pre_mode = "垂直(拉高/拉低)"; pre_c = (80, 255, 150)
-                    else:
-                        pre_mode = "对角(等比缩放)"; pre_c = (220, 120, 255)
-                    def _draw_pinch_dot(lms, px, py, color):
-                        if lms is None: return
-                        t4 = (int(float(lms[4].x) * w), int(float(lms[4].y) * h))
-                        t8 = (int(float(lms[8].x) * w), int(float(lms[8].y) * h))
-                        cv2.line(frame, t4, t8, color, 2)
-                        cv2.circle(frame, t4, 7, color, -1)
-                        cv2.circle(frame, t8, 7, color, -1)
-                        # 回滚 B-2：每帧必画"捏 XX%"文字，避免闪烁
-                        put_text_cn(frame,
-                                    f"捏: {min(99, int(stretch_info.left_pinch_r * 100))}%" if px < w // 2 else f"捏: {min(99, int(stretch_info.right_pinch_r * 100))}%",
-                                    (max(4, px - 32), max(4, py + 32)), font_scale=0.5, color=color, thickness=2)
-                    if (stretch_info.state == _DS.ARMED_CONFIRM) or (stretch_info.ui_pinch_active and stretch_info.state == _DS.IDLE):
-                        color = (255, 210, 80)
-                        thick = 2
-                        cv2.circle(frame, (x1, y1), 22, color, 3)
-                        cv2.circle(frame, (x2, y2), 22, color, 3)
-                        cv2.line(frame, (x1, y1), (x2, y2), color, 2)
-                        _draw_pinch_dot(left_lms_main,  x1, y1, color)
-                        _draw_pinch_dot(right_lms_main, x2, y2, color)
-                        hold_n = stretch.min_hold_sec
-                        pct = stretch_info.confirm_sec / max(1e-6, hold_n)
-                        pct = 1.0 if pct > 1.0 else pct
-                        prog_w = 340
-                        bx = cx - prog_w // 2
-                        by = cy - 62
-                        # 回滚 B-2：黑色大底 + 中文 每帧必画，完全不跳帧
-                        cv2.rectangle(frame, (bx - 6, by - 24), (bx + prog_w + 6, by + 48), (0, 0, 0), -1)
-                        cv2.rectangle(frame, (bx, by), (bx + prog_w, by + 12), (60, 60, 60), -1)
-                        if stretch_info.state == _DS.IDLE and stretch_info.ui_pinch_active:
-                            fill_ratio = min(1.0, theta_deg / 90.0)
-                            cv2.rectangle(frame, (bx, by), (bx + int(prog_w * fill_ratio), by + 12), pre_c, -1)
-                            # 回滚 B-2：中文每帧必画
-                            put_text_cn(frame,
-                                        f"预判定【{pre_mode}】  θ={theta_deg:.0f}° ｜ 双手≥120px 并保持{hold_n:.2f}s即可激活",
-                                        (bx, by + 20), font_scale=0.58, color=(255, 255, 255), thickness=2)
-                        else:
-                            cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 12), color, -1)
-                            # 回滚 B-2：中文每帧必画
-                            put_text_cn(frame,
-                                        f"选中确认中… {stretch_info.confirm_sec:.2f}/{hold_n:.2f}s({int(pct*100)}%)  θ={theta_deg:.0f}° → {pre_mode}",
-                                        (bx, by + 20), font_scale=0.6, color=(255, 255, 255), thickness=2)
-                    elif stretch_info.state == _DS.SCALING:
-                        color = (80, 230, 255)
-                        cv2.circle(frame, (x1, y1), 22, color, 4)
-                        cv2.circle(frame, (x2, y2), 22, color, 4)
-                        cv2.line(frame, (x1, y1), (x2, y2), color, 3)
-                        _draw_pinch_dot(left_lms_main,  x1, y1, color)
-                        _draw_pinch_dot(right_lms_main, x2, y2, color)
-                        ratio = stretch_info.ratio
-                        mode = getattr(stretch_info, 'stretch_mode', 'DIAGONAL')
-                        if mode == "HORIZONTAL":
-                            mode_title = "🤏水平拉伸"
-                            sign = "拉宽" if ratio > 1.01 else ("拉窄" if ratio < 0.99 else "保持宽度")
-                        elif mode == "VERTICAL":
-                            mode_title = "🤏垂直拉伸"
-                            sign = "拉高" if ratio > 1.01 else ("拉低" if ratio < 0.99 else "保持高度")
-                        else:
-                            mode_title = "🤏对角拉伸"
-                            sign = "放大" if ratio > 1.01 else ("缩小" if ratio < 0.99 else "保持")
-                        ratio_c = (60, 255, 90) if ratio > 1.01 else ((60, 180, 255) if ratio < 0.99 else (200, 200, 200))
-                        lines = [
-                            (f"{mode_title} → {sign}", (255, 255, 255), 0.75),
-                            (f"X {ratio:.3f}  比例", ratio_c, 0.95),
-                            (f"窗口: HWND 0x{int(stretch_info.hwnd):08X}   {stretch_info.win_w}×{stretch_info.win_h}",
-                             (230, 230, 230), 0.55),
-                            ("👌双手OK / ✊双拳 保持0.07s = 取消（保持当前大小）", (180, 220, 255), 0.6),
-                        ]
-                        card_w, card_h = 520, 128
-                        bx = cx - card_w // 2
-                        by = cy - card_h // 2 - 16
-                        # 回滚 B-2：卡片黑底 + 边框 + 3 行中文 每帧必画（卡片外框颜色每帧画）
-                        cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), (0, 0, 0), -1)
-                        cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), color, 2)
-                        put_text_cn(frame, lines[0][0], (bx + 24, by + 14), font_scale=lines[0][2], color=lines[0][1], thickness=2)
-                        put_text_cn(frame, lines[1][0], (bx + 24, by + 44), font_scale=lines[1][2], color=lines[1][1], thickness=3)
-                        put_text_cn(frame, lines[2][0], (bx + 24, by + 82), font_scale=lines[2][2], color=lines[2][1], thickness=2)
-
-            # ---------- 绘制：MOVE 移动 UI ----------
-            if mode_now == _DM.MOVE and (stretch_info.move_need_frame_redraw or stretch_info.ui_move_active):
-                hands_mode_now = getattr(stretch_info, 'hands_mode', 'DUAL')
-                p1_m, p2_m = None, None
-                llms_ui = left_lms_main
-                rlms_ui = right_lms_main
-                if "Left" in hand_results:
-                    _, _, _, llms_ui = hand_results["Left"]
-                    try:
-                        nlx, nly = HandDetector.cursor_anchor_from_landmarks(llms_ui, args.anchor)
-                        p1_m = (float(nlx) * w, float(nly) * h)
-                    except Exception:
-                        p1_m = stretch_info.p1
-                if "Right" in hand_results:
-                    _, _, _, rlms_ui = hand_results["Right"]
-                    try:
-                        nrx, nry = HandDetector.cursor_anchor_from_landmarks(rlms_ui, args.anchor)
-                        p2_m = (float(nrx) * w, float(nry) * h)
-                    except Exception:
-                        p2_m = stretch_info.p2
-                if p1_m is None: p1_m = stretch_info.p1
-                if p2_m is None: p2_m = stretch_info.p2
-
-                mv_color = (90, 255, 120)
-                def _draw_open_palm_marks(lms, px, py):
-                    if lms is None: return
-                    for tip_i in (4, 8, 12, 16, 20):
-                        try:
-                            tx = int(float(lms[tip_i].x) * w)
-                            ty = int(float(lms[tip_i].y) * h)
-                            cv2.circle(frame, (tx, ty), 8, mv_color, -1)
-                        except Exception:
-                            pass
-                    # 回滚 B-2：掌心"张开"文字 每帧必画
-                    put_text_cn(frame, "张开",
-                                (max(4, px - 26), max(4, py + 38)), font_scale=0.55, color=mv_color, thickness=2)
-
-                if hands_mode_now != "SINGLE" and p1_m is not None and p2_m is not None:
-                    x1, y1 = int(p1_m[0]), int(p1_m[1])
-                    x2, y2 = int(p2_m[0]), int(p2_m[1])
-                    cx = (x1 + x2) // 2
-                    cy = (y1 + y2) // 2
-                    cv2.circle(frame, (x1, y1), 24, mv_color, 3)
-                    cv2.circle(frame, (x2, y2), 24, mv_color, 3)
-                    cv2.line(frame, (x1, y1), (x2, y2), mv_color, 2)
-                    _draw_open_palm_marks(llms_ui,  x1, y1)
-                    _draw_open_palm_marks(rlms_ui, x2, y2)
-                    if stretch_info.move_state == _DMS.MOVE_CONFIRM or (stretch_info.ui_move_active and stretch_info.move_state == _DMS.IDLE):
-                        hold_n = MOVE_CONFIRM_SEC
-                        pct = stretch_info.move_confirm_sec / max(1e-6, hold_n)
-                        pct = 1.0 if pct > 1.0 else pct
-                        prog_w = 400
-                        bx = cx - prog_w // 2
-                        by = cy - 66
-                        # 回滚 B-2：黑色大底 + 中文 每帧必画
-                        cv2.rectangle(frame, (bx - 6, by - 30), (bx + prog_w + 6, by + 60), (0, 0, 0), -1)
-                        cv2.rectangle(frame, (bx, by), (bx + prog_w, by + 14), (50, 50, 50), -1)
-                        if stretch_info.ui_move_active and stretch_info.move_state == _DMS.IDLE:
-                            cv2.rectangle(frame, (bx, by), (bx + int(prog_w * 0.02), by + 14), mv_color, -1)
-                            # 回滚 B-2：中文每帧必画
-                            put_text_cn(frame,
-                                        f"✋预判定【移动窗口(双手)】左手掌心指向要移动的窗口 ｜ 保持五指张开{hold_n:.2f}s即可选中",
-                                        (bx, by + 24), font_scale=0.55, color=(255, 255, 255), thickness=2)
-                        else:
-                            cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 14), mv_color, -1)
-                            # 回滚 B-2：中文每帧必画
-                            put_text_cn(frame,
-                                        f"✋选中窗口确认中… {stretch_info.move_confirm_sec:.2f}/{hold_n:.2f}s({int(pct*100)}%)  → 左手掌心下窗口=目标",
-                                        (bx, by + 24), font_scale=0.58, color=(255, 255, 255), thickness=2)
-                    elif stretch_info.move_state == _DMS.MOVE_ACTIVE:
-                        dxv, dyv = stretch_info.move_delta_xy
-                        dx_int, dy_int = int(round(float(dxv))), int(round(float(dyv)))
-                        rect = stretch_info.move_window_rect
-                        if rect is not None and len(rect) == 4:
-                            ww = int(rect[2] - rect[0]); wh = int(rect[3] - rect[1])
-                        else:
-                            ww = 0; wh = 0
-                        lines = [
-                            (f"✋五指张开(双手) → 移动窗口中 Δx={dx_int:+d}  Δy={dy_int:+d}", (255, 255, 255), 0.72),
-                            (f"方向：{'右' if dx_int > 4 else ('左' if dx_int < -4 else '—')}  {'下' if dy_int > 4 else ('上' if dy_int < -4 else '—')}  ｜ 光标已锁定窗口中心",
-                             mv_color, 0.55),
-                            (f"窗口: HWND 0x{int(stretch_info.move_hwnd):08X}  {ww}×{wh}",
-                             (230, 230, 230), 0.52),
-                        ]
-                        card_w, card_h = 620, 110
-                        bx = cx - card_w // 2
-                        by = cy - card_h // 2 - 20
-                        # 回滚 B-2：卡片黑底 + 边框 + 3 行中文 每帧必画
-                        cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), (0, 0, 0), -1)
-                        cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), mv_color, 2)
-                        put_text_cn(frame, lines[0][0], (bx + 22, by + 14), font_scale=lines[0][2], color=lines[0][1], thickness=2)
-                        put_text_cn(frame, lines[1][0], (bx + 22, by + 46), font_scale=lines[1][2], color=lines[1][1], thickness=2)
-                        put_text_cn(frame, lines[2][0], (bx + 22, by + 86), font_scale=lines[2][2], color=lines[2][1], thickness=2)
-
-                if hands_mode_now == "SINGLE" and p1_m is not None:
-                    x1, y1 = int(p1_m[0]), int(p1_m[1])
-                    cx = x1
-                    cy = y1
-                    cv2.circle(frame, (x1, y1), 26, mv_color, 3)
-                    _draw_open_palm_marks(llms_ui if ("Left" in hand_results) else rlms_ui, x1, y1)
-                    if stretch_info.move_state == _DMS.MOVE_CONFIRM or (stretch_info.ui_move_active and stretch_info.move_state == _DMS.IDLE):
-                        hold_n = MOVE_CONFIRM_SEC
-                        pct = stretch_info.move_confirm_sec / max(1e-6, hold_n)
-                        pct = 1.0 if pct > 1.0 else pct
-                        prog_w = 420
-                        bx = x1 + 40 if cx < w // 2 else (x1 - 40 - prog_w)
-                        by = y1 - 66
-                        # 回滚 B-2：黑色大底 + 中文 每帧必画
-                        cv2.rectangle(frame, (bx - 6, by - 30), (bx + prog_w + 6, by + 60), (0, 0, 0), -1)
-                        cv2.rectangle(frame, (bx, by), (bx + prog_w, by + 14), (50, 50, 50), -1)
-                        if stretch_info.ui_move_active and stretch_info.move_state == _DMS.IDLE:
-                            cv2.rectangle(frame, (bx, by), (bx + int(prog_w * 0.02), by + 14), mv_color, -1)
-                            # 回滚 B-2：中文每帧必画
-                            put_text_cn(frame,
-                                        f"✋预判定【移动窗口(单手)】掌心指向要移动的窗口 ｜ 保持五指张开{hold_n:.2f}s即可选中",
-                                        (bx, by + 24), font_scale=0.55, color=(255, 255, 255), thickness=2)
-                        else:
-                            cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 14), mv_color, -1)
-                            # 回滚 B-2：中文每帧必画
-                            put_text_cn(frame,
-                                        f"✋选中窗口确认中(单手)… {stretch_info.move_confirm_sec:.2f}/{hold_n:.2f}s({int(pct*100)}%)",
-                                        (bx, by + 24), font_scale=0.58, color=(255, 255, 255), thickness=2)
-                    elif stretch_info.move_state == _DMS.MOVE_ACTIVE:
-                        dxv, dyv = stretch_info.move_delta_xy
-                        dx_int, dy_int = int(round(float(dxv))), int(round(float(dyv)))
-                        rect = stretch_info.move_window_rect
-                        if rect is not None and len(rect) == 4:
-                            ww = int(rect[2] - rect[0]); wh = int(rect[3] - rect[1])
-                        else:
-                            ww = 0; wh = 0
-                        lines = [
-                            (f"✋五指张开(单手) → 移动窗口中 Δx={dx_int:+d}  Δy={dy_int:+d}", (255, 255, 255), 0.72),
-                            (f"方向：{'右' if dx_int > 4 else ('左' if dx_int < -4 else '—')}  {'下' if dy_int > 4 else ('上' if dy_int < -4 else '—')}  ｜ 光标已锁定窗口中心",
-                             mv_color, 0.55),
-                            (f"窗口: HWND 0x{int(stretch_info.move_hwnd):08X}  {ww}×{wh}",
-                             (230, 230, 230), 0.52),
-                        ]
-                        card_w, card_h = 620, 110
-                        bx = x1 + 40 if cx < w // 2 else (x1 - 40 - card_w)
-                        by = y1 - card_h // 2
-                        # 回滚 B-2：卡片黑底 + 边框 + 3 行中文 每帧必画
-                        cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), (0, 0, 0), -1)
-                        cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), mv_color, 2)
-                        put_text_cn(frame, lines[0][0], (bx + 22, by + 14), font_scale=lines[0][2], color=lines[0][1], thickness=2)
-                        put_text_cn(frame, lines[1][0], (bx + 22, by + 46), font_scale=lines[1][2], color=lines[1][1], thickness=2)
-                        put_text_cn(frame, lines[2][0], (bx + 22, by + 86), font_scale=lines[2][2], color=lines[2][1], thickness=2)
-
-            # ---------- 左上角：拉伸/移动状态提示 ----------
-            sst = stretch_info.state
-            msst = stretch_info.move_state
-            hands_mode_now = getattr(stretch_info, 'hands_mode', 'DUAL')
-            if msst == _DMS.MOVE_CONFIRM or (stretch_info.ui_move_active and msst == _DMS.IDLE):
-                s_color = (90, 255, 120)
-                if hands_mode_now == "SINGLE":
-                    s_text = f"✋ 单手五指张开-移动窗口 确认中 {stretch_info.move_confirm_sec:.2f}/{MOVE_CONFIRM_SEC:.2f}s"
-                else:
-                    s_text = f"✋ 双手五指张开-移动窗口 确认中 {stretch_info.move_confirm_sec:.2f}/{MOVE_CONFIRM_SEC:.2f}s"
-            elif msst == _DMS.MOVE_ACTIVE:
-                s_color = (90, 255, 120)
-                ddx, ddy = stretch_info.move_delta_xy
-                if hands_mode_now == "SINGLE":
-                    s_text = f"✋ 单手移动窗口中 Δx={int(round(float(ddx))):+d} Δy={int(round(float(ddy))):+d}  光标锁窗口中心"
-                else:
-                    s_text = f"✋ 移动窗口中 Δx={int(round(float(ddx))):+d} Δy={int(round(float(ddy))):+d}  光标锁窗口中心"
-            elif sst == _DS.ARMED_CONFIRM:
-                s_color = (255, 210, 80)
-                s_text = f"🤏 双手捏合拉伸-选中确认 {stretch_info.confirm_sec:.2f}/{stretch.min_hold_sec:.2f}s"
-            elif sst == _DS.SCALING:
-                s_color = (80, 230, 255)
-                s_text = f"🤏 双手捏合拉伸-窗口缩放中 X {stretch_info.ratio:.3f}  {stretch_info.win_w}×{stretch_info.win_h}"
-            elif stretch_info.ui_pinch_active and sst == _DS.IDLE:
-                s_color = (255, 210, 80)
-                s_text = f"🤏 双手捏合姿态识别到(非五指张开) → 双手拉开≥120px 并保持3帧激活缩放"
-            elif stretch_info.ui_move_active and msst == _DMS.IDLE:
-                s_color = (90, 255, 120)
-                s_text = f"✋ 双手五指张开姿态识别到 → 左手掌心指向窗口 保持3帧激活移动"
-            else:
-                s_color = None
-                s_text = ""
-            if s_text:
-                # 回滚 B-2：背景黑块 + 中文 每帧必画
-                cv2.rectangle(frame, (8, 90), (8 + 470, 90 + 28), (0, 0, 0), -1)
-                put_text_cn(frame, s_text, (14, 94), font_scale=0.6, color=s_color, thickness=2)
 
             # ---------- 组合手势提示 ----------
             current_combo = ""
@@ -3103,18 +2700,12 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             # ---------- 🔴 更新 status_store（纯标量，单写多读，GIL 安全）----------
             lg = hand_results.get("Left",  (None, None, None, None))[0]
             rg = hand_results.get("Right", (None, None, None, None))[0]
-            if msst == _DMS.MOVE_CONFIRM:    smode = "MOVE_CONFIRM"
-            elif msst == _DMS.MOVE_ACTIVE:  smode = "MOVE_ACTIVE"
-            elif sst == _DS.ARMED_CONFIRM:  smode = "ARMED_CONFIRM"
-            elif sst == _DS.SCALING:        smode = "SCALING"
-            else:                           smode = "IDLE"
             _opt_skip_pct = float(100.0 * _skip_skipped_frames / max(_skip_total_frames, 1))
             status_store.update(dict(
                 fps=float(_fps_display),
                 uptime_ms=int(time.time() * 1000) - start_ms,
                 last_left_gesture=lg,
                 last_right_gesture=rg,
-                stretch_mode=smode,
                 preview_active=bool(preview),
                 # 优化诊断字段
                 opt_infer_size=480,

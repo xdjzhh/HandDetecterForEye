@@ -1039,7 +1039,7 @@ class MouseController:
     def compute_roi_bbox_px(frame_w: int, frame_h: int, roi_scale: float, roi_offset_y: float = 0.0,
                             roi_safe_shrink: float | None = None):
         """✨ 统一工具：计算 ROI 矩形在画面中的像素坐标 (x1,y1,x2,y2)。
-        供预览绘制、diagonal_stretch 等所有 UI 代码共用（保证与 _norm_to_screen 的映射范围完全一致）。
+        供预览绘制等所有 UI 代码共用（保证与 _norm_to_screen 的映射范围完全一致）。
 
         ⚠️ 严格遵循用户原逻辑，只做最小增量：
           1. X 方向：100% 保留原 margin 计算方式（左右对称 margin=(1-rs)*0.5*min(fw,fh)）
@@ -1214,7 +1214,7 @@ class MouseController:
           - FIST（用户明确握拳=不动=纯空指令）
           - drag_active=True：拖拽期间由拖拽分支专门 move，避免 moveTo 打断 mouseDown 按下状态
         ⚠️ 每次调用都会先移动鼠标，保证"预览画绿圈的这一帧"和"屏幕光标位置"严格同步——
-           不会因上游门控（双手 / OPEN / 拉伸状态）跳过移动而造成"绿圈动了、鼠标钉住"的视觉脱节。
+           不会因上游门控（双手 / OPEN）跳过移动而造成"绿圈动了、鼠标钉住"的视觉脱节。
 
         Args:
             cursor_anchor_norm: (nx, ny) 归一化 0~1，掌心锚点 = 和画绿圈用的完全同一份

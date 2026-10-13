@@ -68,13 +68,8 @@ class HandDetector:
             min_detection_confidence=detection_confidence,
             min_tracking_confidence=tracking_confidence,
         )
-        self.mp_draw = mp.solutions.drawing_utils
-        self._connect_style = self.mp_draw.DrawingSpec(
-            color=(0, 255, 0), thickness=2, circle_radius=2
-        )
-        self._landmark_style = self.mp_draw.DrawingSpec(
-            color=(255, 0, 255), thickness=2, circle_radius=3
-        )
+        # 2026-10-14：骨架绘制已挪至 hands_tasks.run_loop 的 landmarks-EMA 之后，
+        # 画面所见即下游业务所用的平滑关键点（检测器内不再直接绘帧）。
 
     def take_det_diag(self) -> dict:
         """solutions 同步模式无异步超时/排队概念，诊断桩返回零值（字段与 Tasks 版一致）。"""
@@ -103,13 +98,6 @@ class HandDetector:
                         "world_landmarks": _wlms,
                         "score": score,
                     }
-                )
-                self.mp_draw.draw_landmarks(
-                    frame,
-                    lms_wrapper,
-                    self.mp_hands.HAND_CONNECTIONS,
-                    self._landmark_style,
-                    self._connect_style,
                 )
         return hands_data, frame
 
@@ -227,13 +215,6 @@ class TasksHandDetector(HandDetector):
         #   Windows 默认定时器粒度 15.6ms，sleep(1ms) 实测睡 15.2ms → 每帧白等 ~15ms；
         #   Event.wait 走内核可等待对象，回调 set 的瞬间唤醒（亚毫秒级），且等待期间不占 CPU。
         self._result_event = threading.Event()
-
-        # 绘制样式（与模式 A 保持一致观感）
-        self._pt_color = (255, 0, 255)
-        self._line_color = (0, 255, 0)
-        self._pt_radius = 3
-        self._pt_thickness = 2
-        self._line_thickness = 2
 
         # 推理内部缩放尺寸：MediaPipe 模型只需要 ≈224px 的输入，
         # 1280×720 全尺寸送入只会放大 cvtColor + mp.Image 构造开销，
@@ -367,8 +348,7 @@ class TasksHandDetector(HandDetector):
                         "score": hscore,
                     }
                 )
-                # 自行绘制关键点与连线（tasks 无 drawing_utils）
-                self._draw_on_frame(frame, wrapped)
+                # 2026-10-14：骨架不在检测器内绘制，统一由 run_loop 在 EMA 平滑后绘制
         elif result is not None:
             # 回调正常回来但本帧无手（区分于 80ms 超时）
             self._det_diag["empty"] += 1
@@ -392,20 +372,6 @@ class TasksHandDetector(HandDetector):
         d["enh"] = 0
         d["dark_max"] = 0.0
         return snap
-
-    # ---------------- 自定义绘制（与模式 A 观感一致）----------------
-    def _draw_on_frame(self, frame, wrapped_landmarks):
-        h, w = frame.shape[:2]
-        pts = []
-        for lm in wrapped_landmarks:
-            px, py = int(lm.x * w), int(lm.y * h)
-            pts.append((px, py))
-            cv2.circle(frame, (px, py), self._pt_radius,
-                       self._pt_color, self._pt_thickness)
-        for a, b in HAND_CONNECTIONS:
-            if a < len(pts) and b < len(pts):
-                cv2.line(frame, pts[a], pts[b],
-                         self._line_color, self._line_thickness)
 
     def close(self):
         if hasattr(self, "_detector") and self._detector is not None:
