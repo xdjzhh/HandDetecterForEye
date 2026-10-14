@@ -201,6 +201,7 @@ _status_store.update(dict(
     running=False, fps=0.0, current_camera_id=_default_camera_id,
     start_time_ms=None, uptime_ms=0,
     last_left_gesture=None, last_right_gesture=None,
+    move_mode="IDLE",
     error=None, preview_active=False,
     service_started=True,
     # 把当前生效的配置也暴露出来，前端/排障一眼就能看到
@@ -253,6 +254,7 @@ def run():
             running=False, fps=0.0, current_camera_id=camera_id,
             start_time_ms=None, uptime_ms=0,
             last_left_gesture=None, last_right_gesture=None,
+            move_mode="IDLE",
             error=None, preview_active=False,
         ))
 

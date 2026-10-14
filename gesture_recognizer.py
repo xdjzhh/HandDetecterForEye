@@ -34,7 +34,12 @@ def _p2(lm):
 
 
 def _finger_extended(tip_lm, mcp_lm, palm_width: float, ratio: float = 0.58):
-    """单指伸直判定（ratio 从 0.65 降到 0.58，更宽松以适配 V 手势）。"""
+    """单指伸直判定（ratio 从 0.65 降到 0.58，更宽松以适配 V 手势）。
+
+    2026-10-14 实测记录：曾试 0.58→0.62 以提高 FIST 召回，结果 OPEN 五指张开
+    失效（小指在手掌倾斜时 2D r 率先跌破门限，全 1 组合匹配失败）。全局门限
+    不可动；FIST 强化请走 3D GUARD / 旁路融合判据，不要改此默认值。
+    """
     dist = np.linalg.norm(_p2(tip_lm) - _p2(mcp_lm))
     r = dist / palm_width
     return r > ratio, r

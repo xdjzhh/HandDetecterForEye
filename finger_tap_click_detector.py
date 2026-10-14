@@ -315,6 +315,18 @@ RAW_RECOVER_FRAC  = 0.98
 #   标定：正常点击谷底 ratio=0.25~0.45；日志误触段谷底 0.69（raw 仅到 0.52，几乎没弯）。
 #   仅用于 HOLD→点击分支；长按(PRESSED)释放不受此限（能进长按说明已弯得够久）。
 TAP_MIN_BEND_RATIO = 0.66
+# ⭐⭐ 2026-10-15 长按 3D 正向证据门（架构变更：单手握拳不再是全局取消手势）
+#   旧"握拳全局 guard"在遮挡场景致命（world 缺失宁拦、TIP 推断点乱跳→点击被整段杀光、
+#   光标冻结），已整体拆除。防"握拳保持误转长按"的职责收敛到【长按转换这一个动作边界】：
+#     · 只门 BEND_HOLD→PRESSED(LONG_DOWN)；ARM/单击/双击链路完全不读此门，遮挡绝不杀点击；
+#     · 正向证据 = 食指近节骨(MCP5→PIP6) 与掌轴(wrist0→MCP9) 的 3D world 夹角：
+#       勾按/长按食指作业近节必须沿掌轴前伸，握拳（松/紧）近节必折向掌面。
+#   真机标定 2026-10-14（22:15 会话，点击/勾按段 n=26+ 食角 27~51°，握拳段 56~80°，
+#   间隙 51/56）→ 阈值 53° 取中；只用 MCP/PIP 两个遮挡下仍稳定的点，与 TIP 可信度无关。
+#   阈值为单轮小样本标定，[TAP-SEG]/[LONG3D] 心跳持续观测，有新分布再调。
+#   world/角度缺失：长按 fail-closed（不转长按、松手静默结束）；实测该路径计数≈0，
+#   且单击不受影响，风险远小于旧全局 guard 的宁拦勿漏。
+LONG_GATE_MCP_IDX_DEG = 53.0
 # ARMED 第二帧"尖峰拒绝"的深弯豁免：起弯帧谷底已到此线（实打实弯到过半），第二帧即便弹直
 #   也是【最短合法点击】而不是噪声（真机日志：raw 0.20 弯1帧→0.81 真直，旧逻辑整条吞掉，
 #   反让后面没松直的抖动顶替成第二击）。
@@ -507,6 +519,9 @@ class FingerTapClickDetector:
         # ⭐ TAP-DIAG 诊断
         self._dbg_arm_t = None          # 最近一次 ARMED 时刻
         self._dbg_none_in_tap = 0       # 当前 ARM/HOLD 段内 bend=None（掌心不稳门控）帧数
+        # ⭐ 2026-10-15 长按 3D 正向门运行态（每个弯曲段在 ARM 时复位）
+        self._long_3d_blocked = False   # 本段长按转换是否【曾】被 3D 门拦截（松手→静默结束；一旦成功 LONG_DOWN 即清）
+        self._long_3d_diag_t = 0.0      # [LONG3D] 拦截心跳节流（墙钟）
         # ⭐ 2026-10-03 段生命周期埋点（纯观测）：每个弯曲段无论成败都留一条记录，
         #   由 hands_tasks 每帧 take_seg_logs() 取走附坐标/分区打印 [TAP-SEG]。
         #   解决"标题栏重复尝试、慢送达但失败过程无日志"的观测盲区。
@@ -527,6 +542,8 @@ class FingerTapClickDetector:
             "rescue_tap": 0,                    # RESCUE 补救窗内第二击次数
             "long": 0,                          # LONG_DOWN 次数
             "long_shallow": 0,                  # 保持够长按时长但谷底>0.66（半弯）→ 不转长按次数
+            "long_3d_block_seg": 0,             # 被 3D 正向门拦截的弯曲段数（一段计一次）
+            "long_3d_block_frames": 0,          # 3D 门拦截的 ripe 帧数（含同段多帧）
             "wait_none_cancel": 0,              # WAIT_DBL 遇 None 立即结束次数（原宽限方案已删）
             "rescue_none_cancel": 0,            # RESCUE_DBL 遇 None 立即结束次数
         }
@@ -563,6 +580,9 @@ class FingerTapClickDetector:
         self._seg_min_ratio = None
         self._di_sum_neg_now = 0.0
         self._di_sum_pos_now = 0.0
+        # 长按 3D 正向门运行态同步清空
+        self._long_3d_blocked = False
+        self._long_3d_diag_t = 0.0
         # 双击判定状态同步清空（挂起的单击作废）
         self._double_candidate = False
         self._tap_pending = False
@@ -601,13 +621,16 @@ class FingerTapClickDetector:
             self._seg_min_ratio = None
             self._di_sum_neg_now = 0.0
             self._di_sum_pos_now = 0.0
+            self._long_3d_blocked = False
             # 差分队列清掉这段弯曲残留，避免手势结束恢复喂帧时被旧尾巴误触发
             self._bend_ratio_hist.clear()
 
     def force_long_up(self) -> int:
-        """外部仲裁【明确作废当前长按】时调用（2026-09-22 握拳卷曲门：看见食指尖卷回掌心，
-        物理上不可能仍在按住）。与 bend=None 的丢手语义不同——None=没看见手→冻结等待；
-        本方法=看见手且判定姿态已变→立即抬键，避免慢握拳先触发 LONG_DOWN 后卡键 10s。
+        """外部仲裁【明确作废当前长按】时调用：看见姿态已变、物理上不可能仍在按住，
+        立即抬键（避免外部模块需要废弃长按时长按卡键 10s）。2026-10-15 起单手握拳
+        全局 guard 已拆除，握拳不再调用本方法；保留给未来双手和弦等外部仲裁复用。
+        与 bend=None 的丢手语义不同——None=没看见手→冻结等待；本方法=看见手且判定
+        姿态已变→立即抬键。
         Returns: E.LONG_UP（调用方把它作为本帧事件）；非 PRESSED 态返回 E.NONE（无动作）。
         """
         if self.state != _S.PRESSED:
@@ -750,16 +773,50 @@ class FingerTapClickDetector:
             f"ARM{arms}(差分{s['arm_delta']}/绝对{s['arm_abs']}) 尖峰拒{s['spike']} "
             f"点击段None{s['none_ah_frames']}帧/{s['none_ah_seg']}段 | "
             f"首击{s['first_tap']} 单击发出{s['click']} 双击{s['dbl']} "
-            f"趋势确认{s['trend']} 补救击{s['rescue_tap']} 长按{s['long']}(浅弯拦{s['long_shallow']}) | "
+            f"趋势确认{s['trend']} 补救击{s['rescue_tap']} 长按{s['long']}"
+            f"(浅弯拦{s['long_shallow']}/3D门拦{s['long_3d_block_seg']}段{s['long_3d_block_frames']}帧) | "
             f"丢手杀等待{s['wait_none_cancel']}/补救{s['rescue_none_cancel']} | "
             f"回弹 {_dist(self._gest_ms)} | 送达 {_dist(self._click_ms)}",
             flush=True)
 
+    # ---------------------- 长按 3D 正向证据门 ----------------------
+    @staticmethod
+    def _long_press_3d_gate(long_ev: dict | None) -> tuple[bool, str]:
+        """BEND_HOLD→PRESSED 转换前的 3D 正向证据校验（单击/ARM 不调用）。
+
+        long_ev: {"mcp_idx_deg": 食指近节骨-掌轴 3D 夹角(度)|None,
+                  "bend3d": 3D 弯度(纯观测), "dip3d": 3D DIP 角(纯观测)}
+        Returns: (ok, reason)。证据缺失/超阈 fail-closed：只阻止转长按，不影响点击。
+        """
+        if not isinstance(long_ev, dict):
+            return False, "无3D证据"
+        ang = long_ev.get("mcp_idx_deg")
+        if ang is None:
+            return False, "world缺失"
+        try:
+            ang = float(ang)
+        except (TypeError, ValueError):
+            return False, "角度异常"
+        if ang > LONG_GATE_MCP_IDX_DEG:
+            return False, f"食近节角{ang:.0f}>{LONG_GATE_MCP_IDX_DEG:.0f}"
+        return True, f"食近节角{ang:.0f}"
+
+    def _long3d_obs(self, long_ev: dict | None) -> str:
+        """[LONG3D] 心跳用：3D 弯度/DIP 角观测串（阈值未标定，本版本只记录不门控）。"""
+        if isinstance(long_ev, dict):
+            b3 = long_ev.get("bend3d")
+            d3 = long_ev.get("dip3d")
+            return (f" 3D弯{float(b3):.2f}" if b3 is not None else " 3D弯n/a") + (
+                f" DIP3D{float(d3):.0f}°" if d3 is not None else " DIP3Dn/a")
+        return " 3D弯n/a DIP3Dn/a"
+
     # ---------------------- 主入口 ----------------------
-    def update(self, bend: float | None) -> int:
+    def update(self, bend: float | None, long_ev: dict | None = None) -> int:
         """
         Args:
             bend: 食指伸直度 = dist(TIP_8, MCP_5) / dist(MCP_5, MCP_17)；无手传None
+            long_ev: 长按转换专用 3D 正向证据（mcp_idx_deg/bend3d/dip3d），仅门 LONG_DOWN；
+                     None=无 3D 证据，长按 fail-closed，点击链路不受影响
         Returns:
             E.{NONE,TAP_CLICK,LONG_DOWN,LONG_UP,DRAG_MOVE} 本帧事件
         """
@@ -832,6 +889,7 @@ class FingerTapClickDetector:
                     self._di_sum_neg_now = 0.0
                     self._di_sum_pos_now = 0.0
                     self._seg_min_ratio = None
+                    self._long_3d_blocked = False  # 段已丢弃：3D 门拦截标记同步清（下次 ARM 也会复位）
                     self._double_candidate = False
                     self._rescue_candidate = False
                     self._armed_by_delta = False
@@ -999,6 +1057,7 @@ class FingerTapClickDetector:
                 self._dbg_none_in_tap = 0
                 self._armed_by_delta = True   # 起弯只可能由下弯变化量触发（绝对入口已废除）
                 self._seg_min_ratio = bend_ratio  # 段内弯曲谷底从 ARM 当帧起记
+                self._long_3d_blocked = False  # 新弯曲段：3D 长按门拦截标记复位
                 self._arm_stats(self._armed_by_delta)
                 self._diag(f"① ARM 起弯 ratio={bend_ratio:.3f} Σ下={di_sum_down:.3f}/Σ上={di_sum_up:.3f}")
             elif B > self._baseline * 0.97:
@@ -1024,6 +1083,7 @@ class FingerTapClickDetector:
                 self._double_candidate = True
                 self._armed_by_delta = True   # 第二击同样必须是新的下弯变化量
                 self._seg_min_ratio = bend_ratio  # 第二击段谷底从本帧起记
+                self._long_3d_blocked = False  # 新弯曲段：3D 长按门拦截标记复位
                 self._arm_stats(self._armed_by_delta)
                 self._dbg_arm_t = _CLOCK()   # 第二击段耗时从第二击起弯算（click#1 延迟已在补发前记完）
                 self._dbg_none_in_tap = 0
@@ -1081,6 +1141,7 @@ class FingerTapClickDetector:
                 self._double_candidate = False
                 self._armed_by_delta = True   # 补救第二击同样必须是新的下弯变化量
                 self._seg_min_ratio = bend_ratio  # 补救第二击段谷底从本帧起记
+                self._long_3d_blocked = False  # 新弯曲段：3D 长按门拦截标记复位
                 self._arm_stats(self._armed_by_delta)
                 self._dbg_arm_t = _CLOCK()   # 补救第二击段耗时从本击起弯算
                 self._dbg_none_in_tap = 0
@@ -1147,6 +1208,36 @@ class FingerTapClickDetector:
                 #   让窗口到期补单击（不能占掉第二击名额，否则后面的真点击会被错配/顶包）。
                 _shallow_tap = is_tap and (
                     self._seg_min_ratio is None or self._seg_min_ratio > TAP_MIN_BEND_RATIO)
+                # ⭐ 2026-10-15 3D 正向门拦截过的段松手：整段从未发过 LONG_DOWN，
+                #   也不补发 click（握拳保持不是点击动作），静默结束；第二击身份按浅弯同口径
+                #   回 WAIT/RESCUE，避免占掉真第二击名额。
+                if self._long_3d_blocked:
+                    self._emit_seg("3D门拦截松手", now, ratio=bend_ratio,
+                                   raw_frac=(bend / self._baseline) if self._baseline else None,
+                                   rise=_recover_rise)
+                    _vl = (f"{self._seg_min_ratio:.3f}"
+                           if self._seg_min_ratio is not None else "n/a")
+                    self._diag(f"⑥ 3D门拦截段松手，静默不发 click/LONG_UP "
+                               f"段{self._total_sec:.3f}s 谷底{_vl}"
+                               f"{' 第二击→回WAIT' if self._double_candidate else (' 补救→回RESCUE' if self._rescue_candidate else ' →IDLE')}")
+                    for _ in range(2):
+                        self._bend_ratio_hist.append(
+                            (now, self._smoothed_bend / max(self._baseline, 1e-6)))
+                    if self._double_candidate:
+                        self.state = _S.WAIT_DBL
+                    elif self._rescue_candidate:
+                        self.state = _S.RESCUE_DBL
+                    else:
+                        self.state = _S.IDLE
+                    self._double_candidate = False
+                    self._rescue_candidate = False
+                    self._hold_sec = 0.0
+                    self._total_sec = 0.0
+                    self._stable_frames = 0
+                    self._armed_by_delta = False
+                    self._seg_min_ratio = None
+                    self._long_3d_blocked = False
+                    return E.NONE
                 if _shallow_tap:
                     self._st["shallow"] += 1
                     self._emit_seg("浅弯取消", now, ratio=bend_ratio,
@@ -1275,28 +1366,49 @@ class FingerTapClickDetector:
             #   （同样深度的松指会被判"浅弯取消"，长按却能 mouseDown，口径不一致：
             #    内容区=误选中/误拖，标题栏上=按住标题栏误拖窗口，见 [TAP-SEG] 转长按 谷底0.729）。
             #   不取消、留在 BEND_HOLD：后续弯深(≤0.66)下帧即转；回直则走浅弯取消静默结束。
+            _long_ripe = _t_ge(self._hold_sec, self._p["LONG_PRESS_SEC"])
             _long_shallow = (self._seg_min_ratio is not None
                              and self._seg_min_ratio > TAP_MIN_BEND_RATIO)
-            if _t_ge(self._hold_sec, self._p["LONG_PRESS_SEC"]) and not _long_shallow:
+            # ⭐ 2026-10-15 3D 正向证据：只在长按转换点校验（点击/ARM 不读）。
+            #   证据达标才 LONG_DOWN；不达标留 HOLD 逐帧重判（遮挡恢复/姿态转正即放行）。
+            _long_3d_ok, _long_3d_why = self._long_press_3d_gate(long_ev)
+            if _long_ripe and not _long_shallow and _long_3d_ok:
                 self.state = _S.PRESSED
                 self.event_this_frame = E.LONG_DOWN
                 self.long_count += 1
                 self.last_long_time = _CLOCK()
                 self._st["long"] += 1
+                self._long_3d_blocked = False  # 证据恢复成功转换：此前的拦截历史作废
                 self._emit_seg("转长按", now, ratio=bend_ratio)
                 self._diag(f"⚠⚠ 转长按LONG_DOWN(没检测到回弹!) 总{self._total_sec:.3f}s "
                            f"≈{(now-self._dbg_arm_t)*1000.0:.0f}ms None门控{self._dbg_none_in_tap}帧 "
                            f"ratio={bend_ratio:.3f} Σ上={di_sum_up:.3f}(需{self._p['TAP_UP_DI_SUM']}) "
-                           f"→ 双击被吞：两次弯曲被合成一段按住")
+                           f"3D证据[{_long_3d_why}{self._long3d_obs(long_ev)}]"
+                           f" → 双击被吞：两次弯曲被合成一段按住")
                 # 第二次弯曲演变为长按拖拽 → 挂起的单击/补救候选作废（拖拽语义优先）
                 self._tap_pending = False
                 self._double_candidate = False
                 self._rescue_candidate = False
                 self._rescue_deadline = 0.0
-            elif _t_ge(self._hold_sec, self._p["LONG_PRESS_SEC"]) and _long_shallow:
+            elif _long_ripe and _long_shallow:
                 self._st["long_shallow"] += 1
                 self._diag(f"⏸ 浅弯保持不转长按 谷底{self._seg_min_ratio:.3f}"
                            f">{TAP_MIN_BEND_RATIO} 总{self._total_sec:.3f}s → 留 HOLD 等弯深/回直")
+            elif _long_ripe and not _long_3d_ok:
+                # 3D 正向证据不达标（握拳构型/world 缺失）：不转长按，留 HOLD 逐帧重判。
+                # 标记本段"被拦截"→ 松手时静默结束（不发 click/LONG_UP）。
+                if not self._long_3d_blocked:
+                    self._long_3d_blocked = True
+                    self._st["long_3d_block_seg"] += 1
+                self._st["long_3d_block_frames"] += 1
+                if now - self._long_3d_diag_t >= 0.30:
+                    self._long_3d_diag_t = now
+                    _vl = (f"{self._seg_min_ratio:.3f}"
+                           if self._seg_min_ratio is not None else "n/a")
+                    print(f"[LONG3D] 长按转换被3D门拦截（{_long_3d_why}）留HOLD逐帧重判 "
+                          f"总{self._total_sec:.3f}s 2D谷底{_vl}"
+                          f"{self._long3d_obs(long_ev)}"
+                          f"（bend3d/DIP 本版本仅观测不门控）", flush=True)
 
         elif self.state == _S.PRESSED:
             if up_trigger:
