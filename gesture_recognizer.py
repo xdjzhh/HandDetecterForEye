@@ -17,6 +17,55 @@ import numpy as np
   - 所有 debug 比例值都会在画面上显示，方便调参。
 """
 
+# ⭐⭐ 2026-10-15 用户方案：3D world 五指卷心比重建布尔位（替换不准的 2D 布尔）
+#   对每根手指 i ∈ {拇,食,中,无名,小} 计算
+#       r_i = dist(TIP_i, P) / dist(PIP_i, P)   （拇指 PIP 角色 = IP 关节3）
+#   P = 掌心三角点 = wrist(0)、食根 MCP(5)、小根 MCP(17) 三点质心。
+#   几何含义：手指伸直时 TIP 在 PIP 之外、离掌心更远（r_i>1）；手指折过 PIP 卷回
+#   掌心时 TIP 比 PIP 更靠近 P（r_i<1）。
+#   布尔重建（用户拍板 1.2 分界）：
+#       r_i < FOLD_EXTEND_R(1.2) → 该指位=0（弯）；r_i ≥ 1.2 → 该指位=1（伸）。
+#   五指全部 <1.2 → ext=(0,0,0,0,0) → 表判 FIST。2026-10-15 真机松握临界抖动达
+#   1.15（连续2~3帧），1.1 硬阈值被双向穿透，1.2 留出噪声余量；真勾按 1.34+、
+#   真张开 1.3+ 仍在 1.2 外侧。残余临界噪声由 GestureTimeStabilizer 时钟区间吞掉。
+#   重建后的五指位【整体替换】2D TIP-MCP 布尔（拇指同形式：r_t=‖TIP4−P‖/‖IP3−P‖，
+#   IP 关节3 扮演其他指 PIP 的角色——真机证 2D 拇指位在握拳帧同样被误读成伸直，
+#   若保留 2D 拇指位，FIST 会被 GESTURE_TABLE 抢先匹配成 THUMB）。
+#   随后只走同一张 GESTURE_TABLE 匹配——FIST 即五指位全 0 的普通表项，无任何特判门。
+#   真机分布：深握拳 0.44~0.90、松握 1.00~1.10；勾按/点击食指 1.34~1.74；张开 >1.2。
+#   拇指 r_t 暂无独立标定，阈值先同 1.2（真机握拳漂 ≤1.18、真竖拇指 ≥1.22），
+#   fold_t 随日志输出待更多样本修正。
+#   曾试过 P=四指根弓质心(MCP5/9/13/17)，日志标注"应失效"（握拳时比值恒 >1，无区分
+#   度），不得再换回。
+#   world 缺失/退化/异常 → 返回 None，五指位保留原 2D 布尔（缺失路径行为不变）。
+FOLD_EXTEND_R = 1.2
+# (TIP, PIP/IP) 拇4/3、食8/6、中12/10、无名16/14、小20/18
+_FOLD_TIP_PIP_PAIRS = ((4, 3), (8, 6), (12, 10), (16, 14), (20, 18))
+
+
+def _five_finger_fold_ratios(wlms):
+    """五指卷心比 r = ‖TIP−P‖ / ‖PIP(IP)−P‖（3D world），P=0/5/17 掌心三角质心。
+
+    返回 (拇,食,中,无名,小)；关键点不足/退化向量/异常 → None（调用方回退旧 2D 判定）。
+    """
+    try:
+        if wlms is None or len(wlms) < 21:
+            return None
+        pts = [np.array([float(p.x), float(p.y), float(p.z)], dtype=np.float64)
+               for p in wlms]
+        p_center = (pts[0] + pts[5] + pts[17]) / 3.0
+        out = []
+        for tip, pip in _FOLD_TIP_PIP_PAIRS:
+            d_tip = float(np.linalg.norm(pts[tip] - p_center))
+            d_pip = float(np.linalg.norm(pts[pip] - p_center))
+            if d_pip < 1e-9:
+                return None
+            out.append(d_tip / d_pip)
+        return tuple(out)
+    except Exception:
+        return None
+
+
 # 七类手势（拇,食,中,无,小） 1=伸直 0=弯曲
 # 注意：PINCH 不由布尔组合判定，而由距离判定，单独放在最优先级匹配
 GESTURE_TABLE = [
@@ -51,14 +100,23 @@ def _pinch_distance(lms, palm_width: float):
     return d / palm_width
 
 
-def recognize_gesture(lms):
+def recognize_gesture(lms, wlms=None):
     """识别单只手手势。
+
+    Args:
+        lms:  2D 归一化关键点（21 个，含 .x/.y）
+        wlms: 3D world 关键点（21 个，含 .x/.y/.z）；提供时五指伸/屈布尔位由卷心比
+              r=dist(TIP,P)/dist(PIP或IP,P)（P=0/5/17 掌心三角质心，r<1.1=弯）
+              重建后再走 GESTURE_TABLE；缺失/异常时沿用原 2D 布尔（PINCH 距离门、
+              PEACE 二次校验不受影响）。
 
     Returns:
         (gesture_name, ext_tuple(5个0/1), debug_info_dict)
     """
     # 1. 基准尺度：掌宽
     palm_width = float(np.linalg.norm(_p2(lms[5]) - _p2(lms[17]))) + 1e-6
+    # 1b. 3D 五指卷心比 (拇,食,中,无,小)：用于重建五指伸/屈布尔位
+    _fold = _five_finger_fold_ratios(wlms)
 
     # 2. 五指伸/屈 + 比值
     index_ext,  index_r  = _finger_extended(lms[8],  lms[5],  palm_width)
@@ -70,6 +128,14 @@ def recognize_gesture(lms):
 
     ext_tuple = (int(thumb_ext), int(index_ext), int(middle_ext),
                  int(ring_ext), int(pinky_ext))
+
+    # 2b. ⭐ 3D 卷心比重建五指布尔位（用户 2026-10-15 方案）：
+    #   world 有效时，五指伸/屈位不再信 2D TIP-MCP（真机握拳帧 2D 把五指全误读成
+    #   伸直），改用 r：r<1.1 → 0（弯），r≥1.1 → 1（伸）。
+    #   重建后 PINCH 距离门之外的所有手势（含 FIST/POINT/OPEN/PEACE/ROCK/THUMB）
+    #   都只按这同一份 ext_tuple 走原有判定，不再有任何 FIST 特判门。
+    if _fold is not None:
+        ext_tuple = tuple(0 if r < FOLD_EXTEND_R else 1 for r in _fold)
 
     # 3. 距离手势：PINCH 捏合（最高优先级，距离判定）
     pinch_r = _pinch_distance(lms, palm_width)
@@ -86,6 +152,10 @@ def recognize_gesture(lms):
             "pinky_r": round(pinky_r, 3),
             "pinch_r": round(pinch_r, 3),
         }
+        if _fold is not None:
+            ratios.update({"fold_t": round(_fold[0], 3), "fold_i": round(_fold[1], 3),
+                           "fold_m": round(_fold[2], 3), "fold_r": round(_fold[3], 3),
+                           "fold_p": round(_fold[4], 3)})
         return "PINCH", ext_tuple, ratios
 
     # 4. PEACE (V字) 二次校验：食中指必须充分伸展 (>0.7)，且无名指小指必须弯曲
@@ -100,9 +170,12 @@ def recognize_gesture(lms):
                 "pinky_r": round(pinky_r, 3),
                 "pinch_r": round(pinch_r, 3),
             }
+            if _fold is not None:
+                ratios.update({"fold_t": round(_fold[0], 3), "fold_i": round(_fold[1], 3),
+                               "fold_m": round(_fold[2], 3), "fold_r": round(_fold[3], 3),
+                               "fold_p": round(_fold[4], 3)})
             return "PEACE", ext_tuple, ratios
 
-    # 5. 其它手势按「更具体→更通用」顺序精确匹配布尔组合
     ratios = {
         "palm_w": round(palm_width, 4),
         "thumb_r": round(thumb_raw, 3),
@@ -112,10 +185,75 @@ def recognize_gesture(lms):
         "pinky_r": round(pinky_r, 3),
         "pinch_r": round(pinch_r, 3),
     }
+    if _fold is not None:
+        ratios.update({"fold_t": round(_fold[0], 3), "fold_i": round(_fold[1], 3),
+                       "fold_m": round(_fold[2], 3), "fold_r": round(_fold[3], 3),
+                       "fold_p": round(_fold[4], 3)})
+
+    # 5. 统一走 GESTURE_TABLE：ext_tuple 五指位已由 3D r 重建（world 有效时），
+    #   FIST=(0,0,0,0,0) 只是表中普通一项，无特判、无前置门；world 缺失时五指位是
+    #   原 2D 布尔，即旧行为（PEACE 已在第 4 步单独处理并返回）。
     for name, pattern in GESTURE_TABLE:
         if name == "PEACE":
-            continue  # PEACE 已单独处理
+            continue
         if ext_tuple == pattern:
             return name, ext_tuple, ratios
 
     return "OTHER", ext_tuple, ratios
+
+
+# ⭐⭐ 2026-10-15 手势输出时钟区间稳定器（用户拍板：不按帧、按墙钟区间判断）：
+#   候选新手势必须【连续持续满确认秒数】才能翻转稳定输出；确认期间冒出任意一帧
+#   旧手势（或第三种手势），确认计时立即清零重来。
+#   为什么不用帧计数：主循环有自适应跳帧，同一"3帧"在不同负载下是 0.1~0.3s 不等；
+#   墙钟区间给出确定性的去抖时长。
+#   进出握拳时长沿用 2026-10-01 真机标定（FIST_CURL_ENTER_SEC=0.10/EXIT_SEC=0.17）：
+#     进入 FIST 快（0.10s，保证握拳响应与未来和弦武装跟手）；
+#     离开 FIST 慢（0.17s，松握 r 在 1.2 临界的短时漂移不漏成 OTHER/THUMB）；
+#   其余标签互相切换 0.10s。手离镜必须 reset()，杜绝单向锁（经验教训 630142）。
+FIST_ENTER_SEC = 0.10
+FIST_LEAVE_SEC = 0.17
+GESTURE_SWITCH_SEC = 0.10
+
+
+class GestureTimeStabilizer:
+    """按墙钟区间确认的单只手手势稳定器（每只手一个实例）。"""
+
+    __slots__ = ("_stable", "_cand", "_cand_t0")
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """手离镜/初始化时调用：下一个 raw 直接采纳为稳定输出。"""
+        self._stable: str | None = None   # 当前稳定输出的手势
+        self._cand: str | None = None     # 待确认的候选手势
+        self._cand_t0: float = 0.0        # 候选首次出现的墙钟
+
+    def update(self, raw: str, now: float) -> str:
+        """喂入当帧 raw 手势与 time.monotonic() 墙钟，返回稳定后的手势。"""
+        # 首帧：直接采纳，不做确认延迟
+        if self._stable is None:
+            self._stable = raw
+            self._cand = None
+            return raw
+        # raw 与稳定输出一致：任何在途确认作废
+        if raw == self._stable:
+            self._cand = None
+            return raw
+        # 出现新候选（或候选中途换成别的手势）：重新开始计时
+        if raw != self._cand:
+            self._cand = raw
+            self._cand_t0 = now
+            return self._stable
+        # 候选持续中：按切换方向取确认时长
+        if self._stable == "FIST":
+            need = FIST_LEAVE_SEC
+        elif raw == "FIST":
+            need = FIST_ENTER_SEC
+        else:
+            need = GESTURE_SWITCH_SEC
+        if now - self._cand_t0 >= need:
+            self._stable = raw
+            self._cand = None
+        return self._stable

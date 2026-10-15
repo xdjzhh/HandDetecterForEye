@@ -29,7 +29,7 @@ import cv2
 import numpy as np
 
 from hand_detector import HandDetector, TasksHandDetector, HAND_CONNECTIONS
-from gesture_recognizer import recognize_gesture
+from gesture_recognizer import recognize_gesture, GestureTimeStabilizer
 from mouse_controller import MouseController
 from draw_cn_text import put_text_cn
 from finger_tap_click_detector import (FingerTapClickDetector, TwoFingerRightClickDetector,
@@ -1302,13 +1302,18 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     #   防止 MP handedness 单帧横跳 → EMA 串手 / 控鼠手瞬切 / 双手拉伸左右对调
     _hand_id_stab = HandIdentityStabilizer()
 
-    # (2) 手势标签 majority-vote 去抖：最近 N 帧投票取众数
-    #     ✅ 2026-08-20 调参：窗口从 5 → 3
-    #       之前 5 帧会让手势切换滞后 ~133ms（30fps），和EMA拖尾叠加后用户感觉"我手明明是OPEN，拉伸连线3秒才出来"。
-    #       3 帧折中：单帧噪声（比如半帧弯曲误判）仍能被 2/3 多数票杀掉，但响应延迟从 133ms → 66ms。
-    _MV_WINDOW = 3
-    _mv_history: dict[str, list] = {}      # key = Left/Right, value = list[str] (gesture names)
-    _mv_final: dict[str, str] = {}
+    # (2) 手势标签去抖：⭐ 2026-10-15 帧投票 → 时钟区间稳定器（用户拍板：不按帧、
+    #     按墙钟区间判断）。每只手一个 GestureTimeStabilizer：候选新手势需持续满
+    #     0.10s（离开 FIST 需 0.17s）才翻转，自适应跳帧下去抖时长仍确定。
+    #     旧 3 帧多数投票（_MV_WINDOW/_mv_history）已删除。
+    _gest_stab: dict[str, GestureTimeStabilizer] = {}
+    _mv_final: dict[str, str] = {}   # 仅用于本帧手势翻转检测（上一帧稳定值）
+
+    # ⭐ 2026-10-15 [FIST-CHK] 左手（物理左手=交换后标签 "Right"）握拳判定观测：
+    #   事件即时（入镜/离镜、raw FIST 翻转）+ 0.5s 心跳，不逐帧刷屏。
+    _fist_chk_t0 = 0.0            # 上次心跳墙钟
+    _fist_chk_present = False     # 上一帧左手是否在镜
+    _fist_chk_stable_fist: bool | None = None  # 上一帧左手稳定输出是否 FIST（None=未在镜）
 
     # (3) 自适应跳帧：
     #   · 连续 ≥_SKIP_MIN_STABLE 帧都稳定检测到手 + 掌心位移 < _SKIP_PX_TOL*min(w,h)
@@ -1715,31 +1720,53 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             for hand in hands_data:
                 label = hand["label"]
                 lms = hand["landmarks"]
-                gesture_raw, ext, ratios = recognize_gesture(lms)
-                # --- Majority vote ---
-                if label not in _mv_history:
-                    _mv_history[label] = []
-                hist = _mv_history[label]
-                hist.append(gesture_raw)
-                if len(hist) > _MV_WINDOW:
-                    hist = hist[-_MV_WINDOW:]
-                    _mv_history[label] = hist
-                # 统计众数；平票时选**最新出现**的那个（保持响应性）
-                counts: dict = {}
-                for g in hist:
-                    counts[g] = counts.get(g, 0) + 1
-                max_c = max(counts.values())
-                # 倒序遍历，取最后出现的 max_c 对应的 gesture
-                gesture_final = gesture_raw
-                for g in reversed(hist):
-                    if counts.get(g, 0) == max_c:
-                        gesture_final = g
-                        break
+                # 2026-10-15：FIST 判定走用户的 3D world 五指卷心比
+                # r_i=dist(TIP_i,P)/dist(PIP_i,P)（P=0/5/17 掌心三角点，五指全 <1.2
+                # 重建为全弯 → 表判 FIST），再经时钟区间稳定器去抖；
+                # world 缺失时识别器内部自动回退旧 2D 五指全弯门。
+                gesture_raw, ext, ratios = recognize_gesture(
+                    lms, hand.get("world_landmarks"))
+                # --- 时钟区间稳定（替代旧帧投票；墙钟确认见 GestureTimeStabilizer）---
+                stab = _gest_stab.get(label)
+                if stab is None:
+                    stab = GestureTimeStabilizer()
+                    _gest_stab[label] = stab
+                    _mv_final.pop(label, None)   # 新入镜：清旧值，首帧直接采纳
+                gesture_final = stab.update(gesture_raw, _wall_now)
                 if label in _mv_final and _mv_final[label] != gesture_final:
                     _gestures_changed_any = True
                 _mv_final[label] = gesture_final
                 # 用投票后的手势（不改变 ext/ratios，保持原始弯曲度反馈）
                 hand_results[label] = (gesture_final, ext, ratios, lms)
+
+                # ---- 2026-10-15 [FIST-CHK] 左手握拳判定日志（物理左手=标签 Right）----
+                #   入镜/稳定后握拳翻转即时打印；状态不变时 0.5s 一条心跳；fold 五值=
+                #   r_i=dist(TIP_i,P)/dist(PIP_i,P)，r_i<1.2 重建为"弯"位，FIST 即
+                #   重建 ext=(0,0,0,0,0) 经 GESTURE_TABLE + 时钟稳定器的输出。
+                if label == "Right":
+                    _now_chk = time.monotonic()
+                    _stable_fist = (gesture_final == "FIST")
+                    if "fold_i" in ratios:
+                        _fold_s = (f"fold 拇/食/中/无/小={ratios['fold_t']}/"
+                                   f"{ratios['fold_i']}/{ratios['fold_m']}/"
+                                   f"{ratios['fold_r']}/{ratios['fold_p']}"
+                                   f"(<1.2=弯) ext(拇/食/中/无/小)={ext}")
+                    else:
+                        _fold_s = (f"fold n/a（world缺失→2D布尔）"
+                                   f" ext(拇/食/中/无/小)={ext}")
+                    _enter = not _fist_chk_present
+                    _flip = (_fist_chk_stable_fist is not None
+                             and _fist_chk_stable_fist != _stable_fist)
+                    if (_enter or _flip
+                            or _now_chk - _fist_chk_t0 >= 0.5):
+                        _fist_chk_t0 = _now_chk
+                        _tag = "入镜·" if _enter else ("【握拳翻转】" if _flip else "")
+                        print(f"[FIST-CHK] 左手 {_tag}判定握拳="
+                              f"{'是' if _stable_fist else '否'} "
+                              f"(raw={gesture_raw}/stable={gesture_final}) {_fold_s}",
+                              flush=True)
+                    _fist_chk_present = True
+                    _fist_chk_stable_fist = _stable_fist
                 # 记录掌位（归一化）——⭐ 2026-10-01 与光标锚点同源（args.anchor，默认 mcp），
                 # 跳帧稳定性判定的位移基准必须等于光标实际跟随的点，否则两者门限语义脱节
                 _palm_x, _palm_y = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
@@ -1764,6 +1791,20 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     put_text_cn(frame, hand_title, (w - 260, top_y),
                                 font_scale=0.85, color=color, thickness=2)
                     _draw_finger_state(frame, ext, ratios, (w - 260, 65), color)
+
+            # 手离镜：复位该手的时钟稳定器与翻转记录（防单向锁；重新入镜首帧直接采纳）
+            for _lab in ("Left", "Right"):
+                if _lab not in hand_results:
+                    if _lab in _gest_stab:
+                        _gest_stab[_lab].reset()
+                        del _gest_stab[_lab]
+                    _mv_final.pop(_lab, None)
+
+            # [FIST-CHK] 左手本帧不在镜（且上一帧在）→ 离镜事件打印一次
+            if _fist_chk_present and "Right" not in hand_results:
+                print("[FIST-CHK] 左手 离镜（本帧无左手）", flush=True)
+                _fist_chk_present = False
+                _fist_chk_stable_fist = None
 
             # ================================================================
             # 🔥 自适应跳帧：稳定性判定，决定下一帧是否跳过
@@ -2786,7 +2827,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 # 优化诊断字段
                 opt_infer_size=480,
                 opt_ema_alpha=float(_ema_a),  # 2026-10-02 墙钟化：最近一帧实际 α（τ=60ms，随帧率变化；跳帧=0）
-                opt_mv_window=int(_MV_WINDOW),
+                opt_mv_window=0,  # 2026-10-15 帧投票已停用（0），改走时钟区间稳定器
                 opt_skip_total=int(_skip_total_frames),
                 opt_skip_skipped=int(_skip_skipped_frames),
                 opt_skip_pct=float(_opt_skip_pct),
