@@ -668,6 +668,7 @@ class ARSmoother:
 #     · 无目标 → 直接空右键（桌面/文件夹/窗口空白处的右键菜单）
 # ============================================================================
 import ctypes
+import math
 from ctypes import wintypes
 
 # MSAA accRole 中视为"可选目标"的角色（文件项/应用/图标/按钮/链接/单元格…）
@@ -883,6 +884,11 @@ _MOUSEEVENTF_LEFTDOWN  = 0x0002
 _MOUSEEVENTF_LEFTUP    = 0x0004
 _MOUSEEVENTF_RIGHTDOWN = 0x0008
 _MOUSEEVENTF_RIGHTUP   = 0x0010
+# ⭐ 2026-10-15 垂直滚轮（双手和弦：左手握拳+右手食指画圈）：
+#   mouseData = WHEEL_DELTA 的整数倍，正=向上滚（内容上移），负=向下滚；
+#   滚轮事件在【当前光标位置】投递（和弦期间光标冻结，正好落在用户瞄的窗口上）。
+_MOUSEEVENTF_WHEEL     = 0x0800
+_WHEEL_DELTA           = 120
 _INPUT_MOUSE = 0
 
 
@@ -933,6 +939,9 @@ class MouseController:
             self.sw, self.sh = pyautogui.size()
         else:
             self.sw, self.sh = screen_size
+        # 亚格滚轮累积余量（wheel 单位，120=一格）：画圈检测器按帧给小数 notch，
+        # 在此累积成系统可投递的整数小步长（Vista+ 平滑滚轮由系统/应用自行累计）
+        self._wheel_remain = 0.0
         # ROI scale：画面中心多少%映射到整个屏幕（解决"掌心锁死、手指不可见"）
         roi_scale = float(roi_scale)
         if roi_scale < ROI_SCALE_MIN: roi_scale = ROI_SCALE_MIN
@@ -1548,3 +1557,55 @@ class MouseController:
                     self._drag_active = True
                 except Exception:
                     pass
+
+    @property
+    def wheel_remain(self) -> float:
+        """未投递的滚轮余量（wheel 单位，120=1格）；仅诊断日志用。"""
+        return float(getattr(self, "_wheel_remain", 0.0))
+
+    def scroll(self, clicks):
+        """垂直滚轮（双手转动和弦专用），支持亚格平滑滚动。
+
+        clicks 为 notch 单位（1=一格=WHEEL_DELTA），允许小数（每帧连续量）：
+        内部累积余量，攒够 _WHEEL_SEND_MIN 个 wheel 单位即以小步长投递
+        （30fps 下转动时约每帧 15~30 单位，而非 120 一跳，消除"顿感"；
+         Win 规范允许非 120 整数倍的细粒度值，由系统/应用累计）。
+        clicks>0 上滚（逆时针），<0 下滚（顺时针）；事件投递到当前光标位置。
+        SendInput 异常降级 pyautogui.scroll（仅整格），再异常静默。
+        """
+        try:
+            clicks = float(clicks)
+        except (TypeError, ValueError):
+            return
+        if clicks == 0.0:
+            return
+        # 反向转动时余量立即换向（检测器只在翻向稳定后才给反号量）
+        if self._wheel_remain * clicks < 0.0:
+            self._wheel_remain = 0.0
+        self._wheel_remain += clicks * _WHEEL_DELTA
+        _WHEEL_SEND_MIN = 2.0     # 最小投递步长（降低门槛，小 q 也能投递，更流畅）
+        if abs(self._wheel_remain) < _WHEEL_SEND_MIN:
+            return
+        val = int(math.copysign(math.floor(abs(self._wheel_remain)),
+                                self._wheel_remain))
+        self._wheel_remain -= val
+        try:
+            arr = (_INPUT * 1)()
+            arr[0].type = _INPUT_MOUSE
+            arr[0].union.mi.dx = 0
+            arr[0].union.mi.dy = 0
+            # 负向滚动（下滑）需以无符号 DWORD 投递，按位掩码避免 c_ulong 符号歧义
+            arr[0].union.mi.mouseData = val & 0xFFFFFFFF
+            arr[0].union.mi.dwFlags = _MOUSEEVENTF_WHEEL
+            sent = ctypes.windll.user32.SendInput(
+                1, ctypes.byref(arr), ctypes.sizeof(_INPUT))
+            if not sent:
+                raise OSError("SendInput wheel returned 0")
+        except Exception:
+            self._wheel_remain += val  # 发送失败退回余量
+            try:
+                whole = int(math.copysign(math.floor(abs(clicks)), clicks))
+                if whole:
+                    pyautogui.scroll(whole)
+            except Exception:
+                pass

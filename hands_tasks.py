@@ -36,6 +36,7 @@ from finger_tap_click_detector import (FingerTapClickDetector, TwoFingerRightCli
                                        _S as _TS, E as _TEV, TWO_FINGER_TIP_ENTRY_R,
                                        RF_OBSERVE_ONLY)
 from window_mover import WindowMover, MOVE_CONFIRM_SEC, _MS as _WMS
+from circle_scroll_detector import CircleScrollDetector
 
 # ---------------- 常量（原 main.py 顶部，原样搬） ----------------
 HAND_COLORS = {"Left": (255, 100, 0), "Right": (0, 140, 255)}
@@ -211,7 +212,13 @@ class HandIdentityStabilizer:
             if d["mp"] == tr["label"]:
                 tr["disagree_n"] = 0
                 tr["disagree_sec"] = 0.0
-            else:
+            elif len(dets) == 2:
+                # 仅【双手同帧】才累计反标签账：真实换位只可能发生在双手同框时。
+                # 单只手在镜时 MP handedness 无另一只手做参照，会逐帧 Left/Right
+                # 横跳（单手帧 MP 标签无参照）——此时翻转身份没有
+                # 任何对照意义，只会让下游 label 键整体跳变（控鼠手/和弦修饰手
+                # 错位、和弦永久无法再武装）。单手帧反标签一律忽略：账不累计也
+                # 不清零，位置匹配已把手与轨迹绑死。
                 tr["disagree_n"] += 1
                 tr["disagree_sec"] += float(dt)
                 # ✨ 双条件：样本数 + 墙钟时长都达标，才承认双手真实换位
@@ -245,9 +252,17 @@ class HandIdentityStabilizer:
                      "miss_n": 0, "miss_sec": 0.0, "disagree_n": 0, "disagree_sec": 0.0})
             unmatched = []
         for d in unmatched:
-            lab = d["mp"] if d["mp"] in ("Left", "Right") else "Right"
+            # 新轨迹身份用【解剖位置先验】而非 MP 标签：非镜像头戴画面中
+            # 用户左手恒在画面左半（x≤.5=Right）、右手在右半（x>.5=Left）。
+            # 单手在镜（另一只手出画/刚双丢轨迹注销后归建）
+            # 时 MP 标签大面积误标——物理右手在 x1.2 被连标 Left（交换后 Right），
+            # 信 MP 归建会让右手占 Right 键：和弦修饰位被非拳占据→永久无法武装、
+            # 控鼠手在标签横跳中误控鼠还误触点击。与上方冷启动双同标裁决同源。
+            lab = "Right" if d["x"] <= 0.5 else "Left"
             if lab in used_labels:
-                # 与在册身份撞车（单手恢复等）→ 强制取另一个未占用身份
+                # 与在册身份撞车（单手快速移动未配上等）→ 取另一未占用身份，
+                # 宁可瞬时归错也绝不重名（重名=下游字典键覆盖，灾难更大）；
+                # 后续双手同帧位置匹配 + 重名裁决会自愈。
                 other = "Right" if lab == "Left" else "Left"
                 if other not in used_labels:
                     lab = other
@@ -257,13 +272,35 @@ class HandIdentityStabilizer:
                 {"label": lab, "x": d["x"], "y": d["y"],
                  "miss_n": 0, "miss_sec": 0.0, "disagree_n": 0, "disagree_sec": 0.0})
 
+        # ---- 双手标签唯一性保证 ----
+        # 画圈转掌时 MediaPipe 可连续数十帧给两只手【相同】原始标签（多为双 Left，
+        # 分数 0.6~0.98，与置信度阈值无关）→ 交换后双 Right。此时上方"标签滞回
+        # 翻转"只翻一只：右手轨迹 Left→Right 与左手轨迹重名，两条轨迹同标签 →
+        # 下游 hand_results/EMA/_gest_stab 全部以 label 为字典键，后者覆盖前者，
+        # 画圈手(Left 键)整段消失 = 假 MISS（真机日志 f254~303：n=2 共38帧却
+        # 全 MISS）。n=2 且最终标签不构成一 R 一 L 时，按非镜像解剖先验裁决：
+        # 画面 x 小=用户左手=Right，x 大=用户右手=Left，并同步修正轨迹身份、
+        # 清滞回账（手臂真实交叉为瞬态，下帧位置匹配重新接管，代价仅一帧）。
+        if len(dets) == 2 and len({d.get("final_label") for d in dets}) != 2:
+            by_x = sorted(dets, key=lambda z: z["x"])
+            _want = ((by_x[0], "Right"), (by_x[1], "Left"))
+            _det_to_track = {id(dets[di]): ti for di, ti in best_pairs}
+            for _d, _lab in _want:
+                _d["final_label"] = _lab
+                _ti = _det_to_track.get(id(_d))
+                if _ti is not None:
+                    _tr = self._tracks[_ti]
+                    _tr["label"] = _lab
+                    _tr["disagree_n"] = 0
+                    _tr["disagree_sec"] = 0.0
+
         # ---- 单一出口：改写回 hands_data，下游只消费这份身份 ----
         for d in dets:
             d["hand"]["label"] = d["final_label"]
 
 
 # ======================================================================
-# ⭐ 2026-10-15 握拳语义架构（拍板）：单手握拳【没有任何含义】
+# 握拳语义架构（拍板）：单手握拳【没有任何含义】
 #   - 不取消点击、不冻结光标、不强制抬键、不产生任何动作；单手握拳在交互上完全中性。
 #   - FIST 标签（gesture_recognizer）保留，仅作为【双手组合手势】的旁挂/修饰角色
 #     （未来 FIST 修饰手 + POINT 画圈手滚轮和弦）；单手路径 FIST 按中性 OTHER 处理。
@@ -289,7 +326,7 @@ def _four_finger_mcp_angles(pts3d):
     """四指近节骨(MCP→PIP) 与掌轴(wrist0→MCP9) 的 3D world 夹角（度）。
 
     返回 (食,中,无名,小)；点异常返回 None。
-    2026-10-15 起唯一消费者 = 长按 3D 正向门的证据采集（hands_tasks 把食指角度
+    起唯一消费者 = 长按 3D 正向门的证据采集（hands_tasks 把食指角度
     原样喂给 FingerTapClickDetector.update(long_ev=...)，阈值在检测器侧）。
     只用 MCP/PIP/wrist/MCP9 等遮挡下仍稳定的点，不依赖 TIP。
     """
@@ -618,8 +655,11 @@ def init_models(args):
                            #   （实测长按 9.5s 内 70% 黑帧、最长连续 9.75s），重检成功的头几帧还吐过渡
                            #   垃圾关键点。下调 tracking 到 0.40 让时序跟踪器持续锁定（跟踪模式用上一帧
                            #   ROI，对指关节自遮挡天然鲁棒）；detection 0.55 仅在真丢手重检时使用。
-                           detection_confidence=0.55,
-                           tracking_confidence=0.40)
+                           # 右手画圈手检测分偏低（0.58~0.84）频繁 MISS：
+                           #   det 0.55→0.45 让低分手也能重检；track 0.40→0.30 让时序
+                           #   跟踪更持久。左手握拳分 0.99 不受影响。
+                           detection_confidence=0.45,
+                           tracking_confidence=0.30)
     if args.use_tasks:
         if args.model:
             model_path = args.model
@@ -643,6 +683,8 @@ def init_models(args):
     right_tap_detector = TwoFingerRightClickDetector(hardness=args.tap_hardness, speed=args.tap_speed)
     # 单手五指张开 → 拖移掌心下窗口（2026-10-14 从旧拉伸模块仅恢复 SINGLE MOVE）
     window_mover = WindowMover()
+    # 双手和弦滚轮：左手握拳 + 右手食指画圈（单手路径完全不读它）
+    circle_scroll = CircleScrollDetector()
 
     return dict(
         args=args,
@@ -651,6 +693,7 @@ def init_models(args):
         tap_detector=tap_detector,
         right_tap_detector=right_tap_detector,
         window_mover=window_mover,
+        circle_scroll=circle_scroll,
         mode_label=mode_label,
         mode_color=mode_color,
     )
@@ -1240,8 +1283,12 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     tap_detector    = components["tap_detector"]
     right_tap_detector = components["right_tap_detector"]
     window_mover    = components["window_mover"]
+    circle_scroll   = components["circle_scroll"]
     mode_label      = components["mode_label"]
     mode_color      = components["mode_color"]
+
+    # 画圈滚轮和弦迟滞态每次启动清空（函数属性跨调用会残留，防止单手误成立）
+    run_loop._chord_scroll_hold = False
 
     # ---------- 初始化 status_store ----------
     if status_store is None:
@@ -1253,6 +1300,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
         start_time_ms=start_ms, uptime_ms=0,
         last_left_gesture=None, last_right_gesture=None,
         move_mode="IDLE",
+        chord_scroll=False,
         error=None,
         preview_active=bool(preview),
     ))
@@ -1302,14 +1350,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     #   防止 MP handedness 单帧横跳 → EMA 串手 / 控鼠手瞬切 / 双手拉伸左右对调
     _hand_id_stab = HandIdentityStabilizer()
 
-    # (2) 手势标签去抖：⭐ 2026-10-15 帧投票 → 时钟区间稳定器（用户拍板：不按帧、
+    # (2) 手势标签去抖：帧投票 → 时钟区间稳定器（用户拍板：不按帧、
     #     按墙钟区间判断）。每只手一个 GestureTimeStabilizer：候选新手势需持续满
     #     0.10s（离开 FIST 需 0.17s）才翻转，自适应跳帧下去抖时长仍确定。
     #     旧 3 帧多数投票（_MV_WINDOW/_mv_history）已删除。
     _gest_stab: dict[str, GestureTimeStabilizer] = {}
     _mv_final: dict[str, str] = {}   # 仅用于本帧手势翻转检测（上一帧稳定值）
 
-    # ⭐ 2026-10-15 [FIST-CHK] 左手（物理左手=交换后标签 "Right"）握拳判定观测：
+    # [FIST-CHK] 左手（物理左手=交换后标签 "Right"）握拳判定观测：
     #   事件即时（入镜/离镜、raw FIST 翻转）+ 0.5s 心跳，不逐帧刷屏。
     _fist_chk_t0 = 0.0            # 上次心跳墙钟
     _fist_chk_present = False     # 上一帧左手是否在镜
@@ -1333,12 +1381,17 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     _skip_total_frames = 0                  # 累计主循环帧数
     _skip_skipped_frames = 0                # 累计跳过推理帧数
 
+    # 画圈滚轮统计：和弦期逐帧追踪 + 20s 汇总（纯观测）
+    _cs_stat_t0 = time.monotonic()
+    _cs_rs = {"held": 0, "stale": 0, "fresh": 0, "miss": 0, "inactive": 0,
+              "LOCK": 0, "FLIP": 0, "RELEASE": 0, "qp": 0.0, "qn": 0.0}
+
     # ⭐ 2026-10-02 丢手诊断（纯观测，零行为变更）：
     #   每 20s 一行 [DET-STAT]，把"丢手"拆成可归因的计数：
     #   · 检测层（detector.take_det_diag）：实际推理数 / 80ms回调超时 / 有结果但空手 / 延迟
     #   主循环 bend=None 归因：no_left=本帧无控鼠手标签（检测空手/跟踪丢失/跳帧前已丢）
     #                           palm=掌宽≈0（手太远/关键点残缺）
-    #   （2026-10-15 起 fist/fist_wm 归因随握拳全局 guard 一并删除）
+    #   （起 fist/fist_wm 归因随握拳全局 guard 一并删除）
     #   · 跳帧率：_skip_was_skipped 帧占比（跳帧复用不产生新检测，高跳帧率+高超时=推理拥塞线索）
     #   · 帧亮度：黑帧（均值<_CAM_BLACK_MEAN_THR，与预热同口径）计数 + 窗口 min/avg，
     #             用于区分"检测空手"是手真不在还是相机阶段性吐黑/暗帧（read 成功但画面黑）
@@ -1376,7 +1429,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     # 2026-10-04 [BEND3D] 左键段双口径（2D vs 3D world）纯观测：
     #   b3d 段内谷底、3D DIP 角谷底、压缩比 min、2D-3D 最大差（发生时的压缩比）、
     #   world TIP 逐帧跳变 max、末节指骨长度
-    # 2026-10-15 [LONG3D] mcp_min=食近节角段内【最大】值（握拳方向角变大，取 max 看最接近/越界）
+    # [LONG3D] mcp_min=食近节角段内【最大】值（握拳方向角变大，取 max 看最接近/越界）
     _lseg_b2d_arm = None
     _lseg_b3d_arm = None
     _lseg_b3d_min = None
@@ -1612,6 +1665,32 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _skip_was_skipped = False
                 # ---------- 正常：双手检测 ----------
                 hands_data, frame = detector.detect(frame)
+                # ---- [MP-RAW] 检测出口原始观测（标签交换/身份稳定前）----
+                # 目的：一锤定音区分"模型层只返回了一只手"与"稳定器/标签交换吞手"。
+                # 仅在物理左手(交换前 MP label=Left)在场或和弦保持中打印，避免污染日常日志。
+                # 坐标按画面短边归一（与滚轮检测器口径一致）；palm=MCP四指根质心，tip=TIP8。
+                try:
+                    if (not _skip_was_skipped and (
+                            getattr(run_loop, "_chord_scroll_hold", False)
+                            or any(_h.get("label") == "Left" for _h in hands_data))):
+                        _short0 = float(min(w, h))
+                        _parts = []
+                        for _h in sorted(hands_data, key=lambda z: z.get("label", "")):
+                            _l = _h["landmarks"]
+                            _px = 0.25 * (float(_l[5].x) + float(_l[9].x)
+                                          + float(_l[13].x) + float(_l[17].x)) * w / _short0
+                            _py = 0.25 * (float(_l[5].y) + float(_l[9].y)
+                                          + float(_l[13].y) + float(_l[17].y)) * h / _short0
+                            _parts.append(
+                                f"{_h.get('label')}?s={float(_h.get('score', 0) or 0):.2f}"
+                                f" palm={_px:.3f},{_py:.3f}"
+                                f" tip={float(_l[8].x) * w / _short0:.3f},"
+                                f"{float(_l[8].y) * h / _short0:.3f}")
+                        print(f"[MP-RAW] f={_bg_heartbeat_cnt} n={len(hands_data)} "
+                              + (" | ".join(_parts) if _parts else "(空手)"),
+                              flush=True)
+                except Exception:
+                    pass
                 # ⭐ 同视角标签归一化：MediaPipe 左右手标签假定输入为【镜像自拍图】
                 #   （旧面对面流程靠 cv2.flip 满足该假定，用户右手原始标签恰为 "Left"）。
                 #   同视角输入不镜像，按官方规则在应用层交换 handedness：
@@ -1720,12 +1799,21 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             for hand in hands_data:
                 label = hand["label"]
                 lms = hand["landmarks"]
-                # 2026-10-15：FIST 判定走用户的 3D world 五指卷心比
+                # FIST 判定走用户的 3D world 五指卷心比
                 # r_i=dist(TIP_i,P)/dist(PIP_i,P)（P=0/5/17 掌心三角点，五指全 <1.2
                 # 重建为全弯 → 表判 FIST），再经时钟区间稳定器去抖；
                 # world 缺失时识别器内部自动回退旧 2D 五指全弯门。
                 gesture_raw, ext, ratios = recognize_gesture(
                     lms, hand.get("world_landmarks"))
+                # 左手是和弦修饰手，只做握拳/张开，不会捏合；PINCH 一律按 ext 重判
+                # （握拳全 0→FIST，张开全 1→OPEN，否则 OTHER），避免拇食指靠拢误判。
+                if label == "Right" and gesture_raw == "PINCH":
+                    if ext == (0, 0, 0, 0, 0):
+                        gesture_raw = "FIST"
+                    elif ext == (1, 1, 1, 1, 1):
+                        gesture_raw = "OPEN"
+                    else:
+                        gesture_raw = "OTHER"
                 # --- 时钟区间稳定（替代旧帧投票；墙钟确认见 GestureTimeStabilizer）---
                 stab = _gest_stab.get(label)
                 if stab is None:
@@ -1739,7 +1827,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 # 用投票后的手势（不改变 ext/ratios，保持原始弯曲度反馈）
                 hand_results[label] = (gesture_final, ext, ratios, lms)
 
-                # ---- 2026-10-15 [FIST-CHK] 左手握拳判定日志（物理左手=标签 Right）----
+                # ---- [FIST-CHK] 左手握拳判定日志（物理左手=标签 Right）----
                 #   入镜/稳定后握拳翻转即时打印；状态不变时 0.5s 一条心跳；fold 五值=
                 #   r_i=dist(TIP_i,P)/dist(PIP_i,P)，r_i<1.2 重建为"弯"位，FIST 即
                 #   重建 ext=(0,0,0,0,0) 经 GESTURE_TABLE + 时钟稳定器的输出。
@@ -1853,9 +1941,118 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             #   both_hands_global —— 双手同时在镜：屏蔽点击（旧拉伸/移窗防误触语义；
             #                        2026-10-14 拉伸模块整体删除后保留此最小双手门，
             #                        也为后续 FIST+POINT 滚轮和弦预留互斥位）
-            #   2026-10-15：any_fist_global（任一手握拳即冻结光标/取消点击）已删除——
+            #   any_fist_global（任一手握拳即冻结光标/取消点击）已删除——
             #   单手握拳无任何语义；FIST 仅保留标签供未来双手修饰角色。
             both_hands_global     = ("Left" in hand_results) and ("Right" in hand_results)
+
+            # ==================================================================
+            # 双手滚轮和弦（FIST 修饰角色的唯一消费者）：
+            #   左手（物理左手=标签 "Right"）稳定手势 FIST 即成立和弦；
+            #   右手（物理右手=标签 "Left"）【不做任何姿势门】——不要求食指伸直、
+            #   不要求中/无名指弯曲，只锁定右手食指 TIP(8) 轨迹的转动趋势
+            #   （航向角判定：约 1/4 圈趋势即出格；直线划动航向恒定、天然不触发）
+            #   → 右手食指 TIP 轨迹交 CircleScrollDetector 判转动趋势，
+            #     顺时针=下滑、逆时针=上滑；和弦期间光标冻结（不写 move_only/handle），
+            #     点击检测器沿既有 both_hands_global 分支每帧 reset（本块零改动）。
+            # 🔴 入口隔离：该布尔是【双手专用支路】唯一开关。单手场景
+            #    both_hands_global=False → 永远 False，单手点击/长按/移窗链路不受任何影响；
+            #    双手但左手非握拳同样 False（维持旧双手行为：光标可跟、点击屏蔽）。
+            # ==================================================================
+            # 三次改版：和弦【迟滞保持】。真机画圈时控鼠手漏检率
+            #    高达 60%（DET-STAT "无控鼠手"帧），旧规则"双手同帧才成立"会让
+            #    active 随检出抖动、连续漏检 0.25s 即整体 reset，表现为越画越卡、
+            #    最终锁死。新规则：
+            #      起手：双手同帧 且 左手 FIST；
+            #      保持：一旦成立，只要左手仍在镜且 FIST，右手丢帧【不解除】
+            #            （以 active=True + 坐标 None 喂检测器，内部按漏检衰减）；
+            #      解除：左手松拳/离镜（修饰语义消失，立即退出）。
+            _mod_fist = False
+            try:
+                _mod_fist = ("Right" in hand_results
+                             and hand_results["Right"][0] == "FIST")
+            except Exception:
+                _mod_fist = False
+            _prev_chord = bool(getattr(run_loop, "_chord_scroll_hold", False))
+            if _prev_chord:
+                _chord_scroll = _mod_fist
+            else:
+                _chord_scroll = bool(both_hands_global and _mod_fist)
+            run_loop._chord_scroll_hold = bool(_chord_scroll)
+            # 🔴 和弦保持期【禁止自适应跳帧】：画圈时掌心近似原地、只有食指尖画
+            #    弧，跳帧判定（掌位移<4.3px 连续12帧）会把"指尖运动中"误判成稳定
+            #    场景 → 隔帧复用冻结的关键点喂给滚轮检测器：墙钟在走、坐标不动，
+            #    ω 被假观测一路拖到 0 → LOCK↔RELEASE 空转、滚动积分≈0（真机日志：
+            #    LOCK ω=8~11 后 0.2s 即 RELEASE ω=0 循环，左手 FIST 全程稳定）。
+            if _chord_scroll:
+                _skip_skip_next = False
+                _skip_stable_cnt = 0
+
+            # 每帧喂检测器：active=和弦迟滞保持（见上方）；active=True 但坐标
+            #   None=右手漏检帧（检测器内衰减不 reset）；active=False=左手松拳/离镜，
+            #   0.25s 宽限后 reset（杜绝跨场景单向锁）。
+            #   🔴 跳帧复用帧（本帧根本没推理）=传感器未更新，和弦期【不喂】检测器：
+            #   冻结坐标会被当成"原地不动"的真观测污染测量窗（假停转）。
+            #   坐标按画面短边归一（无宽高比畸变、与分辨率无关），用原始 TIP8 关键点。
+            #   返回值是【亚格连续量】（notch，可小数），交给 mouse.scroll 平滑投递。
+            _scroll_q = 0.0
+            _circle_px = None        # 本帧 TIP 像素（UI 轨迹绘制）
+            _circle_m = {"state": "IDLE", "dir": 0, "m_dir": 0,
+                         "speed": 0.0, "speed_pct": 0.0, "trail": (),
+                         "ev": "", "ev_dir": 0, "ev_t": 0.0}
+            _circle_short = float(min(w, h))
+            if "Left" in hand_results:
+                _clms = hand_results["Left"][3]
+                _circle_px = (float(_clms[8].x) * w, float(_clms[8].y) * h)
+                _tip_u = (float(_clms[8].x) * w / _circle_short,
+                          float(_clms[8].y) * h / _circle_short)
+            else:
+                _tip_u = (None, None)
+            _cs_stale = bool(_chord_scroll and _skip_was_skipped)
+            if not _cs_stale:
+                _scroll_q = float(circle_scroll.update(
+                    _chord_scroll, _tip_u[0], _tip_u[1], _wall_now))
+            if _chord_scroll:
+                _circle_m = circle_scroll.metrics()
+                # STALE 帧没有 update，_ev 是上一帧残留：丢弃，禁止重复打印/计数
+                if _cs_stale:
+                    _circle_m["ev"] = ""
+                # 仅在锁定/翻向/释放状态跳变时打日志（连续滚动帧不刷屏）
+                _cv_ev = _circle_m.get("ev", "")
+                if _cv_ev:
+                    _cv_dir = int(_circle_m.get("ev_dir", 0))
+                    _cv_txt = {"LOCK": "锁定方向", "FLIP": "翻向", "RELEASE": "停转释放"}[_cv_ev]
+                    print(f"[CIRCLE-SCROLL] {_cv_txt}："
+                          f"{'逆时针⬆上滑' if _cv_dir > 0 else '顺时针⬇下滑' if _cv_dir < 0 else '-'}"
+                          f" ω={_circle_m.get('speed', 0.0):.2f}rad/s（左手握拳和弦）",
+                          flush=True)
+                # ---- [CS-DBG] 和弦期逐帧追踪（定位"后半程卡死"，纯观测）----
+                _cs_rs["held"] += 1
+                if _cs_stale:
+                    _cs_rs["stale"] += 1
+                elif _tip_u[0] is None:
+                    _cs_rs["miss"] += 1
+                else:
+                    _cs_rs["fresh"] += 1
+                if _cv_ev:
+                    _cs_rs[_cv_ev] += 1
+                _cs_rs["qp"] += max(_scroll_q, 0.0)
+                _cs_rs["qn"] += min(_scroll_q, 0.0)
+                if time.monotonic() - _cs_stat_t0 >= _DET_STAT_SEC:
+                    print(
+                        f"[CS-STAT] 和弦帧{_cs_rs['held']}:"
+                        f" 新鲜{_cs_rs['fresh']} 漏检{_cs_rs['miss']}"
+                        f" 跳帧复用{_cs_rs['stale']} | "
+                        f"LOCK{_cs_rs['LOCK']} FLIP{_cs_rs['FLIP']}"
+                        f" RELEASE{_cs_rs['RELEASE']} | "
+                        f"积分 q+={_cs_rs['qp']:.1f} q-={_cs_rs['qn']:.1f}",
+                        flush=True)
+                    _cs_stat_t0 = time.monotonic()
+                    for _k in ("held", "stale", "fresh", "miss",
+                               "LOCK", "FLIP", "RELEASE"):
+                        _cs_rs[_k] = 0
+                    _cs_rs["qp"] = _cs_rs["qn"] = 0.0
+            if abs(_scroll_q) > 1e-6:
+                mouse.scroll(_scroll_q)
 
             # 单手张开移窗 ACTIVE 期间 window_mover 每帧 SetCursorPos 锁窗口中心（防误触），
             # 掌心跟随 move_only 若同时写光标会在窗口中心↔掌心映射点间闪动 → 锁定期跳过一切掌心光标写入。
@@ -1868,11 +2065,15 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             # ⭐ B-1：鼠标移动急活【最前置】
             #   全局门控算完 → Pass C / Tap 等慢活之前，
             #   先让掌心光标出帧，消除慢活阻塞造成的“鼠标钉住 + 之后大跳”。
-            #   2026-10-15：单手 FIST 不再冻结光标，按中性 OTHER 出帧（握拳无单手语义）。
+            #   单手 FIST 不再冻结光标，按中性 OTHER 出帧（握拳无单手语义）。
             # ======================================================================
             _pre_move_only_done_right = False
             if _cursor_locked_by_window_move:
                 # 移窗锁定期：本帧掌心 move_only 禁止执行；置位阻止 Pass C 兜底再调一次 moveTo
+                _pre_move_only_done_right = True
+            elif _chord_scroll:
+                # 画圈滚轮和弦期：光标冻结在和弦进入前的位置，指尖画圈只产生滚轮，不移动光标。
+                # 置位同时阻止 Pass C 兜底 move_only / handle。
                 _pre_move_only_done_right = True
             elif "Left" in hand_results:
                 try:
@@ -1911,12 +2112,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                      cursor_anchor_norm=cursor_anchor_norm)
                     # ↓↓ 画锚点（绿圈=光标锚点 args.anchor，默认 mcp 指根；橙圈=食指TIP）
                     # ——和 move_only 用的 cursor_anchor_norm 完全同一份 ↓↓
-                    mx, my = HandDetector.landmark_to_pixel(lms[8], w, h)
-                    cv2.circle(frame, (mx, my), 7, (0, 140, 255), 2)
-                    ax = int(cursor_anchor_norm[0] * w)
-                    ay = int(cursor_anchor_norm[1] * h)
-                    cv2.circle(frame, (ax, ay), 12, (255, 255, 255), 2)
-                    cv2.circle(frame, (ax, ay), 9, (0, 230, 80), -1)
+                    # 和弦滚轮期不画绿锚点（光标冻结，绿圈跟着画圈会误导），轨迹由专用卡片绘制
+                    if not _chord_scroll:
+                        mx, my = HandDetector.landmark_to_pixel(lms[8], w, h)
+                        cv2.circle(frame, (mx, my), 7, (0, 140, 255), 2)
+                        ax = int(cursor_anchor_norm[0] * w)
+                        ay = int(cursor_anchor_norm[1] * h)
+                        cv2.circle(frame, (ax, ay), 12, (255, 255, 255), 2)
+                        cv2.circle(frame, (ax, ay), 9, (0, 230, 80), -1)
 
             # ---------- 食指 Tap-Click（仅右手） ----------
             index_bend: float | None = None
@@ -1934,7 +2137,12 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             _b3d_probe: dict | None = None
             rf_bend3d: float | None = None
             right_screen_pt = None
-            if "Left" in hand_results:
+            # 🔴 只要双手同帧，整块 bend/右键量/落点评估一律跳过——用户语义：
+            #   "出现双手时右手点击失效，只能用于转动翻页"（无论左手是否握拳）。
+            #   tap/right_tap 检测器在下方 both_hands_global 分支每帧 reset，
+            #   这里跳过评估还能避免 _eval_anchor_once 把转动中的掌心写进光标平滑器。
+            #   None 变量在上方已初始化，下游均有 None 防护。
+            if "Left" in hand_results and not both_hands_global:
                 _, _, _, lms = hand_results["Left"]
                 tip = np.array([lms[8].x, lms[8].y])
                 m5  = np.array([lms[5].x, lms[5].y])
@@ -2011,7 +2219,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             dist_bend_old = tip_m5 / denom
                             index_bend = _index_bend_from_joint_angles(
                                 lms, palm_denom=denom, dist_bend_fallback=dist_bend_old)
-                            # 2026-10-15：原"握拳卷曲全局 guard"（r 门/近节角状态机/world 缺失宁拦/
+                            # 原"握拳卷曲全局 guard"（r 门/近节角状态机/world 缺失宁拦/
                             #   bend 置 None/cancel/force_long_up）已整体拆除——单手握拳无任何语义。
                             #   握拳唯一防线在 tap 检测器长按转换点的 3D 正向门（_long_ev，本帧稍后
                             #   取 world 计算）；index_bend 此后永远是正常算出来的食指弯度，不再被置空。
@@ -2640,6 +2848,86 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             except Exception:
                 pass
 
+            # ---------- 2026-10-15 双手转动滚轮和弦 UI（轨迹/锁定方向/速度，仅和弦期绘制）----------
+            #   每帧必画（中文不跳帧，避免闪烁）；和弦不成立时整块零开销跳过。
+            if _chord_scroll:
+                try:
+                    _trail_pts = [(int(round(float(tx) * _circle_short)),
+                                   int(round(float(ty) * _circle_short)))
+                                  for tx, ty in _circle_m.get("trail", ())]
+                    _locked = (_circle_m.get("state") == "LOCKED")
+                    _dir = int(_circle_m.get("dir", 0))
+                    _mdir = int(_circle_m.get("m_dir", 0))
+                    # 已锁定按锁定方向上色；未锁定按短窗趋势预览上色
+                    _c_sign = _dir if _locked else _mdir
+                    _trail_color = ((0, 200, 255) if _c_sign > 0      # 逆时针=橙黄
+                                    else (255, 80, 160) if _c_sign < 0  # 顺时针=品红
+                                    else (180, 180, 180))
+                    # 指尖轨迹（最近 40 点，平滑后坐标）
+                    for i in range(1, len(_trail_pts)):
+                        cv2.line(frame, _trail_pts[i - 1], _trail_pts[i],
+                                 _trail_color, 2, cv2.LINE_AA)
+                    # 当前指尖点（锁定=实心大，未锁=空心小）
+                    if _circle_px is not None:
+                        cv2.circle(frame,
+                                   (int(round(_circle_px[0])), int(round(_circle_px[1]))),
+                                   7 if _locked else 5, _trail_color,
+                                   -1 if _locked else 1)
+                    # 状态卡（顶部居中偏下，黑底每帧重画）
+                    _card_w, _card_h = 780, 78
+                    _cx_card = (w - _card_w) // 2
+                    _cy_card = 64
+                    cv2.rectangle(frame, (_cx_card, _cy_card),
+                                  (_cx_card + _card_w, _cy_card + _card_h),
+                                  (0, 0, 0), -1)
+                    cv2.rectangle(frame, (_cx_card, _cy_card),
+                                  (_cx_card + _card_w, _cy_card + _card_h),
+                                  _trail_color if _locked else (0, 230, 230), 2)
+                    put_text_cn(frame,
+                                "🔒 左手握拳 + 右手转动 = 滚轮：顺时针⬇下滑 / 逆时针⬆上滑（方向锁定，越快越滚）",
+                                (_cx_card + 14, _cy_card + 12),
+                                font_scale=0.6,
+                                color=_trail_color if _locked else (0, 230, 230),
+                                thickness=2)
+                    if _locked and _dir > 0:
+                        _state_txt = "🔒 已锁定：逆时针 ⬆ 持续上滑中（停转或改顺时针才解除）"
+                        _state_col = (0, 200, 255)
+                    elif _locked and _dir < 0:
+                        _state_txt = "🔒 已锁定：顺时针 ⬇ 持续下滑中（停转或改逆时针才解除）"
+                        _state_col = (255, 80, 160)
+                    elif _mdir > 0:
+                        _state_txt = "识别到逆时针趋势…（约 1/12 圈即锁定）"
+                        _state_col = (0, 200, 255)
+                    elif _mdir < 0:
+                        _state_txt = "识别到顺时针趋势…（约 1/12 圈即锁定）"
+                        _state_col = (255, 80, 160)
+                    else:
+                        _state_txt = "转动右手食指即可滚动（直线划动无效）"
+                        _state_col = (220, 220, 220)
+                    put_text_cn(frame, _state_txt, (_cx_card + 14, _cy_card + 40),
+                                font_scale=0.55, color=_state_col, thickness=2)
+                    # 速度条（当前角速度 / 满幅 1.5圈/秒）
+                    _pb_x, _pb_y, _pb_w, _pb_h = _cx_card + 470, _cy_card + 32, 200, 12
+                    cv2.rectangle(frame, (_pb_x, _pb_y), (_pb_x + _pb_w, _pb_y + _pb_h),
+                                  (60, 60, 60), -1)
+                    _pct = float(_circle_m.get("speed_pct", 0.0))
+                    cv2.rectangle(frame, (_pb_x, _pb_y),
+                                  (_pb_x + int(_pb_w * min(1.0, _pct)), _pb_y + _pb_h),
+                                  _trail_color, -1)
+                    put_text_cn(frame, f"速度{int(_pct * 100):3d}%",
+                                (_pb_x + _pb_w + 10, _pb_y + 11),
+                                font_scale=0.5, color=_trail_color, thickness=2)
+                    # 锁定/翻向瞬间方向大字（0.5s 闪烁）
+                    _ev = _circle_m.get("ev", "")
+                    if _ev in ("LOCK", "FLIP") and _wall_now - _circle_m.get("ev_t", 0) < 0.5:
+                        _ev_txt = ("⬆ 上滑" if int(_circle_m.get("ev_dir", 0)) > 0
+                                   else "⬇ 下滑")
+                        _ev_txt = ("锁定 " if _ev == "LOCK" else "翻向 ") + _ev_txt
+                        put_text_cn(frame, _ev_txt, (_cx_card + 14, _cy_card + 66),
+                                    font_scale=0.62, color=_state_col, thickness=2)
+                except Exception:
+                    pass
+
             # ---------- 组合手势提示 ----------
             current_combo = ""
             if "Left" in hand_results and "Right" in hand_results:
@@ -2779,7 +3067,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 cv2.line(frame, (x2, y), (x2, ye), (0, 220, 120), 2)
 
             # ---------- 底部提示 ----------
-            help_line = "右手=控鼠 | 🟢掌心移动=鼠标(食指点击不漂) | 食指轻弯=单击 | 保弯=拖 | 🤏V=单 | Rock=右 | 拇=双 | 拳=拖 | ✋单手五指张开=掌心下窗口拖动(光标锁窗口中心防误触) | q退"
+            help_line = "右手=控鼠 | 食指轻弯=单击 | 保弯=拖 | ✋单手五指张开=移窗 | ✊左手握拳+右手转动=滚轮(顺↓逆↑,无需画圆) | q退"
             # 回滚 B-2：底部帮助栏 每帧必画
             put_text_cn(frame, help_line, (12, h - 28),
                         font_scale=0.55, color=(220, 220, 220), thickness=2)
@@ -2823,6 +3111,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 last_left_gesture=lg,
                 last_right_gesture=rg,
                 move_mode=(mover_info.move_state if mover_info is not None else "IDLE"),
+                chord_scroll=bool(_chord_scroll),
                 preview_active=bool(preview),
                 # 优化诊断字段
                 opt_infer_size=480,
