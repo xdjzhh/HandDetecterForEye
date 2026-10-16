@@ -90,6 +90,7 @@ MODE_PARAMS = {
     "PINCH":  (1.20,  0.0150, 1.0, 1.4),   # 同上
     "ROCK":   (1.20,  0.0150, 1.0, 1.4),
     "THUMB":  (1.20,  0.0150, 1.0, 1.4),
+    "OK":     (1.00,  0.0150, 1.5, 1.4),   # OK手势：鼠标锁定右下角，参数占位避免 KeyError
 }
 DEFAULT_PARAMS = MODE_PARAMS["OTHER"]
 # 4) Sigmoid 响应：已通过 response_k (上) 控制，见 ARSmoother._sigmoid_gain

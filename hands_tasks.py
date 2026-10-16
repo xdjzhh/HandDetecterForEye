@@ -16,6 +16,7 @@ hands_tasks.py  —— 体感鼠标全部业务逻辑的纯封装（零复杂线
 
 import argparse
 import copy as _cp
+import ctypes
 import math as _mt
 import os
 import re
@@ -27,6 +28,7 @@ from collections import deque  # ⭐ 新增：palm_n 滑窗稳定性判断（ind
 os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 import cv2
 import numpy as np
+import pyautogui
 
 from hand_detector import HandDetector, TasksHandDetector, HAND_CONNECTIONS
 from gesture_recognizer import recognize_gesture, GestureTimeStabilizer
@@ -36,6 +38,7 @@ from finger_tap_click_detector import (FingerTapClickDetector, TwoFingerRightCli
                                        _S as _TS, E as _TEV, TWO_FINGER_TIP_ENTRY_R,
                                        RF_OBSERVE_ONLY)
 from window_mover import WindowMover, MOVE_CONFIRM_SEC, _MS as _WMS
+from window_mover import RECT, GetForegroundWindow, GetWindowRect
 from circle_scroll_detector import CircleScrollDetector
 
 # ---------------- 常量（原 main.py 顶部，原样搬） ----------------
@@ -1289,6 +1292,10 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
 
     # 画圈滚轮和弦迟滞态每次启动清空（函数属性跨调用会残留，防止单手误成立）
     run_loop._chord_scroll_hold = False
+    # OK 调整窗口大小状态每次启动清空
+    run_loop._ok_resize_started = False
+    run_loop._ok_drag_prev_x = run_loop._ok_drag_prev_y = 0.0
+    run_loop._ok_miss_t0 = None   # 拖动中丢手宽限计时；None=手在镜
 
     # ---------- 初始化 status_store ----------
     if status_store is None:
@@ -1805,10 +1812,14 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 # world 缺失时识别器内部自动回退旧 2D 五指全弯门。
                 gesture_raw, ext, ratios = recognize_gesture(
                     lms, hand.get("world_landmarks"))
-                # 左手是和弦修饰手，只做握拳/张开，不会捏合；PINCH 一律按 ext 重判
+                # 左手是和弦修饰手，只做握拳/张开，不会捏合；PINCH/OK 一律按 ext 重判
                 # （握拳全 0→FIST，张开全 1→OPEN，否则 OTHER），避免拇食指靠拢误判。
-                if label == "Right" and gesture_raw == "PINCH":
-                    if ext == (0, 0, 0, 0, 0):
+                # OK 是右手单手手势，左手做 OK 无特殊语义，且 OK 的 ext=(1,1,1,1,1) 与 OPEN 相同，
+                # 若重判为 OPEN 会误触发窗口移动 → 左手 OK 统一重判为 OTHER。
+                if label == "Right" and gesture_raw in ("PINCH", "OK"):
+                    if gesture_raw == "OK":
+                        gesture_raw = "OTHER"
+                    elif ext == (0, 0, 0, 0, 0):
                         gesture_raw = "FIST"
                     elif ext == (1, 1, 1, 1, 1):
                         gesture_raw = "OPEN"
@@ -1887,6 +1898,23 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         _gest_stab[_lab].reset()
                         del _gest_stab[_lab]
                     _mv_final.pop(_lab, None)
+                    # 右手离镜：拖动中先宽限 0.35s（短时丢检测不松手，防止缩放被意外中断）；
+                    #   连续丢失超时才释放左键并重置。
+                    if _lab == "Left":
+                        if getattr(run_loop, "_ok_resize_started", False):
+                            _now_miss = time.monotonic()
+                            _t0 = getattr(run_loop, "_ok_miss_t0", None)
+                            if _t0 is None:
+                                run_loop._ok_miss_t0 = _now_miss
+                            elif _now_miss - _t0 >= 0.35:
+                                try:
+                                    pyautogui.mouseUp()
+                                    print(f"[OK-ACT] 右手离镜超0.35s，左键释放(拖动终止)",
+                                          flush=True)
+                                except Exception:
+                                    pass
+                                run_loop._ok_resize_started = False
+                                run_loop._ok_miss_t0 = None
 
             # [FIST-CHK] 左手本帧不在镜（且上一帧在）→ 离镜事件打印一次
             if _fist_chk_present and "Right" not in hand_results:
@@ -2078,10 +2106,103 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             elif "Left" in hand_results:
                 try:
                     _gesture, _ext, _ratios, _lms = hand_results["Left"]
-                    _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
-                    _move_hint = "OTHER" if _gesture == "FIST" else _gesture
-                    mouse.move_only(_cursor_anchor_norm, gesture_hint=_move_hint)
-                    _pre_move_only_done_right = True
+                    if _gesture == "OK":
+                        # OK 手势：在当前前台窗口右下角按住左键，鼠标坐标机制与五指张开完全相同
+                        #   进入帧 → 鼠标定到窗口右下角 + 按下左键（出现双向箭头）
+                        #   保持帧 → 与 OPEN 完全相同：掌心锚点经 ROI 映射 move_only（左键按住=拖动缩放）
+                        #   松开/离镜 → 释放左键
+                        if not getattr(run_loop, "_ok_resize_started", False):
+                            # 自动选中【当前鼠标光标所在】的顶层窗口（无需先点击获焦）：
+                            #   GetCursorPos → WindowFromPoint → GetAncestor(GA_ROOT)，
+                            #   取不到才回退前台窗口/屏幕右下角。
+                            class _OK_POINT(ctypes.Structure):
+                                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                            _u32 = ctypes.windll.user32
+                            _u32.WindowFromPoint.argtypes = [_OK_POINT]
+                            _u32.WindowFromPoint.restype = ctypes.c_void_p
+                            _u32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.c_uint]
+                            _u32.GetAncestor.restype = ctypes.c_void_p
+                            _u32.GetWindowTextW.argtypes = [ctypes.wintypes.HWND,
+                                                          ctypes.wintypes.LPWSTR, ctypes.c_int]
+                            _ok_pt = _OK_POINT()
+                            _hwnd = 0
+                            try:
+                                if bool(_u32.GetCursorPos(ctypes.byref(_ok_pt))):
+                                    _child = _u32.WindowFromPoint(_ok_pt)
+                                    if _child:
+                                        _hwnd = int(_u32.GetAncestor(
+                                            ctypes.wintypes.HWND(int(_child)), 2))
+                            except Exception:
+                                _hwnd = 0
+                            try:
+                                _rc = RECT()
+                                if _hwnd and bool(GetWindowRect(_hwnd, ctypes.byref(_rc))):
+                                    _corner_x = int(_rc.right) - 1
+                                    _corner_y = int(_rc.bottom) - 1
+                                    # 选中并前置（鼠标操作本身也会激活它，这里再兜底一次）
+                                    try:
+                                        _u32.SetForegroundWindow(ctypes.wintypes.HWND(_hwnd))
+                                    except Exception:
+                                        pass
+                                else:
+                                    _hwnd = int(GetForegroundWindow() or 0)
+                                    if _hwnd and bool(GetWindowRect(_hwnd, ctypes.byref(_rc))):
+                                        _corner_x = int(_rc.right) - 1
+                                        _corner_y = int(_rc.bottom) - 1
+                                    else:
+                                        _corner_x = mouse.sw - 1
+                                        _corner_y = mouse.sh - 1
+                            except Exception:
+                                _corner_x = mouse.sw - 1
+                                _corner_y = mouse.sh - 1
+                            pyautogui.moveTo(_corner_x, _corner_y)
+                            pyautogui.mouseDown()
+                            run_loop._ok_resize_started = True
+                            run_loop._ok_miss_t0 = None
+                            # 相对拖动基准：本帧掌心映射点；下一帧起只发增量（首帧不动，避免从角点跳走）
+                            _a0 = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
+                            run_loop._ok_drag_prev_x, run_loop._ok_drag_prev_y = \
+                                mouse._norm_to_screen(float(_a0[0]), float(_a0[1]))
+                            try:
+                                _tb = ctypes.create_unicode_buffer(256)
+                                _u32.GetWindowTextW(ctypes.wintypes.HWND(_hwnd), _tb, 256)
+                                _title = _tb.value
+                            except Exception:
+                                _title = "?"
+                            print(f"[OK-ACT] 光标@({_ok_pt.x},{_ok_pt.y}) 抓窗口 hwnd={_hwnd} "
+                                  f"'{_title}' rect=({_rc.left},{_rc.top},{_rc.right},{_rc.bottom}) "
+                                  f"角@({_corner_x},{_corner_y}) 左键按下",
+                                  flush=True)
+                        else:
+                            # 相对增量拖动：增量 = 当前掌心映射点 - 上一帧映射点，moveRel 发出。
+                            #   · 起点不跳变（首帧只建基准不移动）
+                            #   · 死区 2px 消抖；单帧限幅 60px 防误检/EMA 硬重置导致的跳变
+                            _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
+                            _mx, _my = mouse._norm_to_screen(float(_cursor_anchor_norm[0]),
+                                                          float(_cursor_anchor_norm[1]))
+                            _dx = _mx - run_loop._ok_drag_prev_x
+                            _dy = _my - run_loop._ok_drag_prev_y
+                            run_loop._ok_drag_prev_x, run_loop._ok_drag_prev_y = _mx, _my
+                            run_loop._ok_miss_t0 = None
+                            if abs(_dx) > 2.0 or abs(_dy) > 2.0:
+                                _dx = max(-60.0, min(60.0, _dx))
+                                _dy = max(-60.0, min(60.0, _dy))
+                                pyautogui.moveRel(int(_dx), int(_dy))
+                        _pre_move_only_done_right = True
+                    else:
+                        # 非 OK 手势：若之前在调整窗口大小，释放左键并重置状态
+                        if getattr(run_loop, "_ok_resize_started", False):
+                            try:
+                                pyautogui.mouseUp()
+                                print("[OK-ACT] 手势离开 OK，左键释放", flush=True)
+                            except Exception:
+                                pass
+                            run_loop._ok_resize_started = False
+                            run_loop._ok_miss_t0 = None
+                        _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
+                        _move_hint = "OTHER" if _gesture == "FIST" else _gesture
+                        mouse.move_only(_cursor_anchor_norm, gesture_hint=_move_hint)
+                        _pre_move_only_done_right = True
                 except Exception:
                     _pre_move_only_done_right = False
 
@@ -2104,7 +2225,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     if not _pre_move_only_done_right:
                         mouse.move_only(cursor_anchor_norm, gesture_hint=move_gesture_hint)
                     # 移窗锁定帧额外跳过 handle：OPEN 分支内部也会 moveTo，否则与窗口中心锁打架
-                    if ((not _cursor_locked_by_window_move)
+                    # OK 手势：左键已按下抓窗口右下角，跳过 handle 避免干扰拖拽
+                    if (gesture != "OK"
+                            and (not _cursor_locked_by_window_move)
                             and (not both_hands_global)
                             and (tap_detector.state != _TS.PRESSED)):
                         fingertip_norm = (lms[8].x, lms[8].y)
@@ -2113,6 +2236,7 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     # ↓↓ 画锚点（绿圈=光标锚点 args.anchor，默认 mcp 指根；橙圈=食指TIP）
                     # ——和 move_only 用的 cursor_anchor_norm 完全同一份 ↓↓
                     # 和弦滚轮期不画绿锚点（光标冻结，绿圈跟着画圈会误导），轨迹由专用卡片绘制
+                    # OK 手势：画锚点，让用户看到掌心拖动位置
                     if not _chord_scroll:
                         mx, my = HandDetector.landmark_to_pixel(lms[8], w, h)
                         cv2.circle(frame, (mx, my), 7, (0, 140, 255), 2)
@@ -2439,7 +2563,10 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     flush=True)
 
             _tap_updated = False
-            if both_hands_global:
+            # OK 手势：鼠标锁定右下角，食指弯曲不触发点击（与双手同帧一样 reset 检测器）
+            _right_gesture = hand_results.get("Left", (None,))[0]
+            _ok_gesture_active = (_right_gesture == "OK")
+            if both_hands_global or _ok_gesture_active:
                 tap_detector.reset()
                 right_tap_detector.reset()
                 tap_event = 0
