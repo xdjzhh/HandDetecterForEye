@@ -156,6 +156,10 @@ class WindowMover:
         self._move_w0: float = 0.0
         self._move_h0: float = 0.0
         self._lost_sec: float = 0.0
+        # MOVE_ACTIVE 期间掌心屏幕点 EMA 平滑（治停手时检测噪声导致窗口轻微晃动）
+        self._move_ema_a: float = 0.35   # α 越大越跟手、越小越稳（与 OK 缩放手感一致）
+        self._move_sm_sx: Optional[float] = None
+        self._move_sm_sy: Optional[float] = None
         # OPEN 判定稳定缓存（单标签，单手场景只有一个 "S"）
         self._open_stable: dict = {}
 
@@ -295,6 +299,7 @@ class WindowMover:
         self._move_left0 = self._move_top0 = 0.0
         self._move_w0 = self._move_h0 = 0.0
         self._lost_sec = 0.0
+        self._move_sm_sx = self._move_sm_sy = None
         # 重置时清 OPEN 稳定缓存：下一轮从头开始攒（与旧版 _reset_move_to_idle 一致）
         self._open_stable.clear()
 
@@ -395,6 +400,8 @@ class WindowMover:
                 else:
                     self._move_ref_sx = self._move_left0
                     self._move_ref_sy = self._move_top0
+                # EMA 以起始点为初值：进入移动首帧位移为 0，不从当前窗口位置跳变
+                self._move_sm_sx, self._move_sm_sy = self._move_ref_sx, self._move_ref_sy
                 # 光标立刻锁窗口中心（避免跳动误触）
                 try:
                     SetCursorPos(
@@ -414,8 +421,18 @@ class WindowMover:
         if self._move_state == _MS.MOVE_ACTIVE and self._move_hwnd != 0:
             cur_sx, cur_sy = self._move_ref_sx, self._move_ref_sy
             if screen_xy is not None:
-                cur_sx = float(screen_xy[0])
-                cur_sy = float(screen_xy[1])
+                # 掌心屏幕点 EMA：零均值停手抖动被抹平，单向真实移动稳态无衰减（仅 ~2 帧过渡）
+                if self._move_sm_sx is None or self._move_sm_sy is None:
+                    self._move_sm_sx = float(screen_xy[0])
+                    self._move_sm_sy = float(screen_xy[1])
+                else:
+                    _a = self._move_ema_a
+                    self._move_sm_sx += _a * (float(screen_xy[0]) - self._move_sm_sx)
+                    self._move_sm_sy += _a * (float(screen_xy[1]) - self._move_sm_sy)
+                cur_sx, cur_sy = self._move_sm_sx, self._move_sm_sy
+            elif self._move_sm_sx is not None and self._move_sm_sy is not None:
+                # 本帧无点（短时丢帧）：沿用上次平滑点，窗口保持不动，不被 None 拉回参考点
+                cur_sx, cur_sy = self._move_sm_sx, self._move_sm_sy
             dx_screen = cur_sx - self._move_ref_sx
             dy_screen = cur_sy - self._move_ref_sy
             i_left = int(round(self._move_left0 + dx_screen))

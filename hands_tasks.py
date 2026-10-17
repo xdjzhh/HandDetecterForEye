@@ -1294,7 +1294,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     run_loop._chord_scroll_hold = False
     # OK 调整窗口大小状态每次启动清空
     run_loop._ok_resize_started = False
-    run_loop._ok_drag_prev_x = run_loop._ok_drag_prev_y = 0.0
+    run_loop._ok_sm_x = run_loop._ok_sm_y = 0.0       # 拖动 EMA 平滑点
+    run_loop._ok_acc_x = run_loop._ok_acc_y = 0.0  # moveRel 亚像素累积
     run_loop._ok_miss_t0 = None   # 拖动中丢手宽限计时；None=手在镜
 
     # ---------- 初始化 status_store ----------
@@ -1903,10 +1904,10 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     if _lab == "Left":
                         if getattr(run_loop, "_ok_resize_started", False):
                             _now_miss = time.monotonic()
-                            _t0 = getattr(run_loop, "_ok_miss_t0", None)
-                            if _t0 is None:
+                            _ok_miss_first = getattr(run_loop, "_ok_miss_t0", None)
+                            if _ok_miss_first is None:
                                 run_loop._ok_miss_t0 = _now_miss
-                            elif _now_miss - _t0 >= 0.35:
+                            elif _now_miss - _ok_miss_first >= 0.35:
                                 try:
                                     pyautogui.mouseUp()
                                     print(f"[OK-ACT] 右手离镜超0.35s，左键释放(拖动终止)",
@@ -2159,10 +2160,11 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                             pyautogui.mouseDown()
                             run_loop._ok_resize_started = True
                             run_loop._ok_miss_t0 = None
-                            # 相对拖动基准：本帧掌心映射点；下一帧起只发增量（首帧不动，避免从角点跳走）
+                            # 相对拖动基准：本帧掌心映射点作为 EMA 初值；下帧起只发增量
                             _a0 = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
-                            run_loop._ok_drag_prev_x, run_loop._ok_drag_prev_y = \
-                                mouse._norm_to_screen(float(_a0[0]), float(_a0[1]))
+                            _sx0, _sy0 = mouse._norm_to_screen(float(_a0[0]), float(_a0[1]))
+                            run_loop._ok_sm_x, run_loop._ok_sm_y = _sx0, _sy0
+                            run_loop._ok_acc_x = run_loop._ok_acc_y = 0.0  # 亚像素累积，防慢移取整丢失
                             try:
                                 _tb = ctypes.create_unicode_buffer(256)
                                 _u32.GetWindowTextW(ctypes.wintypes.HWND(_hwnd), _tb, 256)
@@ -2173,21 +2175,43 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                   f"'{_title}' rect=({_rc.left},{_rc.top},{_rc.right},{_rc.bottom}) "
                                   f"角@({_corner_x},{_corner_y}) 左键按下",
                                   flush=True)
+                            # 抓住帧同样置位：阻止 Pass C 的 move_only(掌心) 把光标从窗口角跳回屏幕中央
+                            # （否则左键按在客户区而非 resize 边框，拖动不产生缩放）
+                            _pre_move_only_done_right = True
                         else:
-                            # 相对增量拖动：增量 = 当前掌心映射点 - 上一帧映射点，moveRel 发出。
-                            #   · 起点不跳变（首帧只建基准不移动）
-                            #   · 死区 2px 消抖；单帧限幅 60px 防误检/EMA 硬重置导致的跳变
+                            # 相对增量拖动 + EMA 平滑（治手停住时检测噪声导致的轻微伸缩）：
+                            #   1) 原始掌心映射点 → EMA(α=0.30)：零均值抖动互相抵消，真移动不被抹平
+                            #   2) 平滑后的增量进亚像素累加器：满 1 像素才 moveRel，不足留存
+                            #      → 手慢移不因 int() 取整丢失；手停住时输出严格为 0
+                            #   3) 单帧发出限幅 60px，防飞点/丢手回归大跳变
                             _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
                             _mx, _my = mouse._norm_to_screen(float(_cursor_anchor_norm[0]),
                                                           float(_cursor_anchor_norm[1]))
-                            _dx = _mx - run_loop._ok_drag_prev_x
-                            _dy = _my - run_loop._ok_drag_prev_y
-                            run_loop._ok_drag_prev_x, run_loop._ok_drag_prev_y = _mx, _my
+                            _OK_EMA_A = 0.30
+                            _nsx = run_loop._ok_sm_x + _OK_EMA_A * (_mx - run_loop._ok_sm_x)
+                            _nsy = run_loop._ok_sm_y + _OK_EMA_A * (_my - run_loop._ok_sm_y)
+                            run_loop._ok_acc_x += _nsx - run_loop._ok_sm_x
+                            run_loop._ok_acc_y += _nsy - run_loop._ok_sm_y
+                            run_loop._ok_sm_x, run_loop._ok_sm_y = _nsx, _nsy
                             run_loop._ok_miss_t0 = None
-                            if abs(_dx) > 2.0 or abs(_dy) > 2.0:
-                                _dx = max(-60.0, min(60.0, _dx))
-                                _dy = max(-60.0, min(60.0, _dy))
-                                pyautogui.moveRel(int(_dx), int(_dy))
+                            if run_loop._ok_acc_x >= 1.0:
+                                _ix = int(_mt.floor(run_loop._ok_acc_x))
+                            elif run_loop._ok_acc_x <= -1.0:
+                                _ix = int(_mt.ceil(run_loop._ok_acc_x))
+                            else:
+                                _ix = 0
+                            if run_loop._ok_acc_y >= 1.0:
+                                _iy = int(_mt.floor(run_loop._ok_acc_y))
+                            elif run_loop._ok_acc_y <= -1.0:
+                                _iy = int(_mt.ceil(run_loop._ok_acc_y))
+                            else:
+                                _iy = 0
+                            if _ix != 0 or _iy != 0:
+                                _ix = max(-60, min(60, _ix))
+                                _iy = max(-60, min(60, _iy))
+                                pyautogui.moveRel(_ix, _iy)
+                                run_loop._ok_acc_x -= _ix
+                                run_loop._ok_acc_y -= _iy
                         _pre_move_only_done_right = True
                     else:
                         # 非 OK 手势：若之前在调整窗口大小，释放左键并重置状态
