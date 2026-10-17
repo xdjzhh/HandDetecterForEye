@@ -180,7 +180,7 @@ TAP_DIAG = False
 #   每 TAP_STATS_PRINT_SEC 秒打印一行 [TAP-STAT]：帧率/None占比/ARM入口占比/尖峰拒绝/
 #   点击段内None/首击/单击送达/双击/趋势确认/补救/长按/丢手杀等待次数/回弹与送达延迟分布。
 #   用途：拿真机分布数据决定后续"墙钟化/丢手宽限/自适应平滑"的参数，不盲调。
-TAP_STATS = False  # 用户要求减少刷屏，禁用 [TAP-STAT] 周期性统计打印（2026-10-17）
+TAP_STATS = True
 TAP_STATS_PRINT_SEC = 20.0   # 摘要打印周期（秒）；仅时间判断+一行 print，不拖主循环
 
 # ⭐ 双指并拢右键手势（2026-09-16，食+中并拢同时勾按=鼠标右键）：
@@ -1367,7 +1367,6 @@ class FingerTapClickDetector:
             #    内容区=误选中/误拖，标题栏上=按住标题栏误拖窗口，见 [TAP-SEG] 转长按 谷底0.729）。
             #   不取消、留在 BEND_HOLD：后续弯深(≤0.66)下帧即转；回直则走浅弯取消静默结束。
             _long_ripe = _t_ge(self._hold_sec, self._p["LONG_PRESS_SEC"])
-            _long_ripe = False  # ⚠️ 食指长按逻辑已禁用（用户要求 2026-10-17）：不再触发 LONG_DOWN
             _long_shallow = (self._seg_min_ratio is not None
                              and self._seg_min_ratio > TAP_MIN_BEND_RATIO)
             # ⭐ 2026-10-15 3D 正向证据：只在长按转换点校验（点击/ARM 不读）。

@@ -1,5 +1,6 @@
 import time
 from collections import deque
+import ctypes
 import numpy as np
 import pyautogui
 
@@ -891,6 +892,12 @@ _MOUSEEVENTF_RIGHTUP   = 0x0010
 _MOUSEEVENTF_WHEEL     = 0x0800
 _WHEEL_DELTA           = 120
 _INPUT_MOUSE = 0
+# ⭐ 2026-10-17 绝对坐标移动：MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE
+#   dx/dy 用归一化坐标 0~65535 映射整个屏幕（多显示器时映射整个虚拟桌面）。
+#   用 SendInput 而非 SetCursorPos：产生真实输入事件，触发 Windows 重绘光标
+#   （AHK 黑窗遮盖时，只有物理/SendInput 移动才能让系统光标显现）。
+_MOUSEEVENTF_MOVE      = 0x0001
+_MOUSEEVENTF_ABSOLUTE  = 0x8000
 
 
 class _MOUSEINPUT(ctypes.Structure):
@@ -1091,6 +1098,31 @@ class MouseController:
         """切换光标策略：smooth（AR悬停5层）/ absolute（掌心绝对坐标直接跳）"""
         self._smoother.set_mode(mode)
 
+    # ---------------- SendInput 绝对坐标移动 ----------------
+    def _sendinput_move_to(self, ix: int, iy: int):
+        """用 SendInput 发送绝对坐标鼠标移动（替代 pyautogui.moveTo / SetCursorPos）。
+
+        ⭐ 为什么不用 SetCursorPos：
+          SetCursorPos 只改光标位置、不产生输入事件 → AHK 黑窗遮盖时系统光标不会显现。
+          SendInput + MOUSEEVENTF_ABSOLUTE 产生真实输入事件 → Windows 重绘光标在最上层。
+
+        坐标转换：屏幕像素 (ix,iy) → 归一化 0~65535（映射整个虚拟桌面）。
+        """
+        user32 = ctypes.windll.user32
+        # 虚拟桌面尺寸（多显示器时取整个桌面范围，避免坐标越界）
+        vw = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        vh = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        if vw <= 0: vw = self.sw
+        if vh <= 0: vh = self.sh
+        nx = int(ix * 65535 / vw)
+        ny = int(iy * 65535 / vh)
+        arr = (_INPUT * 1)()
+        arr[0].type = _INPUT_MOUSE
+        arr[0].union.mi.dx = nx
+        arr[0].union.mi.dy = ny
+        arr[0].union.mi.dwFlags = _MOUSEEVENTF_MOVE | _MOUSEEVENTF_ABSOLUTE
+        user32.SendInput(1, ctypes.byref(arr), ctypes.sizeof(_INPUT))
+
     @property
     def cursor_mode(self) -> str:
         return self._smoother.mode
@@ -1237,7 +1269,7 @@ class MouseController:
             return
         if self._drag_active:
             return
-        pyautogui.moveTo(ix, iy)
+        self._sendinput_move_to(ix, iy)
 
     def handle(self, gesture: str, fingertip_norm, cursor_anchor_norm=None):
         """手势 → 鼠标事件（仅处理点击/拖拽语义；移动请先调用 move_only 保证对齐）。
@@ -1270,7 +1302,7 @@ class MouseController:
             #   - 不做任何 moveTo（哪怕 drag 没激活）
             #   - 仅保留：若正在拖拽 → 稍后在 FIST 分支释放（这里先不 move，避免手势切换瞬间跳一下）
             if gesture != "FIST" and not self._drag_active:
-                pyautogui.moveTo(ix, iy)
+                self._sendinput_move_to(ix, iy)
             return
         # 累加本帧间隔（首次调用/手势刚切换时 dt≈0）
         dt = max(0.0, now - self._last_handle_t)
@@ -1288,17 +1320,17 @@ class MouseController:
             if self._drag_active:
                 pyautogui.mouseUp()
                 self._drag_active = False
-            pyautogui.moveTo(ix, iy)
+            self._sendinput_move_to(ix, iy)
             return
         # ✨ 补充：稳定的 ROCK/PINCH/PEACE/THUMB/OTHER 等非 FIST 且非拖拽 → 也每帧 moveTo（否则鼠标钉死=对齐失控）
         if not self._drag_active and gesture != "FIST":
-            pyautogui.moveTo(ix, iy)
+            self._sendinput_move_to(ix, iy)
             return
 
         # 未满 HOLD_SEC 的点击类手势 → 仅移动（已被 _consume_gesture 消费的手势不再触发）
         # ✨ 用户要求：FIST = 无指令 → 哪怕未满 HOLD_SEC 也不移动（避免握拳时鼠标还漂一下）
         if self._hold_elapsed_sec < HOLD_SEC and gesture != "FIST" and not self._gesture_consumed:
-            pyautogui.moveTo(ix, iy)
+            self._sendinput_move_to(ix, iy)
             return
 
         # 4. 点击类手势：✨ 用户要求「PINCH/PEACE/ROCK/THUMB 全部置空 = 不做任何操作」→ 不再冻结位置，不触发任何 click/rightClick/doubleClick
@@ -1330,7 +1362,7 @@ class MouseController:
 
         # 兜底：其它未映射的新手势也移动一下
         else:
-            pyautogui.moveTo(ix, iy)
+            self._sendinput_move_to(ix, iy)
 
     # ---------------- 辅助 ----------------
     def _consume_gesture(self):
@@ -1375,7 +1407,7 @@ class MouseController:
             self._drag_active = False
         elif depth_event == _DE.DRAG_MOVE:
             # 保持按住 → 拖拽移动
-            pyautogui.moveTo(ix, iy)
+            self._sendinput_move_to(ix, iy)
             if not self._drag_active:
                 # 保护：若处于 HOLD 但 drag_active=False（边界情况），自动补按下
                 try:
@@ -1551,7 +1583,7 @@ class MouseController:
             self._drag_active = False
         elif tap_event == _TE.DRAG_MOVE:
             # 长按中持续移动
-            pyautogui.moveTo(ix, iy)
+            self._sendinput_move_to(ix, iy)
             if not self._drag_active:
                 try:
                     pyautogui.mouseDown(ix, iy)

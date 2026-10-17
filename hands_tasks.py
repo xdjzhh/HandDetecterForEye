@@ -37,7 +37,10 @@ from draw_cn_text import put_text_cn
 from finger_tap_click_detector import (FingerTapClickDetector, TwoFingerRightClickDetector,
                                        _S as _TS, E as _TEV, TWO_FINGER_TIP_ENTRY_R,
                                        RF_OBSERVE_ONLY)
-from window_mover import WindowMover, MOVE_CONFIRM_SEC, _MS as _WMS
+from window_mover import (WindowMover, MOVE_CONFIRM_SEC, _MS as _WMS,
+                          SetWindowPos, HWND_TOP, SWP_NOZORDER, SWP_NOACTIVATE,
+                          WindowFromPoint, GetAncestor, GA_ROOT,
+                          is_gameviewer_cursor_window)
 from window_mover import RECT, GetForegroundWindow, GetWindowRect
 from circle_scroll_detector import CircleScrollDetector
 
@@ -603,10 +606,10 @@ def parse_args(argv=None):
     parser.add_argument("--model", type=str, default=None,
                         help="（仅 --use-tasks 时有效）指定 hand_landmarker.task 的绝对/相对路径")
     parser.add_argument("--max-hands", type=int, default=2, help="最多识别手的数量 (默认 2)")
-    parser.add_argument("--anchor", type=str, default="mcp",
+    parser.add_argument("--anchor", type=str, default="palm",
                         choices=["mcp", "palm", "index_tip"],
-                        help="鼠标光标锚点：mcp=四指根质心(同视角默认,手腕出画不漂) / "
-                             "palm=掌心(面对面旧锚点) / index_tip=食指TIP")
+                        help="鼠标光标锚点：palm=掌心(默认,勾按/OK/移窗锚点统一避免漂移) / "
+                             "mcp=四指根质心 / index_tip=食指TIP")
     parser.add_argument("--cursor-mode", type=str, default="smooth", choices=["smooth", "absolute", "direct"],
                         help="光标移动策略：smooth(AR悬停5层稳) / absolute(指哪打哪3层兼顾稳跟手) / direct⭐严格跟UI掌心绿圈(无阻尼无锁，翻转手掌也不卡)")
     parser.add_argument("--roi-scale", type=float, default=0.70,
@@ -1297,7 +1300,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
     run_loop._ok_sm_x = run_loop._ok_sm_y = 0.0       # 拖动 EMA 平滑点
     run_loop._ok_acc_x = run_loop._ok_acc_y = 0.0  # moveRel 亚像素累积
     run_loop._ok_miss_t0 = None   # 拖动中丢手宽限计时；None=手在镜
-    run_loop._open_drag_started = False  # 五指张开=左键长按拖动状态
+    # GameViewer 交互分支：光标所在窗口是否 gameviewer.exe（每帧重算）
+    run_loop._is_gv = False
+    run_loop._gv_press = False    # GV 下五指张开/OK 的左键长按态
 
     # ---------- 初始化 status_store ----------
     if status_store is None:
@@ -1678,29 +1683,28 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 # 目的：一锤定音区分"模型层只返回了一只手"与"稳定器/标签交换吞手"。
                 # 仅在物理左手(交换前 MP label=Left)在场或和弦保持中打印，避免污染日常日志。
                 # 坐标按画面短边归一（与滚轮检测器口径一致）；palm=MCP四指根质心，tip=TIP8。
-                # [MP-RAW] 原始关键点调试日志已禁用（用户要求减少刷屏，2026-10-17）
-                # try:
-                #     if (not _skip_was_skipped and (
-                #             getattr(run_loop, "_chord_scroll_hold", False)
-                #             or any(_h.get("label") == "Left" for _h in hands_data))):
-                #         _short0 = float(min(w, h))
-                #         _parts = []
-                #         for _h in sorted(hands_data, key=lambda z: z.get("label", "")):
-                #             _l = _h["landmarks"]
-                #             _px = 0.25 * (float(_l[5].x) + float(_l[9].x)
-                #                           + float(_l[13].x) + float(_l[17].x)) * w / _short0
-                #             _py = 0.25 * (float(_l[5].y) + float(_l[9].y)
-                #                           + float(_l[13].y) + float(_l[17].y)) * h / _short0
-                #             _parts.append(
-                #                 f"{_h.get('label')}?s={float(_h.get('score', 0) or 0):.2f}"
-                #                 f" palm={_px:.3f},{_py:.3f}"
-                #                 f" tip={float(_l[8].x) * w / _short0:.3f},"
-                #                 f"{float(_l[8].y) * h / _short0:.3f}")
-                #         print(f"[MP-RAW] f={_bg_heartbeat_cnt} n={len(hands_data)} "
-                #               + (" | ".join(_parts) if _parts else "(空手)"),
-                #               flush=True)
-                # except Exception:
-                #     pass
+                try:
+                    if (not _skip_was_skipped and (
+                            getattr(run_loop, "_chord_scroll_hold", False)
+                            or any(_h.get("label") == "Left" for _h in hands_data))):
+                        _short0 = float(min(w, h))
+                        _parts = []
+                        for _h in sorted(hands_data, key=lambda z: z.get("label", "")):
+                            _l = _h["landmarks"]
+                            _px = 0.25 * (float(_l[5].x) + float(_l[9].x)
+                                          + float(_l[13].x) + float(_l[17].x)) * w / _short0
+                            _py = 0.25 * (float(_l[5].y) + float(_l[9].y)
+                                          + float(_l[13].y) + float(_l[17].y)) * h / _short0
+                            _parts.append(
+                                f"{_h.get('label')}?s={float(_h.get('score', 0) or 0):.2f}"
+                                f" palm={_px:.3f},{_py:.3f}"
+                                f" tip={float(_l[8].x) * w / _short0:.3f},"
+                                f"{float(_l[8].y) * h / _short0:.3f}")
+                        print(f"[MP-RAW] f={_bg_heartbeat_cnt} n={len(hands_data)} "
+                              + (" | ".join(_parts) if _parts else "(空手)"),
+                              flush=True)
+                except Exception:
+                    pass
                 # ⭐ 同视角标签归一化：MediaPipe 左右手标签假定输入为【镜像自拍图】
                 #   （旧面对面流程靠 cv2.flip 满足该假定，用户右手原始标签恰为 "Left"）。
                 #   同视角输入不镜像，按官方规则在应用层交换 handedness：
@@ -1841,7 +1845,34 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 # 用投票后的手势（不改变 ext/ratios，保持原始弯曲度反馈）
                 hand_results[label] = (gesture_final, ext, ratios, lms)
 
-                # ---- [FIST-CHK] 左手握拳判定日志已删除（用户要求，2026-10-17）----
+                # ---- [FIST-CHK] 左手握拳判定日志（物理左手=标签 Right）----
+                #   入镜/稳定后握拳翻转即时打印；状态不变时 0.5s 一条心跳；fold 五值=
+                #   r_i=dist(TIP_i,P)/dist(PIP_i,P)，r_i<1.2 重建为"弯"位，FIST 即
+                #   重建 ext=(0,0,0,0,0) 经 GESTURE_TABLE + 时钟稳定器的输出。
+                if label == "Right":
+                    _now_chk = time.monotonic()
+                    _stable_fist = (gesture_final == "FIST")
+                    if "fold_i" in ratios:
+                        _fold_s = (f"fold 拇/食/中/无/小={ratios['fold_t']}/"
+                                   f"{ratios['fold_i']}/{ratios['fold_m']}/"
+                                   f"{ratios['fold_r']}/{ratios['fold_p']}"
+                                   f"(<1.2=弯) ext(拇/食/中/无/小)={ext}")
+                    else:
+                        _fold_s = (f"fold n/a（world缺失→2D布尔）"
+                                   f" ext(拇/食/中/无/小)={ext}")
+                    _enter = not _fist_chk_present
+                    _flip = (_fist_chk_stable_fist is not None
+                             and _fist_chk_stable_fist != _stable_fist)
+                    if (_enter or _flip
+                            or _now_chk - _fist_chk_t0 >= 0.5):
+                        _fist_chk_t0 = _now_chk
+                        _tag = "入镜·" if _enter else ("【握拳翻转】" if _flip else "")
+                        print(f"[FIST-CHK] 左手 {_tag}判定握拳="
+                              f"{'是' if _stable_fist else '否'} "
+                              f"(raw={gesture_raw}/stable={gesture_final}) {_fold_s}",
+                              flush=True)
+                    _fist_chk_present = True
+                    _fist_chk_stable_fist = _stable_fist
                 # 记录掌位（归一化）——⭐ 2026-10-01 与光标锚点同源（args.anchor，默认 mcp），
                 # 跳帧稳定性判定的位移基准必须等于光标实际跟随的点，否则两者门限语义脱节
                 _palm_x, _palm_y = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
@@ -1874,33 +1905,25 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                         _gest_stab[_lab].reset()
                         del _gest_stab[_lab]
                     _mv_final.pop(_lab, None)
-                    # 右手离镜：拖动中先宽限 0.35s（短时丢检测不松手，防止缩放被意外中断）；
-                    #   连续丢失超时才释放左键并重置。
+                    # 右手离镜：
+                    #   - GameViewer 左键长按：立即释放（无鼠标拖动连续性要保持）；
+                    #   - OK 缩放（SetWindowPos）：丢手即停止，直接复位（无鼠标键）。
                     if _lab == "Left":
-                        if getattr(run_loop, "_ok_resize_started", False):
-                            _now_miss = time.monotonic()
-                            _ok_miss_first = getattr(run_loop, "_ok_miss_t0", None)
-                            if _ok_miss_first is None:
-                                run_loop._ok_miss_t0 = _now_miss
-                            elif _now_miss - _ok_miss_first >= 0.35:
-                                try:
-                                    pyautogui.mouseUp()
-                                    print(f"[OK-ACT] 右手离镜超0.35s，左键释放(拖动终止)",
-                                          flush=True)
-                                except Exception:
-                                    pass
-                                run_loop._ok_resize_started = False
-                                run_loop._ok_miss_t0 = None
-                        # 右手离镜：OPEN 长按拖动也一并释放（无宽限，张开手离镜即结束）
-                        if getattr(run_loop, "_open_drag_started", False):
+                        if getattr(run_loop, "_gv_press", False):
                             try:
-                                pyautogui.mouseUp()
-                                print("[OPEN-DRAG] 右手离镜，左键释放", flush=True)
+                                pyautogui.mouseUp(button='left')
                             except Exception:
                                 pass
-                            run_loop._open_drag_started = False
+                            run_loop._gv_press = False
+                        if getattr(run_loop, "_ok_resize_started", False):
+                            run_loop._ok_resize_started = False
+                            run_loop._ok_miss_t0 = None
 
-            # [FIST-CHK] 离镜日志已删除（用户要求，2026-10-17）
+            # [FIST-CHK] 左手本帧不在镜（且上一帧在）→ 离镜事件打印一次
+            if _fist_chk_present and "Right" not in hand_results:
+                print("[FIST-CHK] 左手 离镜（本帧无左手）", flush=True)
+                _fist_chk_present = False
+                _fist_chk_stable_fist = None
 
             # ================================================================
             # 🔥 自适应跳帧：稳定性判定，决定下一帧是否跳过
@@ -2065,14 +2088,26 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             # 单手张开移窗 ACTIVE 期间 window_mover 每帧 SetCursorPos 锁窗口中心（防误触），
             # 掌心跟随 move_only 若同时写光标会在窗口中心↔掌心映射点间闪动 → 锁定期跳过一切掌心光标写入。
             # 读上一帧 mover_info（update 在本帧稍后才跑），进出 ACTIVE 各 1 帧交接、幂等不可见。
-            # 单手张开移窗已禁用（改为五指张开=左键长按拖动），移窗锁定恒为 False
-            _cursor_locked_by_window_move = False
+            _cursor_locked_by_window_move = bool(
+                mover_info is not None and mover_info.move_state == _WMS.MOVE_ACTIVE
+            )
 
             # ======================================================================
             # ⭐ B-1：鼠标移动急活【最前置】
             #   全局门控算完 → Pass C / Tap 等慢活之前，
             #   先让掌心光标出帧，消除慢活阻塞造成的“鼠标钉住 + 之后大跳”。
             #   单手 FIST 不再冻结光标，按中性 OTHER 出帧（握拳无单手语义）。
+            # ======================================================================
+            # ======================================================================
+            # 每帧判定光标所在窗口是否 gameviewer.exe（驱动交互分支切换）
+            # ======================================================================
+            try:
+                run_loop._is_gv = bool(is_gameviewer_cursor_window())
+            except Exception:
+                run_loop._is_gv = False
+
+            # ======================================================================
+            # Pass B-1：控鼠手（Left=用户右手）掌心光标【先出帧】
             # ======================================================================
             _pre_move_only_done_right = False
             if _cursor_locked_by_window_move:
@@ -2085,143 +2120,111 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             elif "Left" in hand_results:
                 try:
                     _gesture, _ext, _ratios, _lms = hand_results["Left"]
-                    if _gesture == "OK":
-                        # OK 手势：在当前前台窗口右下角按住左键，鼠标坐标机制与五指张开完全相同
-                        #   进入帧 → 鼠标定到窗口右下角 + 按下左键（出现双向箭头）
-                        #   保持帧 → 与 OPEN 完全相同：掌心锚点经 ROI 映射 move_only（左键按住=拖动缩放）
-                        #   松开/离镜 → 释放左键
+                    _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
+                    _is_gv = bool(getattr(run_loop, "_is_gv", False))
+
+                    if _is_gv and _gesture in ("OPEN", "OK"):
+                        # ---- GameViewer：五指张开 / OK 都视为鼠标左键长按拖动 ----
+                        #   光标跟随掌心（与正常控鼠一致），左键按住=系统原生拖拽；
+                        #   手势离开/手离镜时释放左键。不再走移窗/缩放分支。
+                        if not getattr(run_loop, "_gv_press", False):
+                            pyautogui.mouseDown(button='left')
+                            run_loop._gv_press = True
+                            # 清掉可能残留的 OK 缩放态
+                            if getattr(run_loop, "_ok_resize_started", False):
+                                run_loop._ok_resize_started = False
+                        mouse.move_only(_cursor_anchor_norm, gesture_hint=_gesture)
+                        _pre_move_only_done_right = True
+                    elif _gesture == "OK":
+                        # ---- 非 GameViewer：OK 直接 SetWindowPos 缩放，不模拟鼠标 ----
+                        #   进入帧：选中光标下窗口、快照 rect + 掌心参考点；
+                        #   保持帧：掌心屏幕位移 → 改窗口右下角（左/上固定），EMA 平滑；
+                        #   离开/离镜：无鼠标键，直接复位状态。
                         if not getattr(run_loop, "_ok_resize_started", False):
-                            # 自动选中【当前鼠标光标所在】的顶层窗口（无需先点击获焦）：
-                            #   GetCursorPos → WindowFromPoint → GetAncestor(GA_ROOT)，
-                            #   取不到才回退前台窗口/屏幕右下角。
+                            _u32 = ctypes.windll.user32
                             class _OK_POINT(ctypes.Structure):
                                 _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-                            _u32 = ctypes.windll.user32
-                            _u32.WindowFromPoint.argtypes = [_OK_POINT]
-                            _u32.WindowFromPoint.restype = ctypes.c_void_p
-                            _u32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.c_uint]
-                            _u32.GetAncestor.restype = ctypes.c_void_p
-                            _u32.GetWindowTextW.argtypes = [ctypes.wintypes.HWND,
-                                                          ctypes.wintypes.LPWSTR, ctypes.c_int]
                             _ok_pt = _OK_POINT()
                             _hwnd = 0
                             try:
                                 if bool(_u32.GetCursorPos(ctypes.byref(_ok_pt))):
-                                    _child = _u32.WindowFromPoint(_ok_pt)
+                                    _child = WindowFromPoint(_ok_pt)
                                     if _child:
-                                        _hwnd = int(_u32.GetAncestor(
-                                            ctypes.wintypes.HWND(int(_child)), 2))
+                                        _hwnd = int(GetAncestor(
+                                            ctypes.wintypes.HWND(int(_child)), GA_ROOT) or 0)
                             except Exception:
                                 _hwnd = 0
-                            try:
-                                _rc = RECT()
-                                if _hwnd and bool(GetWindowRect(_hwnd, ctypes.byref(_rc))):
-                                    _corner_x = int(_rc.right) - 1
-                                    _corner_y = int(_rc.bottom) - 1
-                                    # 选中并前置（鼠标操作本身也会激活它，这里再兜底一次）
-                                    try:
-                                        _u32.SetForegroundWindow(ctypes.wintypes.HWND(_hwnd))
-                                    except Exception:
-                                        pass
-                                else:
-                                    _hwnd = int(GetForegroundWindow() or 0)
-                                    if _hwnd and bool(GetWindowRect(_hwnd, ctypes.byref(_rc))):
-                                        _corner_x = int(_rc.right) - 1
-                                        _corner_y = int(_rc.bottom) - 1
-                                    else:
-                                        _corner_x = mouse.sw - 1
-                                        _corner_y = mouse.sh - 1
-                            except Exception:
-                                _corner_x = mouse.sw - 1
-                                _corner_y = mouse.sh - 1
-                            pyautogui.moveTo(_corner_x, _corner_y)
-                            pyautogui.mouseDown()
-                            run_loop._ok_resize_started = True
-                            run_loop._ok_miss_t0 = None
-                            # 相对拖动基准：本帧掌心映射点作为 EMA 初值；下帧起只发增量
-                            _a0 = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
-                            _sx0, _sy0 = mouse._norm_to_screen(float(_a0[0]), float(_a0[1]))
+                            _rc = RECT()
+                            if not (_hwnd and bool(GetWindowRect(_hwnd, ctypes.byref(_rc)))):
+                                _hwnd = int(GetForegroundWindow() or 0)
+                                if not (_hwnd and bool(GetWindowRect(_hwnd, ctypes.byref(_rc)))):
+                                    _rc = RECT()
+                                    _rc.left = _rc.top = 0
+                                    _rc.right = mouse.sw
+                                    _rc.bottom = mouse.sh
+                            run_loop._ok_hwnd = _hwnd
+                            run_loop._ok_left0 = int(_rc.left)
+                            run_loop._ok_top0 = int(_rc.top)
+                            run_loop._ok_right0 = int(_rc.right)
+                            run_loop._ok_bottom0 = int(_rc.bottom)
+                            _sx0, _sy0 = mouse._norm_to_screen(float(_cursor_anchor_norm[0]),
+                                                               float(_cursor_anchor_norm[1]))
+                            run_loop._ok_ref_sx, run_loop._ok_ref_sy = _sx0, _sy0
                             run_loop._ok_sm_x, run_loop._ok_sm_y = _sx0, _sy0
-                            run_loop._ok_acc_x = run_loop._ok_acc_y = 0.0  # 亚像素累积，防慢移取整丢失
+                            run_loop._ok_acc_x = run_loop._ok_acc_y = 0.0
+                            run_loop._ok_resize_started = True
                             try:
                                 _tb = ctypes.create_unicode_buffer(256)
                                 _u32.GetWindowTextW(ctypes.wintypes.HWND(_hwnd), _tb, 256)
                                 _title = _tb.value
                             except Exception:
                                 _title = "?"
-                            print(f"[OK-ACT] 光标@({_ok_pt.x},{_ok_pt.y}) 抓窗口 hwnd={_hwnd} "
-                                  f"'{_title}' rect=({_rc.left},{_rc.top},{_rc.right},{_rc.bottom}) "
-                                  f"角@({_corner_x},{_corner_y}) 左键按下",
+                            print(f"[OK-RESIZE] 窗口 hwnd={_hwnd} '{_title}' "
+                                  f"rect=({_rc.left},{_rc.top},{_rc.right},{_rc.bottom}) "
+                                  f"掌心参考@({_sx0:.0f},{_sy0:.0f}) 开始缩放",
                                   flush=True)
-                            # 抓住帧同样置位：阻止 Pass C 的 move_only(掌心) 把光标从窗口角跳回屏幕中央
-                            # （否则左键按在客户区而非 resize 边框，拖动不产生缩放）
-                            _pre_move_only_done_right = True
                         else:
-                            # 相对增量拖动 + EMA 平滑（治手停住时检测噪声导致的轻微伸缩）：
-                            #   1) 原始掌心映射点 → EMA(α=0.30)：零均值抖动互相抵消，真移动不被抹平
-                            #   2) 平滑后的增量进亚像素累加器：满 1 像素才 moveRel，不足留存
-                            #      → 手慢移不因 int() 取整丢失；手停住时输出严格为 0
-                            #   3) 单帧发出限幅 60px，防飞点/丢手回归大跳变
-                            _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
                             _mx, _my = mouse._norm_to_screen(float(_cursor_anchor_norm[0]),
-                                                          float(_cursor_anchor_norm[1]))
+                                                             float(_cursor_anchor_norm[1]))
                             _OK_EMA_A = 0.30
                             _nsx = run_loop._ok_sm_x + _OK_EMA_A * (_mx - run_loop._ok_sm_x)
                             _nsy = run_loop._ok_sm_y + _OK_EMA_A * (_my - run_loop._ok_sm_y)
-                            run_loop._ok_acc_x += _nsx - run_loop._ok_sm_x
-                            run_loop._ok_acc_y += _nsy - run_loop._ok_sm_y
                             run_loop._ok_sm_x, run_loop._ok_sm_y = _nsx, _nsy
-                            run_loop._ok_miss_t0 = None
-                            if run_loop._ok_acc_x >= 1.0:
-                                _ix = int(_mt.floor(run_loop._ok_acc_x))
-                            elif run_loop._ok_acc_x <= -1.0:
-                                _ix = int(_mt.ceil(run_loop._ok_acc_x))
-                            else:
-                                _ix = 0
-                            if run_loop._ok_acc_y >= 1.0:
-                                _iy = int(_mt.floor(run_loop._ok_acc_y))
-                            elif run_loop._ok_acc_y <= -1.0:
-                                _iy = int(_mt.ceil(run_loop._ok_acc_y))
-                            else:
-                                _iy = 0
-                            if _ix != 0 or _iy != 0:
-                                _ix = max(-60, min(60, _ix))
-                                _iy = max(-60, min(60, _iy))
-                                pyautogui.moveRel(_ix, _iy)
-                                run_loop._ok_acc_x -= _ix
-                                run_loop._ok_acc_y -= _iy
-                        _pre_move_only_done_right = True
-                    elif _gesture == "OPEN":
-                        # 五指张开 = 鼠标左键长按 + 跟手拖动
-                        #   进入帧 → 在当前光标位置按下左键
-                        #   保持帧 → 掌心 move_only 跟手移动（左键按住=原生拖动）
-                        #   离开/离镜 → 释放左键
-                        _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
-                        if not getattr(run_loop, "_open_drag_started", False):
-                            pyautogui.mouseDown()
-                            run_loop._open_drag_started = True
-                            print("[OPEN-DRAG] 五指张开，左键按下，开始拖动", flush=True)
-                        else:
-                            mouse.move_only(_cursor_anchor_norm, gesture_hint="OPEN")
+                            _dx = _nsx - run_loop._ok_ref_sx
+                            _dy = _nsy - run_loop._ok_ref_sy
+                            _new_right = int(round(run_loop._ok_right0 + _dx))
+                            _new_bottom = int(round(run_loop._ok_bottom0 + _dy))
+                            _min_w, _min_h = 160, 100
+                            if _new_right - run_loop._ok_left0 < _min_w:
+                                _new_right = run_loop._ok_left0 + _min_w
+                            if _new_bottom - run_loop._ok_top0 < _min_h:
+                                _new_bottom = run_loop._ok_top0 + _min_h
+                            _w = _new_right - run_loop._ok_left0
+                            _h = _new_bottom - run_loop._ok_top0
+                            try:
+                                SetWindowPos(
+                                    ctypes.wintypes.HWND(run_loop._ok_hwnd),
+                                    ctypes.wintypes.HWND(HWND_TOP),
+                                    ctypes.wintypes.INT(run_loop._ok_left0),
+                                    ctypes.wintypes.INT(run_loop._ok_top0),
+                                    ctypes.wintypes.INT(_w),
+                                    ctypes.wintypes.INT(_h),
+                                    ctypes.wintypes.UINT(SWP_NOZORDER | SWP_NOACTIVATE),
+                                )
+                            except Exception:
+                                pass
                         _pre_move_only_done_right = True
                     else:
-                        # 非 OK/OPEN 手势：若之前在拖动，释放左键并重置状态
-                        if getattr(run_loop, "_ok_resize_started", False):
+                        # 非 OK / 非 GV-拖动：释放 GV 左键、复位 OK 缩放态，正常控鼠
+                        if getattr(run_loop, "_gv_press", False):
                             try:
-                                pyautogui.mouseUp()
-                                print("[OK-ACT] 手势离开 OK，左键释放", flush=True)
+                                pyautogui.mouseUp(button='left')
                             except Exception:
                                 pass
+                            run_loop._gv_press = False
+                        if getattr(run_loop, "_ok_resize_started", False):
                             run_loop._ok_resize_started = False
                             run_loop._ok_miss_t0 = None
-                        if getattr(run_loop, "_open_drag_started", False):
-                            try:
-                                pyautogui.mouseUp()
-                                print("[OPEN-DRAG] 手势离开张开，左键释放", flush=True)
-                            except Exception:
-                                pass
-                            run_loop._open_drag_started = False
-                        _cursor_anchor_norm = HandDetector.cursor_anchor_from_landmarks(_lms, args.anchor)
                         _move_hint = "OTHER" if _gesture == "FIST" else _gesture
                         mouse.move_only(_cursor_anchor_norm, gesture_hint=_move_hint)
                         _pre_move_only_done_right = True
@@ -2247,8 +2250,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     if not _pre_move_only_done_right:
                         mouse.move_only(cursor_anchor_norm, gesture_hint=move_gesture_hint)
                     # 移窗锁定帧额外跳过 handle：OPEN 分支内部也会 moveTo，否则与窗口中心锁打架
-                    # OK/OPEN 手势：左键已按下，跳过 handle 避免干扰拖拽
-                    if (gesture not in ("OK", "OPEN")
+                    # OK 手势：左键已按下抓窗口右下角，跳过 handle 避免干扰拖拽
+                    if (gesture != "OK"
                             and (not _cursor_locked_by_window_move)
                             and (not both_hands_global)
                             and (tap_detector.state != _TS.PRESSED)):
@@ -2542,48 +2545,47 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     _det_rs["palm"] += 1
                 else:
                     _det_rs["other"] += 1
-            # ---------- [DET-STAT]/[MOUSE-STAT] 统计打印已禁用（用户要求减少刷屏，2026-10-17） ----------
-            # if time.monotonic() - _det_stat_t0 >= _DET_STAT_SEC:
-            #     _dd = detector.take_det_diag()
-            #     _n = max(1, _det_rs["frames"])
-            #     _ni = max(1, _dd["infer"])
-            #     _none_tot = (_det_rs["no_left"] + _det_rs["palm"]
-            #                  + _det_rs["other"])
-            #     _b_avg = _det_rs["b_sum"] / _n
-            #     _b_min = _det_rs["b_min"]
-            #     print(
-            #         f"[DET-STAT] 循环帧{_det_rs['frames']} 跳帧{_det_rs['skip']}"
-            #         f"({100.0*_det_rs['skip']/_n:.0f}%) | "
-            #         f"推理{_dd['infer']} 超时{_dd['timeout']}"
-            #         f"({100.0*_dd['timeout']/_ni:.0f}%) 空手{_dd['empty']}"
-            #         f"({100.0*_dd['empty']/_ni:.0f}%) 有手{_dd['hand1']} | "
-            #         f"逆光增强{_dd['enh']}帧 暗占max{100.0*_dd['dark_max']:.0f}% | "
-            #         f"等待avg{_dd['lat_avg_ms']}/p90{_dd['lat_p90_ms']}ms | "
-            #         f"bend=None共{_none_tot}({100.0*_none_tot/_n:.0f}%): "
-            #         f"无控鼠手{_det_rs['no_left']} "
-            #         f"掌宽过小{_det_rs['palm']} "
-            #         f"其他{_det_rs['other']} | "
-            #         f"黑帧{_det_rs['black']}(最长连{_det_rs['black_run_max']}) 亮度min"
-            #         f"{_b_min if _b_min is not None else 0:.0f}/avg{_b_avg:.0f} | "
-            #         f"读帧max{_det_rs['read_max_ms']:.0f}ms/慢帧{_det_rs['read_slow']} "
-            #         f"waitKeyMax{_det_rs['wk_max_ms']:.0f}ms",
-            #         flush=True)
-            #     _det_stat_t0 = time.monotonic()
-            #     _det_rs = {"frames": 0, "skip": 0,
-            #                "no_left": 0, "palm": 0, "other": 0,
-            #                "black": 0, "b_sum": 0.0, "b_min": None,
-            #                "black_run": 0, "black_run_max": 0,
-            #                "read_max_ms": 0.0, "read_slow": 0, "wk_max_ms": 0.0}
-            #     # ---- 鼠标微震基线：原始锚点位移 vs 平滑后输出位移 + 静止锁进出统计 ----
-            #     _md = mouse._smoother.take_mouse_diag()
-            #     print(
-            #         f"[MOUSE-STAT] 有手帧{_md['frames']} 锁定{_md['locked_pct']:.0f}% "
-            #         f"入锁{_md['enters']}次 解锁{_md['unlocks']}次 | "
-            #         f"原始位移px p50/{_md['raw_p50']} p90/{_md['raw_p90']} max/{_md['raw_max']} | "
-            #         f"输出位移px p50/{_md['out_p50']} p90/{_md['out_p90']} max/{_md['out_max']} | "
-            #         f"解锁时 drift_max/{_md['unl_dist_max']} p90/{_md['unl_dist_p90']} "
-            #         f"3帧漂移max/{_md['unl_trend_max']}(阈8.96) σavg/{_md['unl_std_avg']}(进锁阈5.6)",
-            #         flush=True)
+            if time.monotonic() - _det_stat_t0 >= _DET_STAT_SEC:
+                _dd = detector.take_det_diag()
+                _n = max(1, _det_rs["frames"])
+                _ni = max(1, _dd["infer"])
+                _none_tot = (_det_rs["no_left"] + _det_rs["palm"]
+                             + _det_rs["other"])
+                _b_avg = _det_rs["b_sum"] / _n
+                _b_min = _det_rs["b_min"]
+                print(
+                    f"[DET-STAT] 循环帧{_det_rs['frames']} 跳帧{_det_rs['skip']}"
+                    f"({100.0*_det_rs['skip']/_n:.0f}%) | "
+                    f"推理{_dd['infer']} 超时{_dd['timeout']}"
+                    f"({100.0*_dd['timeout']/_ni:.0f}%) 空手{_dd['empty']}"
+                    f"({100.0*_dd['empty']/_ni:.0f}%) 有手{_dd['hand1']} | "
+                    f"逆光增强{_dd['enh']}帧 暗占max{100.0*_dd['dark_max']:.0f}% | "
+                    f"等待avg{_dd['lat_avg_ms']}/p90{_dd['lat_p90_ms']}ms | "
+                    f"bend=None共{_none_tot}({100.0*_none_tot/_n:.0f}%): "
+                    f"无控鼠手{_det_rs['no_left']} "
+                    f"掌宽过小{_det_rs['palm']} "
+                    f"其他{_det_rs['other']} | "
+                    f"黑帧{_det_rs['black']}(最长连{_det_rs['black_run_max']}) 亮度min"
+                    f"{_b_min if _b_min is not None else 0:.0f}/avg{_b_avg:.0f} | "
+                    f"读帧max{_det_rs['read_max_ms']:.0f}ms/慢帧{_det_rs['read_slow']} "
+                    f"waitKeyMax{_det_rs['wk_max_ms']:.0f}ms",
+                    flush=True)
+                _det_stat_t0 = time.monotonic()
+                _det_rs = {"frames": 0, "skip": 0,
+                           "no_left": 0, "palm": 0, "other": 0,
+                           "black": 0, "b_sum": 0.0, "b_min": None,
+                           "black_run": 0, "black_run_max": 0,
+                           "read_max_ms": 0.0, "read_slow": 0, "wk_max_ms": 0.0}
+                # ---- 鼠标微震基线：原始锚点位移 vs 平滑后输出位移 + 静止锁进出统计 ----
+                _md = mouse._smoother.take_mouse_diag()
+                print(
+                    f"[MOUSE-STAT] 有手帧{_md['frames']} 锁定{_md['locked_pct']:.0f}% "
+                    f"入锁{_md['enters']}次 解锁{_md['unlocks']}次 | "
+                    f"原始位移px p50/{_md['raw_p50']} p90/{_md['raw_p90']} max/{_md['raw_max']} | "
+                    f"输出位移px p50/{_md['out_p50']} p90/{_md['out_p90']} max/{_md['out_max']} | "
+                    f"解锁时 drift_max/{_md['unl_dist_max']} p90/{_md['unl_dist_p90']} "
+                    f"3帧漂移max/{_md['unl_trend_max']}(阈8.96) σavg/{_md['unl_std_avg']}(进锁阈5.6)",
+                    flush=True)
 
             _tap_updated = False
             # OK 手势：鼠标锁定右下角，食指弯曲不触发点击（与双手同帧一样 reset 检测器）
@@ -2652,21 +2654,20 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 _jit3d_q.append((float(index_bend), float(_b3d_probe["bend"]),
                                  _b3d_probe["comp"]))
                 _jit3d_sec += _frame_dt
-                # [BEND3D-JIT] 周期性 2D/3D 弯度对比日志已禁用（用户要求减少刷屏，2026-10-17）
-                # if _jit3d_sec >= 2.0 and len(_jit3d_q) >= 8:
-                #     _a2 = np.array([_q[0] for _q in _jit3d_q], dtype=np.float64)
-                #     _a3 = np.array([_q[1] for _q in _jit3d_q], dtype=np.float64)
-                #     _ac = np.array([_q[2] for _q in _jit3d_q if _q[2] is not None],
-                #                    dtype=np.float64)
-                #     _cs = (f" comp中位{float(np.median(_ac)):.2f}/min{float(_ac.min()):.2f}"
-                #            if len(_ac) else "")
-                #     print(f"[BEND3D-JIT] {_jit3d_sec:.1f}s n={len(_jit3d_q)} "
-                #           f"2D弯 {_a2.mean():.3f}±{_a2.std():.4f} | "
-                #           f"3D弯 {_a3.mean():.3f}±{_a3.std():.4f} | "
-                #           f"均值差2D-3D{(_a2.mean() - _a3.mean()):+.3f}{_cs}",
-                #           flush=True)
-                #     _jit3d_q.clear()
-                #     _jit3d_sec = 0.0
+                if _jit3d_sec >= 2.0 and len(_jit3d_q) >= 8:
+                    _a2 = np.array([_q[0] for _q in _jit3d_q], dtype=np.float64)
+                    _a3 = np.array([_q[1] for _q in _jit3d_q], dtype=np.float64)
+                    _ac = np.array([_q[2] for _q in _jit3d_q if _q[2] is not None],
+                                   dtype=np.float64)
+                    _cs = (f" comp中位{float(np.median(_ac)):.2f}/min{float(_ac.min()):.2f}"
+                           if len(_ac) else "")
+                    print(f"[BEND3D-JIT] {_jit3d_sec:.1f}s n={len(_jit3d_q)} "
+                          f"2D弯 {_a2.mean():.3f}±{_a2.std():.4f} | "
+                          f"3D弯 {_a3.mean():.3f}±{_a3.std():.4f} | "
+                          f"均值差2D-3D{(_a2.mean() - _a3.mean()):+.3f}{_cs}",
+                          flush=True)
+                    _jit3d_q.clear()
+                    _jit3d_sec = 0.0
             else:
                 if _jit3d_q:
                     _jit3d_q.clear()
@@ -2791,13 +2792,12 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                    f" 压缩min{_lf(_lseg_comp_min)}"
                                    f" 2D-3D差max{_lf(_lseg_diff_max)}@压{_lf(_lseg_diff_comp)}"
                                    f" 末节{_lf(_lseg_phal)}mm 跳max{_lf(_lseg_jump_max)}mm")
-                    # [TAP-SEG] 段生命周期日志已注释（用户要求减少刷屏，2026-10-17）
-                    # print(
-                    #     f"[TAP-SEG] {_sr['result']}({_sr['ctx']}) 区={_ez} "
-                    #     f"段{_sr['wall_ms']}ms{_fz} None{_sr['none_n']}帧"
-                    #     f"{('[' + _nrs + ']') if _nrs else ''} "
-                    #     f"{_ap}末点{_ep}{_dr}{_gates}{_lobs}{_lobs3d}",
-                    #     flush=True)
+                    print(
+                        f"[TAP-SEG] {_sr['result']}({_sr['ctx']}) 区={_ez} "
+                        f"段{_sr['wall_ms']}ms{_fz} None{_sr['none_n']}帧"
+                        f"{('[' + _nrs + ']') if _nrs else ''} "
+                        f"{_ap}末点{_ep}{_dr}{_gates}{_lobs}{_lobs3d}",
+                        flush=True)
                 except Exception:
                     pass
 
@@ -2954,21 +2954,24 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     mouse.handle_finger_tap_event(right_tap_event, right_screen_pt)
                     _hb_stage[0] = "business"
 
-            # ---------- 单手五指张开移窗逻辑已禁用（改为五指张开=左键长按拖动） ----------
-            # _mv_n = len(hand_results)
-            # _mv_lms = None
-            # _mv_px = None
-            # _mv_screen = None
-            # if _mv_n == 1:
-            #     _, _, _, _mv_lms = next(iter(hand_results.values()))
-            #     try:
-            #         _nx, _ny = HandDetector.cursor_anchor_from_landmarks(_mv_lms, args.anchor)
-            #         _mv_px = (float(_nx) * w, float(_ny) * h)
-            #         _sx, _sy = mouse._norm_to_screen(float(_nx), float(_ny))
-            #         _mv_screen = (float(_sx), float(_sy))
-            #     except Exception:
-            #         _mv_px, _mv_screen = None, None
-            # mover_info = window_mover.update(_mv_n, _mv_lms, _mv_px, _mv_screen, dt=_frame_dt)
+            # ---------- 单手五指张开 → 移动掌心下窗口（双手场景不触发） ----------
+            #   GameViewer 下五指张开改为左键长按拖动，不走移窗状态机（传 n_hands=0 让其回 IDLE）。
+            _mv_n = len(hand_results)
+            if getattr(run_loop, "_is_gv", False):
+                _mv_n = 0
+            _mv_lms = None
+            _mv_px = None
+            _mv_screen = None
+            if _mv_n == 1:
+                _, _, _, _mv_lms = next(iter(hand_results.values()))
+                try:
+                    _nx, _ny = HandDetector.cursor_anchor_from_landmarks(_mv_lms, args.anchor)
+                    _mv_px = (float(_nx) * w, float(_ny) * h)
+                    _sx, _sy = mouse._norm_to_screen(float(_nx), float(_ny))
+                    _mv_screen = (float(_sx), float(_sy))
+                except Exception:
+                    _mv_px, _mv_screen = None, None
+            mover_info = window_mover.update(_mv_n, _mv_lms, _mv_px, _mv_screen, dt=_frame_dt)
 
             _t2 = time.perf_counter()
 
@@ -3105,81 +3108,81 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 put_text_cn(frame, combo_hint, (tx, ty),
                             font_scale=0.8, color=(0, 230, 230), thickness=2)
 
-            # ---------- 绘制：单手五指张开移窗（已禁用） ----------
-            # try:
-            #     if (mover_info is not None and _mv_lms is not None
-            #             and (mover_info.need_redraw or mover_info.ui_active)
-            #             and mover_info.anchor_px is not None):
-            #         mv_color = (90, 255, 120)
-            #         x1, y1 = int(mover_info.anchor_px[0]), int(mover_info.anchor_px[1])
-            #         cv2.circle(frame, (x1, y1), 26, mv_color, 3)
-            #         for _tip_i in (4, 8, 12, 16, 20):
-            #             cv2.circle(frame,
-            #                        (int(float(_mv_lms[_tip_i].x) * w),
-            #                         int(float(_mv_lms[_tip_i].y) * h)),
-            #                        8, mv_color, -1)
-            #         put_text_cn(frame, "张开", (max(4, x1 - 26), max(4, y1 + 38)),
-            #                     font_scale=0.55, color=mv_color, thickness=2)
-            #
-            #         if (mover_info.move_state == _WMS.MOVE_CONFIRM
-            #                 or (mover_info.ui_active and mover_info.move_state == _WMS.IDLE)):
-            #             hold_n = MOVE_CONFIRM_SEC
-            #             pct = mover_info.confirm_sec / max(1e-6, hold_n)
-            #             pct = min(1.0, pct)
-            #             prog_w = 420
-            #             bx = x1 + 40 if x1 < w // 2 else (x1 - 40 - prog_w)
-            #             by = y1 - 66
-            #             cv2.rectangle(frame, (bx - 6, by - 30), (bx + prog_w + 6, by + 60), (0, 0, 0), -1)
-            #             cv2.rectangle(frame, (bx, by), (bx + prog_w, by + 14), (50, 50, 50), -1)
-            #             if mover_info.ui_active and mover_info.move_state == _WMS.IDLE:
-            #                 cv2.rectangle(frame, (bx, by), (bx + int(prog_w * 0.02), by + 14), mv_color, -1)
-            #                 put_text_cn(frame,
-            #                             f"✋预判定【移动窗口(单手)】掌心指向要移动的窗口 ｜ 保持五指张开{hold_n:.2f}s即可选中",
-            #                             (bx, by + 24), font_scale=0.55, color=(255, 255, 255), thickness=2)
-            #             else:
-            #                 cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 14), mv_color, -1)
-            #                 put_text_cn(frame,
-            #                             f"✋选中窗口确认中(单手)… {mover_info.confirm_sec:.2f}/{hold_n:.2f}s({int(pct*100)}%)",
-            #                             (bx, by + 24), font_scale=0.58, color=(255, 255, 255), thickness=2)
-            #         elif mover_info.move_state == _WMS.MOVE_ACTIVE:
-            #             dx_int = int(round(float(mover_info.delta_xy[0])))
-            #             dy_int = int(round(float(mover_info.delta_xy[1])))
-            #             rect = mover_info.window_rect
-            #             if rect is not None and len(rect) == 4:
-            #                 ww = int(rect[2] - rect[0]); wh = int(rect[3] - rect[1])
-            #             else:
-            #                 ww = wh = 0
-            #             lines = [
-            #                 (f"✋五指张开(单手) → 移动窗口中 Δx={dx_int:+d}  Δy={dy_int:+d}", (255, 255, 255), 0.72),
-            #                 (f"方向：{'右' if dx_int > 4 else ('左' if dx_int < -4 else '—')}  "
-            #                  f"{'下' if dy_int > 4 else ('上' if dy_int < -4 else '—')}  ｜ 光标已锁定窗口中心",
-            #                  mv_color, 0.55),
-            #                 (f"窗口: HWND 0x{int(mover_info.move_hwnd):08X}  {ww}×{wh}",
-            #                  (230, 230, 230), 0.52),
-            #             ]
-            #             card_w, card_h = 620, 110
-            #             bx = x1 + 40 if x1 < w // 2 else (x1 - 40 - card_w)
-            #             by = y1 - card_h // 2
-            #             cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), (0, 0, 0), -1)
-            #             cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), mv_color, 2)
-            #             put_text_cn(frame, lines[0][0], (bx + 22, by + 14), font_scale=lines[0][2], color=lines[0][1], thickness=2)
-            #             put_text_cn(frame, lines[1][0], (bx + 22, by + 46), font_scale=lines[1][2], color=lines[1][1], thickness=2)
-            #             put_text_cn(frame, lines[2][0], (bx + 22, by + 86), font_scale=lines[2][2], color=lines[2][1], thickness=2)
-            #
-            #         # 左上角状态条
-            #         s_text, s_color = "", None
-            #         if mover_info.move_state == _WMS.MOVE_CONFIRM or (mover_info.ui_active and mover_info.move_state == _WMS.IDLE):
-            #             s_color = (90, 255, 120)
-            #             s_text = f"✋ 单手五指张开-移动窗口 确认中 {mover_info.confirm_sec:.2f}/{MOVE_CONFIRM_SEC:.2f}s"
-            #         elif mover_info.move_state == _WMS.MOVE_ACTIVE:
-            #             s_color = (90, 255, 120)
-            #             s_text = (f"✋ 单手移动窗口中 Δx={int(round(float(mover_info.delta_xy[0]))):+d} "
-            #                       f"Δy={int(round(float(mover_info.delta_xy[1]))):+d}  光标锁窗口中心")
-            #         if s_text:
-            #             cv2.rectangle(frame, (8, 90), (8 + 470, 118), (0, 0, 0), -1)
-            #             put_text_cn(frame, s_text, (14, 94), font_scale=0.6, color=s_color, thickness=2)
-            # except Exception:
-            #     pass
+            # ---------- 绘制：单手五指张开移窗 ----------
+            try:
+                if (mover_info is not None and _mv_lms is not None
+                        and (mover_info.need_redraw or mover_info.ui_active)
+                        and mover_info.anchor_px is not None):
+                    mv_color = (90, 255, 120)
+                    x1, y1 = int(mover_info.anchor_px[0]), int(mover_info.anchor_px[1])
+                    cv2.circle(frame, (x1, y1), 26, mv_color, 3)
+                    for _tip_i in (4, 8, 12, 16, 20):
+                        cv2.circle(frame,
+                                   (int(float(_mv_lms[_tip_i].x) * w),
+                                    int(float(_mv_lms[_tip_i].y) * h)),
+                                   8, mv_color, -1)
+                    put_text_cn(frame, "张开", (max(4, x1 - 26), max(4, y1 + 38)),
+                                font_scale=0.55, color=mv_color, thickness=2)
+
+                    if (mover_info.move_state == _WMS.MOVE_CONFIRM
+                            or (mover_info.ui_active and mover_info.move_state == _WMS.IDLE)):
+                        hold_n = MOVE_CONFIRM_SEC
+                        pct = mover_info.confirm_sec / max(1e-6, hold_n)
+                        pct = min(1.0, pct)
+                        prog_w = 420
+                        bx = x1 + 40 if x1 < w // 2 else (x1 - 40 - prog_w)
+                        by = y1 - 66
+                        cv2.rectangle(frame, (bx - 6, by - 30), (bx + prog_w + 6, by + 60), (0, 0, 0), -1)
+                        cv2.rectangle(frame, (bx, by), (bx + prog_w, by + 14), (50, 50, 50), -1)
+                        if mover_info.ui_active and mover_info.move_state == _WMS.IDLE:
+                            cv2.rectangle(frame, (bx, by), (bx + int(prog_w * 0.02), by + 14), mv_color, -1)
+                            put_text_cn(frame,
+                                        f"✋预判定【移动窗口(单手)】掌心指向要移动的窗口 ｜ 保持五指张开{hold_n:.2f}s即可选中",
+                                        (bx, by + 24), font_scale=0.55, color=(255, 255, 255), thickness=2)
+                        else:
+                            cv2.rectangle(frame, (bx, by), (bx + int(prog_w * pct), by + 14), mv_color, -1)
+                            put_text_cn(frame,
+                                        f"✋选中窗口确认中(单手)… {mover_info.confirm_sec:.2f}/{hold_n:.2f}s({int(pct*100)}%)",
+                                        (bx, by + 24), font_scale=0.58, color=(255, 255, 255), thickness=2)
+                    elif mover_info.move_state == _WMS.MOVE_ACTIVE:
+                        dx_int = int(round(float(mover_info.delta_xy[0])))
+                        dy_int = int(round(float(mover_info.delta_xy[1])))
+                        rect = mover_info.window_rect
+                        if rect is not None and len(rect) == 4:
+                            ww = int(rect[2] - rect[0]); wh = int(rect[3] - rect[1])
+                        else:
+                            ww = wh = 0
+                        lines = [
+                            (f"✋五指张开(单手) → 移动窗口中 Δx={dx_int:+d}  Δy={dy_int:+d}", (255, 255, 255), 0.72),
+                            (f"方向：{'右' if dx_int > 4 else ('左' if dx_int < -4 else '—')}  "
+                             f"{'下' if dy_int > 4 else ('上' if dy_int < -4 else '—')}  ｜ 光标已锁定窗口中心",
+                             mv_color, 0.55),
+                            (f"窗口: HWND 0x{int(mover_info.move_hwnd):08X}  {ww}×{wh}",
+                             (230, 230, 230), 0.52),
+                        ]
+                        card_w, card_h = 620, 110
+                        bx = x1 + 40 if x1 < w // 2 else (x1 - 40 - card_w)
+                        by = y1 - card_h // 2
+                        cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), (0, 0, 0), -1)
+                        cv2.rectangle(frame, (bx, by), (bx + card_w, by + card_h), mv_color, 2)
+                        put_text_cn(frame, lines[0][0], (bx + 22, by + 14), font_scale=lines[0][2], color=lines[0][1], thickness=2)
+                        put_text_cn(frame, lines[1][0], (bx + 22, by + 46), font_scale=lines[1][2], color=lines[1][1], thickness=2)
+                        put_text_cn(frame, lines[2][0], (bx + 22, by + 86), font_scale=lines[2][2], color=lines[2][1], thickness=2)
+
+                    # 左上角状态条
+                    s_text, s_color = "", None
+                    if mover_info.move_state == _WMS.MOVE_CONFIRM or (mover_info.ui_active and mover_info.move_state == _WMS.IDLE):
+                        s_color = (90, 255, 120)
+                        s_text = f"✋ 单手五指张开-移动窗口 确认中 {mover_info.confirm_sec:.2f}/{MOVE_CONFIRM_SEC:.2f}s"
+                    elif mover_info.move_state == _WMS.MOVE_ACTIVE:
+                        s_color = (90, 255, 120)
+                        s_text = (f"✋ 单手移动窗口中 Δx={int(round(float(mover_info.delta_xy[0]))):+d} "
+                                  f"Δy={int(round(float(mover_info.delta_xy[1]))):+d}  光标锁窗口中心")
+                    if s_text:
+                        cv2.rectangle(frame, (8, 90), (8 + 470, 118), (0, 0, 0), -1)
+                        put_text_cn(frame, s_text, (14, 94), font_scale=0.6, color=s_color, thickness=2)
+            except Exception:
+                pass
 
             # ---------- 顶部模式标签 ----------
             anchor_text = {"mcp": "指根", "palm": "掌心", "index_tip": "食指尖"}.get(
@@ -3306,10 +3309,9 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 #   且 detect() 等待回调的 Event.wait 期间本就释放 GIL，Flask 有充足调度窗口。
                 time.sleep(0)
                 # 无预览模式额外心跳（~每 2 秒 1 次，与输入无关）：证明循环在跑，方便排查静默状态
-                # [RUN-OK bg-mode] 心跳日志已禁用（用户要求减少刷屏，2026-10-17）
-                # if (_bg_heartbeat_cnt % 120 == 0) and (_bg_heartbeat_cnt > 0):
-                #     print(f"[RUN-OK bg-mode] frame={_bg_heartbeat_cnt:>5} FPS={_fps_display:5.1f} preview=OFF gesture_left={hand_results.get('Left',(None,))[0]} move_ok={right_screen_pt is not None} tap_event={tap_event}",
-                #           flush=True)
+                if (_bg_heartbeat_cnt % 120 == 0) and (_bg_heartbeat_cnt > 0):
+                    print(f"[RUN-OK bg-mode] frame={_bg_heartbeat_cnt:>5} FPS={_fps_display:5.1f} preview=OFF gesture_left={hand_results.get('Left',(None,))[0]} move_ok={right_screen_pt is not None} tap_event={tap_event}",
+                          flush=True)
 
     # ================== finally：100% 与原 main.py 行为一致 ==================
     except Exception as e:

@@ -246,21 +246,21 @@ def recognize_gesture(lms, wlms=None):
     # 3b. OK 手势：拇指食指成圈 + 中/无名/小三指伸直
     #   判据1：2D dist(拇TIP4,食TIP8) / dist(食PIP6,食MCP5) < 0.50（真机捏定0.26~0.37）。
     #   判据2：三指 PIP 关节 2D 弯曲度全部 < 0.25（真机捏定 中≤0.15）。就这两条，无其它门控。
-    # [OK-DBG] 调试打印已禁用（用户要求减少刷屏，2026-10-17）
-    # if pinch_pip is not None and pinch_pip < 2.5:
-    #     _num = float(np.linalg.norm(_p2(lms[4]) - _p2(lms[8])))
-    #     _den = float(np.linalg.norm(_p2(lms[6]) - _p2(lms[5])))
-    #     if _ok_pinch_ok and _ok_mid_ok:
-    #         _verdict = "OK"
-    #     elif not _ok_mid_ok:
-    #         _verdict = "非OK(三指未全伸)"
-    #     else:
-    #         _verdict = "张开"
-    #     print(f"[OK-DBG] 捏合比={pinch_pip:.2f}(门0.50) [TIP4-8={_num:.3f} / PIP6-MCP5={_den:.3f} "
-    #           f"掌宽={palm_width:.3f} 旧掌宽比={pinch_r:.2f}] 2D弯曲 中/无/小="
-    #           f"({_ok_three[0]:.2f},{_ok_three[1]:.2f},{_ok_three[2]:.2f})(门0.25,小=直) "
-    #           f"=> {_verdict}",
-    #           flush=True)
+    # [OK-DBG] 必须在 return 之前打（旧版打印在 return 后，成功帧永远静默，日志只剩过渡帧）
+    if pinch_pip is not None and pinch_pip < 2.5:
+        _num = float(np.linalg.norm(_p2(lms[4]) - _p2(lms[8])))
+        _den = float(np.linalg.norm(_p2(lms[6]) - _p2(lms[5])))
+        if _ok_pinch_ok and _ok_mid_ok:
+            _verdict = "OK"
+        elif not _ok_mid_ok:
+            _verdict = "非OK(三指未全伸)"
+        else:
+            _verdict = "张开"
+        print(f"[OK-DBG] 捏合比={pinch_pip:.2f}(门0.50) [TIP4-8={_num:.3f} / PIP6-MCP5={_den:.3f} "
+              f"掌宽={palm_width:.3f} 旧掌宽比={pinch_r:.2f}] 2D弯曲 中/无/小="
+              f"({_ok_three[0]:.2f},{_ok_three[1]:.2f},{_ok_three[2]:.2f})(门0.25,小=直) "
+              f"=> {_verdict}",
+              flush=True)
     if _ok_pinch_ok and _ok_mid_ok:
         ratios = {
             "palm_w": round(palm_width, 4),

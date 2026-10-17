@@ -88,6 +88,87 @@ GetAncestor.restype = wintypes.HWND
 GA_ROOT       = 2
 GA_ROOTOWNER  = 3
 
+# ============================================================
+# 窗口所属进程名检测（用于 GameViewer 等特定进程的交互分支）
+# ============================================================
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+GetWindowThreadProcessId.restype = wintypes.DWORD
+
+OpenProcess = kernel32.OpenProcess
+OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+OpenProcess.restype = wintypes.HANDLE
+
+CloseHandle = kernel32.CloseHandle
+CloseHandle.argtypes = [wintypes.HANDLE]
+CloseHandle.restype = wintypes.BOOL
+
+QueryFullProcessImageNameW = kernel32.QueryFullProcessImageNameW
+QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                       wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def get_window_process_name(hwnd: int) -> str:
+    """返回窗口所属进程的可执行文件名（小写，如 'gameviewer.exe'），失败返回 ''。"""
+    hwnd = int(hwnd or 0)
+    if hwnd == 0:
+        return ""
+    pid = wintypes.DWORD()
+    try:
+        GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    except Exception:
+        return ""
+    if not pid.value:
+        return ""
+    hproc = OpenProcess(wintypes.DWORD(PROCESS_QUERY_LIMITED_INFORMATION),
+                        wintypes.BOOL(False), wintypes.DWORD(pid.value))
+    if not hproc:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if QueryFullProcessImageNameW(wintypes.HANDLE(hproc), wintypes.DWORD(0),
+                                      buf, ctypes.byref(size)):
+            import os as _os
+            return _os.path.basename(buf.value).lower()
+    except Exception:
+        pass
+    finally:
+        try:
+            CloseHandle(wintypes.HANDLE(hproc))
+        except Exception:
+            pass
+    return ""
+
+
+def get_cursor_window_process_name() -> str:
+    """当前鼠标光标所在顶层窗口的进程名。"""
+    pt = wintypes.POINT()
+    try:
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return ""
+    except Exception:
+        return ""
+    hwnd = int(user32.WindowFromPoint(pt) or 0)
+    if hwnd == 0:
+        return ""
+    try:
+        hwnd = int(GetAncestor(wintypes.HWND(hwnd), wintypes.UINT(GA_ROOT)) or 0) or hwnd
+    except Exception:
+        pass
+    return get_window_process_name(hwnd)
+
+
+def is_gameviewer_cursor_window() -> bool:
+    """光标所在窗口是否属于 gameviewer.exe。"""
+    return get_cursor_window_process_name() == "gameviewer.exe"
+
+
 # 旧版 Python 的 wintypes 可能缺 ULONG_PTR/LONG_PTR，手动补齐
 if not hasattr(wintypes, 'ULONG_PTR') or not hasattr(wintypes, 'LONG_PTR'):
     import ctypes as _ct_local

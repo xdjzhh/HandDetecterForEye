@@ -19,7 +19,7 @@
     "--roi-safe-shrink",
     "0.82",
     "--anchor",
-    "mcp",
+    "palm",
     "--cursor-mode",
     "absolute",
     "--tap-hardness",
