@@ -23,6 +23,7 @@ import json
 import time
 import socket
 import threading
+import argparse
 import urllib.request
 import urllib.parse
 
@@ -44,6 +45,51 @@ if os.path.exists(_CONFIG_PATH_EARLY):
 import app_log
 app_log.setup_logging(enabled=_log_enabled, project_root=_PROJECT_ROOT)
 
+# =========================================================================
+# ⓪.5 服务级单例锁（跨平台文件锁：msvcrt 区域锁 / fcntl.flock）：锁在服务
+#   身份上，与端口/参数无关
+#   （换端口启动同样被拦）。必须在 hands_tasks/模型加载之前。进程存活期间
+#   持有；正常退出或 taskkill 强杀后由 OS 自动释放——无残留死锁，无需
+#   PID 活性检查与 atexit 清理。句柄引用保留在模块级（丢引用=锁释放）。
+# =========================================================================
+def _acquire_singleton_lock(lock_name: str):
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             f"{lock_name}.lock")
+    fp = open(lock_path, "a+", encoding="utf-8")
+    fp.write(" ")          # 字节 0 = 锁区占位；PID 写在其后（冲突方可读）
+    fp.flush()
+    try:
+        fp.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)   # Windows：区域锁
+        else:
+            import fcntl
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # Linux/macOS：整文件锁
+    except OSError:
+        old_pid = ""
+        try:
+            fp.seek(1)     # 跳过锁区（字节 0 被独占，读不到）
+            old_pid = fp.read().strip()
+        except Exception:
+            pass
+        print(f"[singleton] 已有实例在运行{f'（PID={old_pid}）' if old_pid else ''}，"
+              f"锁文件={lock_path}，本次启动退出。", flush=True)
+        sys.exit(0)
+    try:
+        fp.seek(0)
+        fp.truncate()
+        fp.write(" ")          # 字节 0 = 锁区占位
+        fp.write(str(os.getpid()))  # PID 写在锁区外，冲突方可读
+        fp.flush()
+    except Exception:
+        pass
+    # fp 故意不关闭：进程存续期间持锁，退出后由 OS 释放
+    return fp
+
+
+_SINGLETON_LOCK_FP = _acquire_singleton_lock("handdetecter")
+
 from flask import Flask, jsonify, request
 
 import hands_tasks as HT
@@ -55,11 +101,72 @@ print("\n" + "=" * 70)
 print("[server.py Step 1] 启动时加载模型、校验参数（不打开摄像头）")
 print("=" * 70)
 
-# 如果同目录有 config.json，读它作为默认 camera_id（不传参数时用）
+# =========================================================================
+# 启动参数：命令行显式 > start_proporties.yaml > 内置默认（与 Open-AutoGLM
+#   server.py 同一模式）。config.json 只管摄像头/预览等业务字段，host/port
+#   迁入 YAML。
+# =========================================================================
+_START_PROPERTIES_NAME = "start_proporties.yaml"
+
+
+def _load_start_properties(config_path=None):
+    """读取启动参数 YAML，返回 dict。
+    文件缺失/解析失败只告警并返回 {}（回退内置默认值），绝不阻断启动。
+    """
+    path = config_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), _START_PROPERTIES_NAME)
+    if not os.path.isfile(path):
+        print(f"[server.py] ℹ️ 未找到启动参数文件 {path}，使用命令行/内置默认值。")
+        return {}
+    try:
+        import yaml
+    except ImportError:
+        print("[server.py] ⚠️ 未安装 PyYAML，无法读取 "
+              f"{_START_PROPERTIES_NAME}（pip install pyyaml）；回退命令行/内置默认值。")
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"[server.py] ⚠️ 解析启动参数文件 {path} 失败，回退命令行/内置默认值：{e!r}")
+        return {}
+    if not isinstance(data, dict):
+        print(f"[server.py] ⚠️ 启动参数文件 {path} 顶层不是键值映射，已忽略。")
+        return {}
+    print(f"[server.py] ⚙️ 已加载启动参数文件：{path}（命令行同名参数优先）")
+    return data
+
+
+# default=None 表示「命令行未传」：未传回退 YAML，YAML 缺项再回退内置默认
+_server_argp = argparse.ArgumentParser(description="HandDetecter 手势识别服务")
+_server_argp.add_argument("--config", default=None,
+                          help=f"启动参数 YAML 路径（默认=server.py 同目录 {_START_PROPERTIES_NAME}）")
+_server_argp.add_argument("--host", default=None,
+                          help=f"Flask 监听地址（默认读 YAML/内置: 127.0.0.1）")
+_server_argp.add_argument("--port", type=int, default=None,
+                          help=f"Flask 监听端口（默认读 YAML/内置: 8000）")
+_server_cli = _server_argp.parse_args()
+_server_props = _load_start_properties(_server_cli.config)
+
+
+def _pick_server_prop(cli_val, yaml_key, builtin_default):
+    """命令行显式值优先；否则取 YAML；YAML 无此项再用内置默认。"""
+    if cli_val is not None:
+        return cli_val
+    return _server_props.get(yaml_key, builtin_default)
+
+
+# Flask 监听地址（三层合并结果；下面的单实例锁与 make_server 都用它）
+_flask_host = str(_pick_server_prop(_server_cli.host, "host", "127.0.0.1"))
+try:
+    _flask_port = max(1, min(65535, int(_pick_server_prop(_server_cli.port, "port", 8000))))
+except Exception:
+    _flask_port = 8000
+print(f"[server.py] Flask 监听: {_flask_host}:{_flask_port}（来源：命令行 > {_START_PROPERTIES_NAME} > 内置默认）")
+
+# config.json 只读业务字段（摄像头/预览；host/port 已迁 start_proporties.yaml）
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 _default_camera_id = 0
-_flask_host = "127.0.0.1"
-_flask_port = 8000
 _preview_default = True
 if os.path.exists(CONFIG_PATH):
     try:
@@ -72,20 +179,15 @@ if os.path.exists(CONFIG_PATH):
             # 兼容：config 里写字符串时按相机友好名字片段匹配（MF 实时清单）；正式配置推荐用数字 index（见 /cameras）
             _default_camera_id = str(_raw_cid).strip()
         print(f"[server.py] 从 config.json 读到默认 camera_id = {_default_camera_id!r}")
-        # 读取 Flask host / port
-        try: _flask_host = str(cfg.get("flask_host", _flask_host)).strip() or "127.0.0.1"
-        except Exception: pass
-        try: _flask_port = max(1, min(65535, int(cfg.get("flask_port", _flask_port))))
-        except Exception: pass
         # 读取 preview_default（/run 接口不传 preview 时的默认行为）
         try:
             _pv = cfg.get("preview_default", True)
             _preview_default = bool(_pv) if isinstance(_pv, bool) else (str(_pv) not in ("0", "false", "False", "no", "None"))
         except Exception:
             pass
-        print(f"[server.py] Flask 监听: {_flask_host}:{_flask_port}  preview_default={_preview_default}")
+        print(f"[server.py] preview_default={_preview_default}")
     except Exception as e:
-        print(f"[server.py] 读取 config.json 失败，忽略（默认 0/8000）：{e}")
+        print(f"[server.py] 读取 config.json 失败，忽略（默认 camera_id=0）：{e}")
 
 # =========================================================================
 # ⓪.5 单实例启动锁（2026-10-04）
@@ -136,7 +238,7 @@ def _acquire_single_instance_lock(host: str, port: int) -> socket.socket:
         sys.exit(2)
     if reason is not None:
         print(f"\n[server.py] ❌ 端口 {host}:{port} 已被【其他程序】占用（不是本服务）。"
-              f"请退出占用程序，或改 config.json 的 flask_port 后重试。\n")
+              f"请退出占用程序，或改 {_START_PROPERTIES_NAME} 的 port 后重试。\n")
         sys.exit(3)
     # OS 级兜底：独占绑定，持有到进程退出
     lock_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -357,6 +459,29 @@ def status():
     out["thread_alive"] = alive
     out["default_camera_id"] = _default_camera_id
     return jsonify(out)
+
+
+# =========================================================================
+# 优雅停止（virtualdesk stop 调用）：回 200 后延迟 httpd.shutdown()——进程内
+# 标志，无控制台进程（CREATE_NO_WINDOW）也可靠送达。CTRL_C 事件在无控制台
+# 进程里投递不到 handler（GenerateConsoleCtrlEvent 成空操作），信号方案弃用。
+# serve_forever 返回后进程自然退出（识别线程是 daemon，随进程收尾）。
+# shutdown 失败不强退，交由 virtualdesk taskkill 兜底。
+# =========================================================================
+@app.route("/exit", methods=["POST"])
+def graceful_exit():
+    import threading
+
+    def _self_shutdown():
+        time.sleep(0.5)
+        print("\n[exit] 收到 /exit 请求：httpd.shutdown()，serve_forever 收尾退出...", flush=True)
+        try:
+            _httpd.shutdown()
+        except Exception as e:
+            print(f"[exit] ⚠️ shutdown 失败（由外部 taskkill 兜底）：{e}", flush=True)
+
+    threading.Thread(target=_self_shutdown, daemon=True).start()
+    return jsonify({"success": True, "message": "exiting via httpd.shutdown()"})
 
 
 # =========================================================================
