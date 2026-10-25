@@ -137,6 +137,85 @@ def _load_start_properties(config_path=None):
     return data
 
 
+def set_cpu_affinity(cpu_list_str) -> bool:
+    """设置当前进程的 CPU 亲和性（Windows: SetProcessAffinityMask；Linux/macOS: sched_setaffinity）
+
+    核心不足时自动回退：若配置的核心全部超出范围，自动取前 N 个可用核心
+    （N = 请求的核心数量，但不超过总核心数），保证 CPU 限制始终生效。
+
+    Args:
+        cpu_list_str: 逻辑核心编号逗号分隔字符串，如 "0,1" 绑定到核心0和1
+    Returns:
+        是否设置成功
+    """
+    if not cpu_list_str:
+        return False
+    try:
+        cores = [int(c.strip()) for c in str(cpu_list_str).split(",") if c.strip() != ""]
+    except ValueError:
+        print(f"[server.py] ⚠️ CPU 亲和性参数格式错误: {cpu_list_str}，应为如 '0,1'")
+        return False
+
+    total = os.cpu_count() or 1
+    requested = cores
+    cores = [c for c in cores if 0 <= c < total]
+
+    if not cores:
+        n = min(len(requested), total)
+        cores = list(range(n))
+        print(f"[server.py] ⚠️ CPU 亲和性核心 {requested} 超出范围 (0-{total-1})，"
+              f"自动回退到前 {n} 个核心: {cores}")
+    elif len(cores) < len(requested):
+        ignored = [c for c in requested if c not in cores]
+        print(f"[server.py] ⚠️ CPU 亲和性核心 {ignored} 超出范围 (0-{total-1}) 已忽略，"
+              f"实际绑定: {cores}")
+
+    mask = 0
+    for c in cores:
+        mask |= (1 << c)
+
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            PROCESS_SET_INFORMATION = 0x0200
+            PROCESS_QUERY_INFORMATION = 0x0400
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+            kernel32.SetProcessAffinityMask.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(
+                PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION,
+                False,
+                os.getpid(),
+            )
+            if not handle:
+                err = ctypes.get_last_error()
+                print(f"[server.py] ⚠️ OpenProcess 失败，错误码: {err}")
+                return False
+            try:
+                result = kernel32.SetProcessAffinityMask(handle, mask)
+                if result:
+                    print(f"[server.py] ✅ CPU 亲和性已设置: 核心 {cores} (mask=0x{mask:X})")
+                    return True
+                else:
+                    err = ctypes.get_last_error()
+                    print(f"[server.py] ⚠️ SetProcessAffinityMask 失败，错误码: {err}")
+                    return False
+            finally:
+                kernel32.CloseHandle(handle)
+        else:
+            os.sched_setaffinity(0, cores)
+            print(f"[server.py] ✅ CPU 亲和性已设置: 核心 {cores}")
+            return True
+    except Exception as e:
+        print(f"[server.py] ⚠️ 设置 CPU 亲和性失败: {e}")
+        return False
+
+
 # default=None 表示「命令行未传」：未传回退 YAML，YAML 缺项再回退内置默认
 _server_argp = argparse.ArgumentParser(description="HandDetecter 手势识别服务")
 _server_argp.add_argument("--config", default=None,
@@ -145,6 +224,8 @@ _server_argp.add_argument("--host", default=None,
                           help=f"Flask 监听地址（默认读 YAML/内置: 127.0.0.1）")
 _server_argp.add_argument("--port", type=int, default=None,
                           help=f"Flask 监听端口（默认读 YAML/内置: 8000）")
+_server_argp.add_argument("--cpu-affinity", type=str, default=None,
+                          help="CPU 亲和性，绑定到指定逻辑核心，如 '0,1'；不设则由系统调度")
 _server_cli = _server_argp.parse_args()
 _server_props = _load_start_properties(_server_cli.config)
 
@@ -163,6 +244,11 @@ try:
 except Exception:
     _flask_port = 8000
 print(f"[server.py] Flask 监听: {_flask_host}:{_flask_port}（来源：命令行 > {_START_PROPERTIES_NAME} > 内置默认）")
+
+# CPU 亲和性（命令行 > YAML > 不设置）
+_cpu_affinity = _pick_server_prop(_server_cli.cpu_affinity, "cpu_affinity", None)
+if _cpu_affinity is not None:
+    set_cpu_affinity(str(_cpu_affinity))
 
 # config.json 只读业务字段（摄像头/预览；host/port 已迁 start_proporties.yaml）
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
