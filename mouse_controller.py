@@ -923,8 +923,10 @@ def _fast_click_sequence(x: int, y: int, select_first: bool) -> None:
     select_first=True  →  left-down, left-up, right-down, right-up  （选中目标再右键）
     select_first=False →  right-down, right-up                     （空白处空右键）
     所有事件塞在同一个 SendInput 调用里，OS 按队列顺序处理，左选与右键之间无任何 Python 层延迟。"""
-    user32 = ctypes.windll.user32
-    user32.SetCursorPos(int(x), int(y))
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    ctypes.set_last_error(0)
+    cursor_ok = bool(user32.SetCursorPos(int(x), int(y)))
+    cursor_error = 0 if cursor_ok else ctypes.get_last_error()
     flags = []
     if select_first:
         flags += [_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP]
@@ -934,7 +936,12 @@ def _fast_click_sequence(x: int, y: int, select_first: bool) -> None:
     for k, fl in enumerate(flags):
         arr[k].type = _INPUT_MOUSE
         arr[k].union.mi.dwFlags = fl
-    user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(_INPUT))
+    sent = user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(_INPUT))
+    error_code = 0 if sent == n else ctypes.get_last_error()
+    print(f"[RIGHT-SEND] SetCursorPos={'成功' if cursor_ok else '失败'} "
+          f"cursor_error={cursor_error} 点({int(x)},{int(y)}) "
+          f"select_first={select_first} 请求={n} 实发={sent}/{n} "
+          f"last_error={error_code}", flush=True)
 
 
 # ============================================================================
@@ -995,6 +1002,8 @@ class MouseController:
         #   新像素值需越过当前像素 ±0.75 才跳（对真实移动仅多 0.25px 门槛，不可感知）
         self._quant_ix: int | None = None
         self._quant_iy: int | None = None
+        self._move_diag_last_t = 0.0
+        self._move_diag_prev = None
 
     def _quantize_px(self, sx: float, sy: float) -> tuple[int, int]:
         rx, ry = int(round(sx)), int(round(sy))
@@ -1263,13 +1272,36 @@ class MouseController:
             gesture_hint: 可选，传给 smoother 做平滑的手势上下文（不决定移不移动）
         """
         # 1. 坐标映射 + 平滑（⭐ 同帧只跑 1 次：如果 move_only 之后 handle 再传同一份 cursor_anchor_norm 直接命中缓存）
-        _, _, sx, sy, ix, iy = self._eval_anchor_once(cursor_anchor_norm, gesture_hint=gesture_hint)
+        gx, gy, sx, sy, ix, iy = self._eval_anchor_once(cursor_anchor_norm, gesture_hint=gesture_hint)
         # 2. 不移动的唯二例外：FIST 或 drag_active（拖拽分支会处理 move）
         if gesture_hint == "FIST":
             return
         if self._drag_active:
             return
         self._sendinput_move_to(ix, iy)
+        # 低频有符号坐标诊断：区分图像锚点、屏幕映射、平滑和系统光标方向。
+        now = time.monotonic()
+        prev = self._move_diag_prev
+        if now - self._move_diag_last_t >= 0.5:
+            anchor_x = float(cursor_anchor_norm[0])
+            delta = "初始"
+            if prev is not None:
+                delta = (f"d_anchor={anchor_x - prev[0]:+.4f} "
+                         f"d_map={gx - prev[1]:+.1f}px d_smooth={sx - prev[2]:+.1f}px "
+                         f"d_send={ix - prev[3]:+d}px")
+            class _POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+            _pt = _POINT()
+            try:
+                _cursor = bool(ctypes.windll.user32.GetCursorPos(ctypes.byref(_pt)))
+                _cursor_xy = f"({_pt.x},{_pt.y})" if _cursor else "读取失败"
+            except Exception:
+                _cursor_xy = "读取失败"
+            print(f"[MOVE-DIAG] anchor=({anchor_x:.4f},{float(cursor_anchor_norm[1]):.4f}) "
+                  f"map=({gx:.1f},{gy:.1f}) smooth=({sx:.1f},{sy:.1f}) "
+                  f"send=({ix},{iy}) cursor={_cursor_xy} {delta}", flush=True)
+            self._move_diag_last_t = now
+            self._move_diag_prev = (anchor_x, gx, sx, ix)
 
     def handle(self, gesture: str, fingertip_norm, cursor_anchor_norm=None):
         """手势 → 鼠标事件（仅处理点击/拖拽语义；移动请先调用 move_only 保证对齐）。
@@ -1455,17 +1487,23 @@ class MouseController:
             _t0 = time.time()
             has_target, target_desc, _ = probe_ui_target(ix, iy)
             _probe_ms = (time.time() - _t0) * 1000.0
+            _send_method = "SendInput"
+            _send_error = None
             try:
                 _fast_click_sequence(ix, iy, select_first=has_target)
-            except Exception:
+            except Exception as exc:
+                _send_error = f"{type(exc).__name__}: {exc}"
+                _send_method = "PyAutoGUI-fallback"
                 try:
                     pyautogui.mouseDown(ix, iy, button="right")
                     pyautogui.mouseUp(button="right")
-                except Exception:
-                    pass
+                except Exception as fallback_exc:
+                    _send_error += f"; fallback {type(fallback_exc).__name__}: {fallback_exc}"
             _total_ms = (time.time() - _t0) * 1000.0
-            print(f"[右键] ({ix},{iy}) → {'★有目标：已选中→右键' if has_target else '○空白：直接空右键'} "
-                  f"| probe={_probe_ms:.0f}ms total={_total_ms:.0f}ms | {target_desc}", flush=True)
+            print(f"[右键执行] 点({ix},{iy}) 方法={_send_method} "
+                  f"目标={'选中后右键' if has_target else '直接右键'} "
+                  f"probe={_probe_ms:.0f}ms total={_total_ms:.0f}ms "
+                  f"说明={target_desc} 异常={_send_error or '无'}", flush=True)
             if self._drag_active:
                 try: pyautogui.mouseUp()
                 except Exception: pass
@@ -1514,29 +1552,14 @@ class MouseController:
                 except Exception: pass
             self._drag_active = False
         elif tap_event == _TE.DOUBLE_TAP:
-            # 双击窗口（0.38s）内完成第二次"勾指回弹"。
-            # ⭐ 2026-09-19 位置门控 + 2026-10-03 MSAA 同名放宽：第二击落点距挂起的第一击
-            #   ≤10px → 同一目标；10~90px 须两点下是同名 UI 元素（快窗口 0.38s 内漂移通常很小，
-            #   此处仅兜底）；否则手已移到别的目标 → click#1 补在首击位置 + 新落点普通单击。
-            _same, _d0, _why = rescue_dbl_target_decision(ix, iy, first_xy)
-            if not _same:
-                print(f"[DBL-RESCUE] 快窗口第二击 ({ix},{iy}) vs 首击"
-                      f"({int(first_xy[0])},{int(first_xy[1])}) {_why} "
-                      f"→ 两次独立click（不双击旧目标）", flush=True)
-                pyautogui.click(int(first_xy[0]), int(first_xy[1]), button="left")
-                pyautogui.click(ix, iy, button="left")
-                self._dbg_last_click_t = time.time()
-                self._dbg_last_click_xy = (ix, iy)
+            # 程序侧原子双击：第二击必须已在检测器的0.38s窗口内完成，
+            # 这里不再交给Windows拼接两次普通click。
+            # 直接在首击坐标发送doubleClick，避免手指自然间隔和漂移影响双击。
+            if first_xy is not None:
+                _tx, _ty = int(first_xy[0]), int(first_xy[1])
             else:
-                # 原子 doubleClick 落在首击像素（物理点击恰好 2 次，OS 必判双击）
-                if first_xy is not None:
-                    _tx, _ty = int(first_xy[0]), int(first_xy[1])
-                else:
-                    _tx, _ty = ix, iy
-                pyautogui.doubleClick(_tx, _ty, button="left")
-                if _d0 > RESCUE_DBL_SNAP_PX:
-                    print(f"[DBL-RESCUE] 快窗口第二击 ({ix},{iy}) vs 首击({_tx},{_ty}) {_why} "
-                          f"→ doubleClick@首击", flush=True)
+                _tx, _ty = ix, iy
+            pyautogui.doubleClick(_tx, _ty, button="left")
             if self._drag_active:
                 try: pyautogui.mouseUp()
                 except Exception: pass

@@ -74,7 +74,9 @@ GESTURE_TABLE = [
     ("POINT", (0, 1, 0, 0, 0)),   # 仅食指
     ("THUMB", (1, 0, 0, 0, 0)),   # 仅拇指
     ("FIST",  (0, 0, 0, 0, 0)),   # 握拳
-    ("OPEN",  (1, 1, 1, 1, 1)),   # 全张开
+    # ⭐ 2026-10-29 用户需求：注释五指张开(OPEN)手势逻辑（原=单手移窗/GV左键拖动，均已在
+    #   hands_tasks 注释）；全张开 ext=(1,1,1,1,1) 不再匹配任何表项 → 落到 OTHER 正常控鼠。
+    # ("OPEN",  (1, 1, 1, 1, 1)),   # 全张开
 ]
 
 
@@ -231,56 +233,60 @@ def recognize_gesture(lms, wlms=None):
 
     # 3. 距离手势：PINCH 捏合（最高优先级，距离判定）
     pinch_r = _pinch_distance(lms, palm_width)
+    # ⭐ 2026-10-29 用户需求：注释 OK 手势识别（原=拇食成圈+三指伸直 → 窗口缩放/GV拖动，
+    #   相关动作逻辑已在 hands_tasks.py 注释）。拇指-食指 TIP 捏合现改为左键点击信号
+    #   （hands_tasks 计算 pinch_bend 喂原 tap 状态机），与这里的 OK 标签无关；
+    #   深捏合时 pinch_r 很小 → 仍会落到下方 PINCH 分支（仅显示用）。
     # OK 手势捏合判定：2D 拇食指 TIP 距 / 2D 食指 PIP(6)-MCP(5) 距
     #   食指 PIP→MCP 是近节指骨，长度最稳定，不受手掌侧对镜头影响；
     #   2D 比值的分子分母同受远近缩放，比值稳定，不依赖 world 坐标。
-    pinch_pip = _pinch_index_pip_mcp(lms)
+    # pinch_pip = _pinch_index_pip_mcp(lms)
     # 捏合阈值（真机标定 2026-10-16 晚，捏定 40 帧）：OK 簇 0.26~0.37（分母近节骨稳定 0.128~0.132），
     #   过渡/张开帧 ≥0.53（上一批日志）→ 门取 0.50。旧掌宽口径侧对时 1.24~2.65 不可用，已弃用。
-    _ok_pinch_ok = pinch_pip is not None and pinch_pip < 0.50
+    # _ok_pinch_ok = pinch_pip is not None and pinch_pip < 0.50
     # 中/无名/小指 2D 弯曲度（PIP 关节角，0=直 1=弯）：真机捏定 中≤0.15/无≤0.08/小≤0.05；弯帧无≥0.36。
     #   门 0.25 = PIP 角 >135° 即算伸直。
-    _ok_three = _three_finger_bend_2d(lms)
-    _ok_mid_ok = _ok_three is not None and all(v < 0.25 for v in _ok_three)
+    # _ok_three = _three_finger_bend_2d(lms)
+    # _ok_mid_ok = _ok_three is not None and all(v < 0.25 for v in _ok_three)
 
-    # 3b. OK 手势：拇指食指成圈 + 中/无名/小三指伸直
+    # 3b. OK 手势：拇指食指成圈 + 中/无名/小三指伸直（2026-10-29 已注释）
     #   判据1：2D dist(拇TIP4,食TIP8) / dist(食PIP6,食MCP5) < 0.50（真机捏定0.26~0.37）。
     #   判据2：三指 PIP 关节 2D 弯曲度全部 < 0.25（真机捏定 中≤0.15）。就这两条，无其它门控。
     # [OK-DBG] 必须在 return 之前打（旧版打印在 return 后，成功帧永远静默，日志只剩过渡帧）
-    if pinch_pip is not None and pinch_pip < 2.5:
-        _num = float(np.linalg.norm(_p2(lms[4]) - _p2(lms[8])))
-        _den = float(np.linalg.norm(_p2(lms[6]) - _p2(lms[5])))
-        if _ok_pinch_ok and _ok_mid_ok:
-            _verdict = "OK"
-        elif not _ok_mid_ok:
-            _verdict = "非OK(三指未全伸)"
-        else:
-            _verdict = "张开"
-        print(f"[OK-DBG] 捏合比={pinch_pip:.2f}(门0.50) [TIP4-8={_num:.3f} / PIP6-MCP5={_den:.3f} "
-              f"掌宽={palm_width:.3f} 旧掌宽比={pinch_r:.2f}] 2D弯曲 中/无/小="
-              f"({_ok_three[0]:.2f},{_ok_three[1]:.2f},{_ok_three[2]:.2f})(门0.25,小=直) "
-              f"=> {_verdict}",
-              flush=True)
-    if _ok_pinch_ok and _ok_mid_ok:
-        ratios = {
-            "palm_w": round(palm_width, 4),
-            "thumb_r": round(thumb_raw, 3),
-            "index_r": round(index_r, 3),
-            "middle_r": round(middle_r, 3),
-            "ring_r": round(ring_r, 3),
-            "pinky_r": round(pinky_r, 3),
-            "pinch_r": round(pinch_r, 3),
-            "pinch_pip": round(pinch_pip, 3) if pinch_pip is not None else None,
-            "okb_m": round(_ok_three[0], 3), "okb_r": round(_ok_three[1], 3),
-            "okb_p": round(_ok_three[2], 3),
-        }
-        if _fold is not None:
-            ratios.update({"fold_t": round(_fold[0], 3), "fold_i": round(_fold[1], 3),
-                           "fold_m": round(_fold[2], 3), "fold_r": round(_fold[3], 3),
-                           "fold_p": round(_fold[4], 3)})
-        # OK 三指实际伸直，返回给下游的布尔位也置成伸直形态
-        ext_tuple = (ext_tuple[0], ext_tuple[1], 1, 1, 1)
-        return "OK", ext_tuple, ratios
+    # if pinch_pip is not None and pinch_pip < 2.5:
+    #     _num = float(np.linalg.norm(_p2(lms[4]) - _p2(lms[8])))
+    #     _den = float(np.linalg.norm(_p2(lms[6]) - _p2(lms[5])))
+    #     if _ok_pinch_ok and _ok_mid_ok:
+    #         _verdict = "OK"
+    #     elif not _ok_mid_ok:
+    #         _verdict = "非OK(三指未全伸)"
+    #     else:
+    #         _verdict = "张开"
+    #     print(f"[OK-DBG] 捏合比={pinch_pip:.2f}(门0.50) [TIP4-8={_num:.3f} / PIP6-MCP5={_den:.3f} "
+    #           f"掌宽={palm_width:.3f} 旧掌宽比={pinch_r:.2f}] 2D弯曲 中/无/小="
+    #           f"({_ok_three[0]:.2f},{_ok_three[1]:.2f},{_ok_three[2]:.2f})(门0.25,小=直) "
+    #           f"=> {_verdict}",
+    #           flush=True)
+    # if _ok_pinch_ok and _ok_mid_ok:
+    #     ratios = {
+    #         "palm_w": round(palm_width, 4),
+    #         "thumb_r": round(thumb_raw, 3),
+    #         "index_r": round(index_r, 3),
+    #         "middle_r": round(middle_r, 3),
+    #         "ring_r": round(ring_r, 3),
+    #         "pinky_r": round(pinky_r, 3),
+    #         "pinch_r": round(pinch_r, 3),
+    #         "pinch_pip": round(pinch_pip, 3) if pinch_pip is not None else None,
+    #         "okb_m": round(_ok_three[0], 3), "okb_r": round(_ok_three[1], 3),
+    #         "okb_p": round(_ok_three[2], 3),
+    #     }
+    #     if _fold is not None:
+    #         ratios.update({"fold_t": round(_fold[0], 3), "fold_i": round(_fold[1], 3),
+    #                        "fold_m": round(_fold[2], 3), "fold_r": round(_fold[3], 3),
+    #                        "fold_p": round(_fold[4], 3)})
+    #     # OK 三指实际伸直，返回给下游的布尔位也置成伸直形态
+    #     ext_tuple = (ext_tuple[0], ext_tuple[1], 1, 1, 1)
+    #     return "OK", ext_tuple, ratios
 
     # ✨ 用户反馈"捏合太严格无法触发"：阈值同步放松 原 0.18/0.28 → 现 0.25/0.40
     # 条件：捏合中等 (<0.40) 且 食指中指都有一定弯曲避免张开时误触发
