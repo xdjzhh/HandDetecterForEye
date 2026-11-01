@@ -95,6 +95,13 @@ DEFAULT_PARAMS = MODE_PARAMS["OTHER"]
 # 4) Sigmoid 响应：已通过 response_k (上) 控制，见 ARSmoother._sigmoid_gain
 # 5) 点击前位置锁定墙钟时长（防点击瞬间抖动漂移；原 3 帧 @30fps）
 CLICK_FREEZE_SEC = 0.10
+# smooth 模式粗调/精调：低速瞄准时增强稳定，高速移动时恢复跟手。
+SMOOTH_PRECISION_ENTER_PX = 5.0
+SMOOTH_PRECISION_EXIT_PX = 18.0
+SMOOTH_PRECISION_ENTER_FRAMES = 4
+SMOOTH_PRECISION_EXIT_FRAMES = 2
+SMOOTH_PRECISION_DEADZONE_PX = 3.0
+SMOOTH_PRECISION_MEDIAN_WINDOW = 5
 
 # cursor 模式
 CURSOR_MODE_SMOOTH   = "smooth"    # 当前 AR 5 层平滑（悬停稳、但有滞后）
@@ -251,7 +258,18 @@ class ARSmoother:
         self._locked_x: float | None = None
         self._locked_y: float | None = None
         self._last_params = DEFAULT_PARAMS
-        # 点击前冻结（两种模式都生效；墙钟截止时刻 monotonic）
+        self._smooth_precision = False
+        self._smooth_enter_count = 0
+        self._smooth_exit_count = 0
+        self._smooth_precision_buf_x: deque[float] = deque(maxlen=SMOOTH_PRECISION_MEDIAN_WINDOW)
+        self._smooth_precision_buf_y: deque[float] = deque(maxlen=SMOOTH_PRECISION_MEDIAN_WINDOW)
+        # smooth 模式粗调/精调诊断
+        self._diag_precision_frames = 0
+        self._diag_coarse_frames = 0
+        self._diag_precision_enters = 0
+        self._diag_precision_exits = 0
+        self._diag_precision_prev = False
+
         self._freeze_x: float | None = None
         self._freeze_y: float | None = None
         self._freeze_until: float = 0.0
@@ -324,6 +342,10 @@ class ARSmoother:
             "unl_dist_p90": round(self._pct(d, 0.90), 2),
             "unl_trend_max": round(max(self._diag_unl_trend) if self._diag_unl_trend else 0.0, 2),
             "unl_std_avg": round(sum(self._diag_unl_std) / max(1, len(self._diag_unl_std)), 2),
+            "precision_pct": round(100.0 * self._diag_precision_frames / max(1, n), 0),
+            "coarse_pct": round(100.0 * self._diag_coarse_frames / max(1, n), 0),
+            "precision_enters": self._diag_precision_enters,
+            "precision_exits": self._diag_precision_exits,
         }
         self._diag_raw_d.clear()
         self._diag_out_d.clear()
@@ -333,6 +355,10 @@ class ARSmoother:
         self._diag_unl_dist.clear()
         self._diag_unl_trend.clear()
         self._diag_unl_std.clear()
+        self._diag_precision_frames = 0
+        self._diag_coarse_frames = 0
+        self._diag_precision_enters = 0
+        self._diag_precision_exits = 0
         return snap
 
 
@@ -373,6 +399,16 @@ class ARSmoother:
         self._abs_ema_x = None
         self._abs_ema_y = None
         self._euro.reset()
+        self._smooth_precision = False
+        self._smooth_enter_count = 0
+        self._smooth_exit_count = 0
+        self._smooth_precision_buf_x.clear()
+        self._smooth_precision_buf_y.clear()
+        self._diag_precision_frames = 0
+        self._diag_coarse_frames = 0
+        self._diag_precision_enters = 0
+        self._diag_precision_exits = 0
+        self._diag_precision_prev = False
         self._locked_x = None
         self._locked_y = None
         self._last_out_x = None
@@ -660,17 +696,50 @@ class ARSmoother:
         if self._last_out_x is None:
             ox, oy = float(ex), float(ey)
         else:
-            dx = ex - self._last_out_x
-            dy = ey - self._last_out_y
+            # 精调阶段使用独立鲁棒中值，避免单帧 landmark 飞点改变瞄准位置。
+            if self._smooth_precision:
+                self._smooth_precision_buf_x.append(float(ex))
+                self._smooth_precision_buf_y.append(float(ey))
+                ex_used = float(np.median(self._smooth_precision_buf_x))
+                ey_used = float(np.median(self._smooth_precision_buf_y))
+            else:
+                self._smooth_precision_buf_x.clear()
+                self._smooth_precision_buf_y.clear()
+                ex_used, ey_used = float(ex), float(ey)
+            dx = ex_used - self._last_out_x
+            dy = ey_used - self._last_out_y
             dist = float(np.hypot(dx, dy))
-            # 死区叠加：非常小的位移直接归零
-            if dist <= deadzone_px:
-                gain = 0.0
+            if dist <= SMOOTH_PRECISION_ENTER_PX:
+                self._smooth_enter_count += 1
+                self._smooth_exit_count = 0
+                if self._smooth_enter_count >= SMOOTH_PRECISION_ENTER_FRAMES:
+                    self._smooth_precision = True
+            elif dist >= SMOOTH_PRECISION_EXIT_PX:
+                self._smooth_exit_count += 1
+                self._smooth_enter_count = 0
+                if self._smooth_exit_count >= SMOOTH_PRECISION_EXIT_FRAMES:
+                    self._smooth_precision = False
+            else:
+                self._smooth_enter_count = 0
+                self._smooth_exit_count = 0
+            if self._smooth_precision != self._diag_precision_prev:
+                if self._smooth_precision:
+                    self._diag_precision_enters += 1
+                else:
+                    self._diag_precision_exits += 1
+                self._diag_precision_prev = self._smooth_precision
+            if self._smooth_precision:
+                self._diag_precision_frames += 1
+            else:
+                self._diag_coarse_frames += 1
+            active_deadzone = (SMOOTH_PRECISION_DEADZONE_PX
+                               if self._smooth_precision else deadzone_px)
+            if dist <= active_deadzone:
+                ox, oy = float(self._last_out_x), float(self._last_out_y)
             else:
                 gain = self._sigmoid_gain(dist, response_k)
-            # 新目标 = 上次输出 + 经过 sigmoid gain 缩放后的 delta
-            ox = float(self._last_out_x + dx * gain)
-            oy = float(self._last_out_y + dy * gain)
+                ox = float(self._last_out_x + dx * gain)
+                oy = float(self._last_out_y + dy * gain)
 
         self._last_out_x, self._last_out_y = ox, oy
         return ox, oy
