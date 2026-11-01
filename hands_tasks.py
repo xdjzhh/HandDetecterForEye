@@ -2341,7 +2341,8 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
             #   观测上有意义的引用已同步改读 pinch_bend。
             index_bend: float | None = None
             pinch_bend: float | None = None   # 拇食TIP距/掌宽（3D优先2D兜底）：高=张开 低=捏合
-            thumb_middle_tip_distance: float | None = None  # 拇指TIP4-中指TIP12距/掌宽：高=张开 低=接近
+            thumb_middle_tip_distance: float | None = None  # 拇指TIP4-中指TIP12距/dist(MCP2拇指根,MCP9中指根)：高=张开 低=接近
+            run_loop._right_denom_dbg = None                 # 每帧先清空：无控鼠手帧不留上帧过期分母
             _bend_none_reason: str | None = None  # 诊断：本帧 bend=None 归因（palm=掌宽过小 / curl=食指卷曲遮蔽）；None=正常有值或无控鼠手
             _long_ev: dict | None = None          # 3D观测数据，仅用于日志，不参与手势判定
             two_finger_bend: float | None = None  # 双指右键：双指单元合成伸直度（四关节中点，0.20弯~0.88直）
@@ -2468,14 +2469,32 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                                 _d48 = float(np.linalg.norm(
                                     np.array([lms[4].x, lms[4].y]) - np.array([lms[8].x, lms[8].y])))
                                 pinch_bend = _d48 / denom
-                            # 拇指TIP(4)-中指TIP(12)距离：优先 world 3D，缺失时用 2D，统一除以掌宽。
-                            if _wl_pinch is not None and len(_wl_pinch) >= 18 and _pw3 > 1e-6:
-                                _p12w = np.array([_wl_pinch[12].x, _wl_pinch[12].y, _wl_pinch[12].z], dtype=np.float64)
-                                thumb_middle_tip_distance = float(np.linalg.norm(_p4w - _p12w)) / _pw3
-                            else:
+                            # ⭐ 2026-11-02 拇指TIP(4)-中指TIP(12)距离：优先 world 3D，缺失用 2D；
+                            #   分母换 dist(MCP2拇指根, MCP9中指根)（用户定位：侧面视角掌宽归一化失效）。
+                            #   旧分母=掌宽 dist(MCP5,MCP17)：拇中对捏时手掌侧转，食指-小指根连线透视
+                            #   缩短/估计漂移 → 真机 base 从 1.6 漂到 3.9（分母塌缩 2 倍+），
+                            #   0.60 触碰门的绝对尺度跟着漂 → 大量真捏合 raw 谷底压不进门 → 右键未生效。
+                            #   MCP2/MCP9 正是对捏两条手指的根部，对捏全程两者相对姿态基本不变，
+                            #   拇指同一来源的估计误差在分子(TIP4)/分母(MCP2)中同向部分抵消 → 视角稳定。
+                            #   量级与掌宽接近（张开≈1.3~1.7、指尖相触≈0.15~0.35）→ 触碰门 0.60 无需改。
+                            _right_denom_dbg = None
+                            if _wl_pinch is not None and len(_wl_pinch) >= 18:
+                                _p2w = np.array([_wl_pinch[2].x, _wl_pinch[2].y, _wl_pinch[2].z], dtype=np.float64)
+                                _p9w = np.array([_wl_pinch[9].x, _wl_pinch[9].y, _wl_pinch[9].z], dtype=np.float64)
+                                _pm29 = float(np.linalg.norm(_p2w - _p9w))
+                                if _pm29 > 1e-6:
+                                    _p12w = np.array([_wl_pinch[12].x, _wl_pinch[12].y, _wl_pinch[12].z], dtype=np.float64)
+                                    thumb_middle_tip_distance = float(np.linalg.norm(_p4w - _p12w)) / _pm29
+                                    _right_denom_dbg = _pm29
+                            if thumb_middle_tip_distance is None:
                                 _d4_12 = float(np.linalg.norm(
                                     np.array([lms[4].x, lms[4].y]) - np.array([lms[12].x, lms[12].y])))
-                                thumb_middle_tip_distance = _d4_12 / denom
+                                _d2_9 = float(np.linalg.norm(
+                                    np.array([lms[2].x, lms[2].y]) - np.array([lms[9].x, lms[9].y])))
+                                _d2_9 = _d2_9 if _d2_9 > 1e-6 else denom
+                                thumb_middle_tip_distance = _d4_12 / _d2_9
+                                _right_denom_dbg = _d2_9
+                            run_loop._right_denom_dbg = _right_denom_dbg
                             # ⭐⭐ 2026-10-29 捏合 vs 食指卷曲 鉴别门 v2（双特征 AND，真机两轮迭代）：
                             #   v1 单用 PIP 角误伤真捏合：真机日志 [TAP-SEG] 长按段内
                             #   None5帧[食指卷曲遮蔽4]——真捏合段大半帧被遮蔽 → 冻结
@@ -2652,8 +2671,11 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                 #     → 冻结 freeze_for_click() 和 tap_event=1/2/3/4 时 click/long-press drag 都点到了错位的位置 → 用户感知"点不到 / 完全混乱"
                 anchor_norm = HandDetector.cursor_anchor_from_landmarks(lms, args.anchor)
                 # 走 _eval_anchor_once：如果 move_only() 已经在本帧跑过同 anchor_norm → 缓存命中，smoother 不再二次更新
-                _, _, sx, sy, _, _ = mouse._eval_anchor_once(anchor_norm, gesture_hint=None)
-                right_screen_pt = (float(sx), float(sy))
+                # ⭐ 2026-11-02 必须取 (ix, iy)（量化+窗口角磁吸后的真实光标位置），不能取平滑值 (sx, sy)：
+                #   磁吸锁定时光标显示在吸附点、平滑值却还差几十px，mouseDown/click 用平滑值落点
+                #   会点在窗口外/别的窗口上（真机：长按缩放角"跳转到下层窗口"、缩放完全无效）。
+                _, _, _sx_dbg, _sy_dbg, ix, iy = mouse._eval_anchor_once(anchor_norm, gesture_hint=None)
+                right_screen_pt = (float(ix), float(iy))
 
                 # ---- 3D 姿态观测（仅用于日志，不参与长按、点击或释放判定） ----
                 #   world 缺失时不影响长按；检测器只按捏合持续时间转换长按。
@@ -2755,8 +2777,10 @@ def run_loop(components, camera_id=0, stop_event=None, preview=True, status_stor
                     if _rt_now - getattr(run_loop, "_right_dbg_t", 0.0) >= 0.5:
                         run_loop._right_dbg_t = _rt_now
                         _rm = right_tap_detector.metrics()
+                        _rdenom = getattr(run_loop, "_right_denom_dbg", None)
                         print(
                             f"[RIGHT-DBG] input={None if thumb_middle_tip_distance is None else round(float(thumb_middle_tip_distance), 3)} "
+                            f"denom={None if _rdenom is None else round(float(_rdenom), 3)} "
                             f"raw={_rm['raw']} base={_rm['baseline']} ratio={_rm['ratio']} "
                             f"Σ下={_rm['di_sum_down']:.3f} state={_rm['state']} event={right_tap_event}",
                             flush=True)

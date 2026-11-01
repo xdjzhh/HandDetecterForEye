@@ -64,12 +64,15 @@ DEFAULT_ROI_OFFSET_Y = 0.62  # ✨ 2026-08-25 组合根治B1：从0.50下移至0
 ROI_OFFSET_Y_MIN = -1.0
 ROI_OFFSET_Y_MAX = +1.0
 
-# ---------------- AR Smoother 5 层参数 ----------------
-# 1) 滑动中值窗口
-MEDIAN_WINDOW = 5
-# 2) 静止方差锁：近 N 帧屏幕像素位移的协方差 (px^2) 低于此值 → 锁死光标不动
-#   smooth 模式允许更长观察窗：用更多帧确认是生理性微动，而不是短暂的真实移动。
-LOCK_WINDOW = 12
+# ---------------- AR Smoother 5 层参数（⭐ 2026-11-01 全墙钟化：彻底消除帧率影响）----------------
+# 1) 滑动中值窗口：旧 MEDIAN_WINDOW=5 按帧数设计，30fps=167ms 但真机 7~15fps 下时长
+#    翻倍到 0.33~0.71s（卡顿来源之一）。改恒定 0.20s 时间窗，窗口物理时长与帧率无关。
+MEDIAN_SEC = 0.20
+# 2) 静止方差锁：近窗屏幕像素位移的协方差 (px^2) 低于阈值 → 锁死光标不动。
+#    旧 LOCK_WINDOW=8 帧（15fps=0.53s、7fps=1.14s 帧率翻倍时长也翻倍）。改恒定 0.50s。
+#    样本不足 LOCK_MIN_SAMPLES 时不锁（宁可不锁也不误锁）。
+LOCK_SEC = 0.50
+LOCK_MIN_SAMPLES = 3
 #  不同模式下的锁死阈值 (px^2)，越大=越容易锁死=越稳
 LOCK_THRESH_HOVER  = 5.0       # POINT 悬停：约 2px 级二维微动仍视为静止
 LOCK_THRESH_BROWSE = 6.0       # OPEN 浏览：抑制小幅生理抖动，同时保留真实移动解锁空间
@@ -80,7 +83,8 @@ LOCK_THRESH_DRAG   = 99999.0   # （保留兼容定义，但 FIST 不再用于�
 MODE_PARAMS = {
     # 手势名    (fc_min_Hz, beta,  deadzone_px, response_k)
     # response_k 降低后，3~8px 的微动不会快速获得接近 1 的增益；大范围移动仍会逐步放行。
-    "POINT":  (0.30,  0.0040, 3.5, 0.35),  # 悬停：允许延迟，优先抑制生理性微动
+    "POINT":  (0.85,  0.0080, 3.0, 0.45),  # ⭐ 2026-11-01 降滞后：fc_min 0.30→0.85（τ 530ms→190ms）、beta×2。
+                                           #   旧 0.30 在真机 7~15fps 下叠加增量式输出 = 光标追平要 1~2s（用户反馈"非常卡顿"）
     "OPEN":   (0.80,  0.0100, 2.0, 0.45),  # 浏览：比悬停灵敏，但仍抑制小幅抖动
     # ✨ 用户要求：FIST = 取消所有指令（不再用于拖拽），因此参数用 OTHER 中性（实际 FIST 分支不触发任何动作，参数只是占位避免 KeyError）
     "FIST":   (1.00,  0.0150, 2.0, 0.50),
@@ -96,12 +100,24 @@ DEFAULT_PARAMS = MODE_PARAMS["OTHER"]
 # 5) 点击前位置锁定墙钟时长（防点击瞬间抖动漂移；原 3 帧 @30fps）
 CLICK_FREEZE_SEC = 0.10
 # smooth 模式粗调/精调：低速瞄准时增强稳定，高速移动时恢复跟手。
+# ⭐ 2026-11-01 全墙钟化：进入/退出用段计时（非帧计数）、精调中值用时间窗，
+#   物理时长恒定，7~30fps 行为完全一致。
 SMOOTH_PRECISION_ENTER_PX = 5.0
-SMOOTH_PRECISION_EXIT_PX = 18.0
-SMOOTH_PRECISION_ENTER_FRAMES = 4
-SMOOTH_PRECISION_EXIT_FRAMES = 2
+SMOOTH_PRECISION_EXIT_PX = 12.0
+SMOOTH_PRECISION_ENTER_SEC = 0.25    # 持续低速 0.25s → 进入精调
+SMOOTH_PRECISION_EXIT_SEC = 0.15    # 持续高速 0.15s → 退出精调
 SMOOTH_PRECISION_DEADZONE_PX = 3.0
-SMOOTH_PRECISION_MEDIAN_WINDOW = 5
+SMOOTH_PRECISION_MEDIAN_SEC = 0.15   # 精调中值时间窗
+SMOOTH_PRECISION_MEDIAN_MIN_SAMPLES = 2
+# ⭐ 2026-11-02 精调锁定迟滞（无法锁定窗口右下角缩放箭头的根因修复）：
+#   旧 Layer 2 静止锁只看方差（POINT 5.0px²）：真机静瞄 σ≈2.15px → var_x+var_y≈9+ 永远入不了锁
+#   → 精调时光标只剩 0.22~0.6 的 Sigmoid 增益压制生理性慢偏移 = 低速爬行漂移，锁不住小目标。
+#   精调专属锁（照搬 absolute 静止锁 2026-10-02 真机迟滞教训）：
+#     ① 入锁阈值放宽 25px²（σ≈3.5px 级生理性晃动也能钉住）；
+#     ② 锁定后不看方差、只看【锁窗均值 vs 锁点】定向漂移 >4px 才解锁——
+#        双向生理晃动均值不漂=保持钉死；真实定向移动均值必漂=果断放行再调再锁。
+SMOOTH_PRECISION_LOCK_THRESH = 25.0
+SMOOTH_PRECISION_UNLOCK_PX = 4.0
 
 # cursor 模式
 CURSOR_MODE_SMOOTH   = "smooth"    # 当前 AR 5 层平滑（悬停稳、但有滞后）
@@ -249,20 +265,20 @@ class _TwoEuroFilter2D:
 class ARSmoother:
     def __init__(self, mode: str = CURSOR_MODE_SMOOTH):
         self._mode = mode
-        self._median_buf_x: deque[float] = deque(maxlen=MEDIAN_WINDOW)
-        self._median_buf_y: deque[float] = deque(maxlen=MEDIAN_WINDOW)
-        self._lock_buf_x:   deque[float] = deque(maxlen=LOCK_WINDOW)
-        self._lock_buf_y:   deque[float] = deque(maxlen=LOCK_WINDOW)
+        # ⭐ 2026-11-01 墙钟时间窗历史：deque[(t, x, y)]，按 monotonic 时间戳剔除过期样本，
+        #   窗口物理时长恒定，不受帧率影响（替代旧按帧数 maxlen 的 deque）
+        self._median_hist: deque[tuple[float, float, float]] = deque()   # Layer 1 中值窗（MEDIAN_SEC）
+        self._lock_hist:   deque[tuple[float, float, float]] = deque()   # Layer 2 静止锁窗（LOCK_SEC）
         self._euro = _TwoEuroFilter2D(fc_min=DEFAULT_PARAMS[0], beta=DEFAULT_PARAMS[1])
         # 锁死时光标位置（smooth 模式 Layer 2）
         self._locked_x: float | None = None
         self._locked_y: float | None = None
         self._last_params = DEFAULT_PARAMS
         self._smooth_precision = False
-        self._smooth_enter_count = 0
-        self._smooth_exit_count = 0
-        self._smooth_precision_buf_x: deque[float] = deque(maxlen=SMOOTH_PRECISION_MEDIAN_WINDOW)
-        self._smooth_precision_buf_y: deque[float] = deque(maxlen=SMOOTH_PRECISION_MEDIAN_WINDOW)
+        # 精调状态机：连续低速/高速【段起始时刻】（None=当前不在该段），帧率无关
+        self._smooth_low_since: float | None = None
+        self._smooth_high_since: float | None = None
+        self._smooth_precision_hist: deque[tuple[float, float, float]] = deque()  # 精调中值窗
         # smooth 模式粗调/精调诊断
         self._diag_precision_frames = 0
         self._diag_coarse_frames = 0
@@ -391,8 +407,7 @@ class ARSmoother:
             self._freeze_until = time.monotonic() + CLICK_FREEZE_SEC
 
     def reset(self):
-        for b in (self._median_buf_x, self._median_buf_y,
-                  self._lock_buf_x,   self._lock_buf_y,
+        for b in (self._median_hist, self._lock_hist, self._smooth_precision_hist,
                   self._abs_buf_x,    self._abs_buf_y,
                   self._abs_lock_buf_x, self._abs_lock_buf_y):
             b.clear()
@@ -400,10 +415,8 @@ class ARSmoother:
         self._abs_ema_y = None
         self._euro.reset()
         self._smooth_precision = False
-        self._smooth_enter_count = 0
-        self._smooth_exit_count = 0
-        self._smooth_precision_buf_x.clear()
-        self._smooth_precision_buf_y.clear()
+        self._smooth_low_since = None
+        self._smooth_high_since = None
         self._diag_precision_frames = 0
         self._diag_coarse_frames = 0
         self._diag_precision_enters = 0
@@ -652,20 +665,25 @@ class ARSmoother:
             self._last_out_x, self._last_out_y = ox, oy
             return ox, oy
 
-        # ===== Layer 1: 滑动中值（杀 1~2 帧 MediaPipe 尖峰）=====
-        self._median_buf_x.append(float(raw_x))
-        self._median_buf_y.append(float(raw_y))
-        # 求中值（窗口不满时用平均，等价）
-        if len(self._median_buf_x) < MEDIAN_WINDOW:
-            mx = sum(self._median_buf_x) / len(self._median_buf_x)
-            my = sum(self._median_buf_y) / len(self._median_buf_y)
+        # ===== Layer 1: 滑动中值（墙钟时间窗：杀 1~2 帧 MediaPipe 尖峰，时长帧率无关）=====
+        now_mono = time.monotonic()
+        self._median_hist.append((now_mono, float(raw_x), float(raw_y)))
+        while len(self._median_hist) > 1 and self._median_hist[0][0] < now_mono - MEDIAN_SEC:
+            self._median_hist.popleft()
+        _mxs = [s[1] for s in self._median_hist]
+        _mys = [s[2] for s in self._median_hist]
+        # 窗口未满（低帧率热身）→ 用样本均值（等价旧热身行为）；样本=1 时中值即该样本
+        if len(_mxs) >= 3:
+            mx = float(np.median(_mxs))
+            my = float(np.median(_mys))
         else:
-            mx = float(np.median(self._median_buf_x))
-            my = float(np.median(self._median_buf_y))
+            mx = sum(_mxs) / len(_mxs)
+            my = sum(_mys) / len(_mys)
 
-        # ===== Layer 2: 静止方差锁（8 帧不动 → 直接锁死）=====
-        self._lock_buf_x.append(mx)
-        self._lock_buf_y.append(my)
+        # ===== Layer 2: 静止方差锁（墙钟时间窗：近 LOCK_SEC 秒不动 → 锁死）=====
+        self._lock_hist.append((now_mono, mx, my))
+        while len(self._lock_hist) > 1 and self._lock_hist[0][0] < now_mono - LOCK_SEC:
+            self._lock_hist.popleft()
         lock_thresh = {
             "POINT": LOCK_THRESH_HOVER,
             "OPEN":  LOCK_THRESH_BROWSE,
@@ -674,21 +692,40 @@ class ARSmoother:
         }.get(gesture if gesture else "OTHER", LOCK_THRESH_BROWSE)
 
         locked_now = False
-        if len(self._lock_buf_x) >= LOCK_WINDOW:
-            var_x = float(np.var(self._lock_buf_x))
-            var_y = float(np.var(self._lock_buf_y))
-            if (var_x + var_y) < lock_thresh:
+        if len(self._lock_hist) >= LOCK_MIN_SAMPLES:
+            _lxs = [s[1] for s in self._lock_hist]
+            _lys = [s[2] for s in self._lock_hist]
+            var_x = float(np.var(_lxs))
+            var_y = float(np.var(_lys))
+            # ⭐ 2026-11-02 精调专属锁定迟滞：入锁阈值放宽 + 定向均值漂移解锁。
+            #   _smooth_precision 是上一帧状态（Layer 2 先于 Layer 3/4 执行），一帧滞后可接受。
+            if self._smooth_precision:
+                if self._locked_x is not None:
+                    # 已锁：只看锁窗均值 vs 锁点的定向漂移（不看方差——
+                    # 双向生理晃动方差高但均值不漂=保持钉死；定向移动均值必漂=解锁放行）
+                    _mcx = sum(_lxs) / len(_lxs)
+                    _mcy = sum(_lys) / len(_lys)
+                    if float(np.hypot(_mcx - self._locked_x,
+                                      _mcy - self._locked_y)) <= SMOOTH_PRECISION_UNLOCK_PX:
+                        locked_now = True
+                elif (var_x + var_y) < SMOOTH_PRECISION_LOCK_THRESH:
+                    # 入锁：锚定锁窗均值（晃动中心，而非晃动瞬时极值）
+                    self._locked_x = float(sum(_lxs) / len(_lxs))
+                    self._locked_y = float(sum(_lys) / len(_lys))
+                    locked_now = True
+            elif (var_x + var_y) < lock_thresh:
                 locked_now = True
                 if self._locked_x is None:
                     self._locked_x = mx
                     self._locked_y = my
+            if locked_now:
                 # 用锁死值替换中值输出
                 mx, my = float(self._locked_x), float(self._locked_y)
         if not locked_now:
             self._locked_x = None
             self._locked_y = None
 
-        # ===== Layer 3: 1€ Filter（速度自适应平滑）=====
+        # ===== Layer 3: 1€ Filter（速度自适应平滑，内部已按 dt 墙钟自适应）=====
         t = time.time()
         ex, ey = self._euro.apply(mx, my, t)
 
@@ -696,32 +733,45 @@ class ARSmoother:
         if self._last_out_x is None:
             ox, oy = float(ex), float(ey)
         else:
-            # 精调阶段使用独立鲁棒中值，避免单帧 landmark 飞点改变瞄准位置。
-            if self._smooth_precision:
-                self._smooth_precision_buf_x.append(float(ex))
-                self._smooth_precision_buf_y.append(float(ey))
-                ex_used = float(np.median(self._smooth_precision_buf_x))
-                ey_used = float(np.median(self._smooth_precision_buf_y))
+            # ⭐ 进入/退出精调判定用【原始 1€ 输出】距离 + 墙钟段计时：
+            #   中值只作用于精调位置输出，不拖住状态切换；段计时使进入/退出
+            #   物理时长恒定（持续低速 ENTER_SEC / 持续高速 EXIT_SEC），帧率无关。
+            raw_dist = float(np.hypot(ex - self._last_out_x, ey - self._last_out_y))
+            if raw_dist <= SMOOTH_PRECISION_ENTER_PX:
+                self._smooth_high_since = None
+                if self._smooth_low_since is None:
+                    self._smooth_low_since = now_mono
+                if now_mono - self._smooth_low_since >= SMOOTH_PRECISION_ENTER_SEC:
+                    self._smooth_precision = True
+            elif raw_dist >= SMOOTH_PRECISION_EXIT_PX:
+                self._smooth_low_since = None
+                if self._smooth_high_since is None:
+                    self._smooth_high_since = now_mono
+                if now_mono - self._smooth_high_since >= SMOOTH_PRECISION_EXIT_SEC:
+                    self._smooth_precision = False
             else:
-                self._smooth_precision_buf_x.clear()
-                self._smooth_precision_buf_y.clear()
+                self._smooth_low_since = None
+                self._smooth_high_since = None
+            if self._smooth_precision:
+                # 精调中值：墙钟时间窗（SMOOTH_PRECISION_MEDIAN_SEC），样本不足时退化均值
+                self._smooth_precision_hist.append((now_mono, float(ex), float(ey)))
+                while len(self._smooth_precision_hist) > 1 and \
+                        self._smooth_precision_hist[0][0] < now_mono - SMOOTH_PRECISION_MEDIAN_SEC:
+                    self._smooth_precision_hist.popleft()
+                _pxs = [s[1] for s in self._smooth_precision_hist]
+                _pys = [s[2] for s in self._smooth_precision_hist]
+                if len(_pxs) >= SMOOTH_PRECISION_MEDIAN_MIN_SAMPLES:
+                    ex_used = float(np.median(_pxs))
+                    ey_used = float(np.median(_pys))
+                else:
+                    ex_used = sum(_pxs) / len(_pxs)
+                    ey_used = sum(_pys) / len(_pys)
+            else:
+                self._smooth_precision_hist.clear()
                 ex_used, ey_used = float(ex), float(ey)
             dx = ex_used - self._last_out_x
             dy = ey_used - self._last_out_y
             dist = float(np.hypot(dx, dy))
-            if dist <= SMOOTH_PRECISION_ENTER_PX:
-                self._smooth_enter_count += 1
-                self._smooth_exit_count = 0
-                if self._smooth_enter_count >= SMOOTH_PRECISION_ENTER_FRAMES:
-                    self._smooth_precision = True
-            elif dist >= SMOOTH_PRECISION_EXIT_PX:
-                self._smooth_exit_count += 1
-                self._smooth_enter_count = 0
-                if self._smooth_exit_count >= SMOOTH_PRECISION_EXIT_FRAMES:
-                    self._smooth_precision = False
-            else:
-                self._smooth_enter_count = 0
-                self._smooth_exit_count = 0
             if self._smooth_precision != self._diag_precision_prev:
                 if self._smooth_precision:
                     self._diag_precision_enters += 1
@@ -1027,6 +1077,33 @@ def _fast_click_sequence(x: int, y: int, select_first: bool) -> None:
 
 
 # ============================================================================
+# ⭐ 2026-11-02 窗口右下角磁吸（缩放箭头锁定方案）
+#   背景：屏幕右下角 = 掌心顶到 ROI 极端角落，MediaPipe 在画面边缘/侧视下 landmark
+#   噪声远超生理晃动（±10px+ 屏幕级），精调锁（25px²）也压不住 → 缩放箭头(~13px
+#   热区)完全无法锁定。
+#   方案：不硬扛输入噪声，改"目标吸附"——smooth 精调中光标靠近前台窗口右下角
+#   ≤32px 时直接钉到缩放热区中心 (right-3, bottom-3)，迟滞 >50px 才解除。
+#   在吸附点捏合 → 左键正好落在箭头上 → OS 抓住缩放手柄 → 拖拽即缩放。
+#   排除：OPEN(移动窗口)/FIST(取消)/拖拽中（拖拽时光标必须自由跟随，否则缩放冻结）/
+#        最大化窗口（无缩放语义）。
+_CORNER_SNAP_ENTER_PX   = 32.0
+_CORNER_SNAP_RELEASE_PX = 50.0
+_CORNER_SNAP_POLL_SEC   = 0.10
+
+def _foreground_resize_corner():
+    """前台窗口未最大化时返回其右下角缩放热区中心 (x, y)；最大化/取不到返回 None。"""
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if not hwnd or ctypes.windll.user32.IsZoomed(hwnd):
+            return None
+        rc = wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+            return None
+        return float(rc.right - 3), float(rc.bottom - 3)
+    except Exception:
+        return None
+
+
 class MouseController:
     def __init__(self, screen_size=None, cursor_mode: str = CURSOR_MODE_SMOOTH,
                  roi_scale: float = DEFAULT_ROI_SCALE,
@@ -1086,6 +1163,9 @@ class MouseController:
         self._quant_iy: int | None = None
         self._move_diag_last_t = 0.0
         self._move_diag_prev = None
+        # ⭐ 2026-11-02 窗口右下角磁吸状态（缩放箭头锁定，见 _apply_corner_snap）
+        self._corner_snap_pt: tuple[float, float] | None = None
+        self._corner_snap_poll_t: float = 0.0
 
     def _quantize_px(self, sx: float, sy: float) -> tuple[int, int]:
         rx, ry = int(round(sx)), int(round(sy))
@@ -1103,6 +1183,41 @@ class MouseController:
             qy = ry
         self._quant_ix, self._quant_iy = qx, qy
         return qx, qy
+
+    def _apply_corner_snap(self, sx: float, sy: float, ix: int, iy: int,
+                           gesture_hint: str | None):
+        """smooth 精调中把光标吸附到前台窗口右下角缩放热区（迟滞解除）。
+
+        move_only 与 handle 共用 _eval_anchor_once → 点击坐标同样落在吸附点。
+        """
+        # 拖拽中必须关磁吸：缩放拖拽时光标钉在旧角点 → 窗口角追不上光标 = 缩放冻结。
+        if (self._drag_active or gesture_hint in ("OPEN", "FIST")):
+            self._corner_snap_pt = None
+            return ix, iy
+        pt = self._corner_snap_pt
+        if pt is not None:
+            # 已吸附：不再要求保持精调——ROI 极端角落噪声会打断精调状态
+            # （raw_dist≥12px 持续 0.15s 即退出），若吸附依赖精调，长按确认的
+            # 0.733s 内一被打断光标就飞离角点（真机：无法缩放、长按移动脱锁）。
+            # 只看迟滞距离解除（迟滞防边界抖动）。
+            if float(np.hypot(sx - pt[0], sy - pt[1])) > _CORNER_SNAP_RELEASE_PX:
+                self._corner_snap_pt = None
+            else:
+                return int(round(pt[0])), int(round(pt[1]))
+        # 入锁仍要求精调：避免正常快速移动途中误吸附窗口角
+        if not getattr(self._smoother, "_smooth_precision", False):
+            return ix, iy
+        now = time.monotonic()
+        if now - self._corner_snap_poll_t < _CORNER_SNAP_POLL_SEC:
+            return ix, iy
+        self._corner_snap_poll_t = now
+        corner = _foreground_resize_corner()
+        if corner is None:
+            return ix, iy
+        if float(np.hypot(sx - corner[0], sy - corner[1])) <= _CORNER_SNAP_ENTER_PX:
+            self._corner_snap_pt = corner
+            return int(round(corner[0])), int(round(corner[1]))
+        return ix, iy
 
     # ---------------- 外部：ROI / cursor 模式切换 ----------------
     def set_roi_scale(self, roi_scale: float):
@@ -1239,6 +1354,9 @@ class MouseController:
             gx, gy = self.last_screen_px
             sx, sy = self.last_smoothed_px
             ix, iy = self._quantize_px(sx, sy)
+            # ⭐ 2026-11-02 窗口角磁吸（缓存命中路径也要过：同帧 move_only/handle 共用吸附点）
+            if self.cursor_mode == CURSOR_MODE_SMOOTH:
+                ix, iy = self._apply_corner_snap(sx, sy, ix, iy, gesture_hint)
             return gx, gy, sx, sy, ix, iy
         # 缓存未命中 → 实际执行映射 + 平滑一次 → 写缓存
         gx, gy = self._norm_to_screen(nx, ny)
@@ -1254,6 +1372,9 @@ class MouseController:
         self.last_screen_px   = (float(gx), float(gy))
         self.last_smoothed_px = (float(sx), float(sy))
         ix, iy = self._quantize_px(float(sx), float(sy))
+        # ⭐ 2026-11-02 窗口角磁吸（主路径）：点击与移动共用同一吸附点
+        if self.cursor_mode == CURSOR_MODE_SMOOTH:
+            ix, iy = self._apply_corner_snap(sx, sy, ix, iy, gesture_hint)
         return float(gx), float(gy), float(sx), float(sy), ix, iy
 
     def invalidate_anchor_cache(self):

@@ -134,16 +134,21 @@ POST_NONE_CONFIRM_WINDOW = 0.35
 POST_NONE_CONFIRM_FRAMES = 3
 # ⭐ 单击/双击判定（程序侧原子双击）：
 #   第一次 Tap 松开后不立即单击，进入 WAIT_DBL：
-#     · 0.38s 窗口内完成第二次 Tap → DOUBLE_TAP，只发一次原子 doubleClick
+#     · TREND_WAIT_SEC(0.18s) 内无二次下弯趋势 → 立即补发单击（单击快速反应，不干等窗口）
+#     · 有趋势 → 0.38s 窗口内完成第二次 Tap → DOUBLE_TAP，只发一次原子 doubleClick
 #     · 超过 0.38s 未完成第二击 → 补发 TAP_CLICK，后续动作不再配对为本次双击
-#   趋势探测只用于确认第二击意图，不延长 0.38s 总窗口，也不直接发送事件。
-DOUBLE_TAP_WINDOW_SEC     = 0.38  # 旧版双击窗口：第一次回弹后，第二击必须在此窗口内完成
+#   趋势探测只用于确认第二击意图（有趋势才有资格等完整窗口），不直接发送事件。
+DOUBLE_TAP_WINDOW_SEC     = 0.38  # 双击窗口：第一次回弹后第二击须在此窗内完成。
+                                  # ⭐ 2026-11-01 用户确认双击完全能在 0.38s 内完成——窗口不是瓶颈，
+                                  #   瓶颈在第二击质量门（见 _no_pinch_tap 第二击豁免），窗口保持不放宽。
 DOUBLE_TAP_COOLDOWN_FRAMES = 6    # 双击后的冷却帧数（比单击4帧略长，让伸直基线稳一下）
 DOUBLE_TAP_COOLDOWN_SEC    = DOUBLE_TAP_COOLDOWN_FRAMES * FRAME_SEC
 # ⭐ 第二击趋势探测：只观察第一次回弹后的短窗
 #   低门限差分 + 已离开伸直位 + 连续确认，用来标记“正在开始第二击”；
 #   完整第二击仍必须在 DOUBLE_TAP_WINDOW_SEC 截止前回弹成功。
-TREND_WAIT_SEC       = 0.10   # 首次回弹后最多观察100ms（30fps约3帧）
+TREND_WAIT_SEC       = 0.18   # 首次回弹后的趋势观察窗（无趋势→快速补发单击）。
+                              # ⭐ 0.10→0.18：真机 15fps 下趋势确认需 2 帧≈0.13s，
+                              #   0.10s 窗会把刚起步的快速第二击误杀成单击。0.18s 覆盖确认时长。
 TREND_DI_FRAC        = 0.40   # 趋势门限 = 完整起弯门限的40%
 TREND_MAX_RATIO      = 0.95   # 必须已离开伸直位，排除回弹尾段锯齿
 TREND_CONFIRM_FRAMES = 2      # 连续满足2帧才确认趋势
@@ -306,6 +311,15 @@ PINCH_RELEASE_ABS = 0.60      # 松开线：回升越过此值 = 指尖已张开
 #   仅用于 HOLD→点击分支；长按(PRESSED)释放不受此限（能进长按说明已弯得够久）。
 TAP_MIN_BEND_RATIO = 0.66
 # 长按转换不再读取任何3D角度/姿态门；只由捏合持续时间决定。
+# ⭐ 2026-11-01 长按弯曲度门（替代点击口径的 raw≤0.40 捏合距离门）：
+#   真长按「蜷握式按住」ratio 谷底实测 0.17~0.27；移动假段 ratio 谷底 0.46+。
+#   0.45 取中间偏深——深弯按住放行，浅弯/漂移假段拦截（浅弯门 0.66 在点击路径兜底）。
+LONG_PRESS_BEND_MAX = 0.45
+# ⭐ 2026-11-01 第二击专用放宽捏合门（用户提议"放宽而非豁免"的折中）：
+#   真机双击第二击 raw 谷底实测 0.406~0.634 —— 统一放宽到 0.50 只能救回一半（0.595/0.634 仍被拦），
+#   0.70 覆盖全部实测；同时仍拦"完全没捏"的假段（移动假段 raw 实测 1.0~1.6）。
+#   防误触三重保障：首击已真捏合(≤0.40) + 0.38s 窗时序配对 + 浅弯门(ratio≤0.66)继续生效。
+TAP2_PINCH_ABS_MAX = 0.70
 # ARMED 第二帧"尖峰拒绝"的深弯豁免：起弯帧谷底已到此线（实打实弯到过半），第二帧即便弹直
 #   也是【最短合法点击】而不是噪声（真机日志：raw 0.20 弯1帧→0.81 真直，旧逻辑整条吞掉，
 #   反让后面没松直的抖动顶替成第二击）。
@@ -1033,11 +1047,18 @@ class FingerTapClickDetector:
                 self._baseline = BASELINE_ALPHA_FAST * B + (1 - BASELINE_ALPHA_FAST) * self._baseline
             _now = _CLOCK()
             _fire_reason = None  # 本帧需要补发单击的原因（None=不补发）
-            # 先检查总截止时间，再接受第二击。这样超过0.50s后即使出现新的下弯，
-            # 也只能作为下一次独立动作，不能再配对成双击。
+            # ⭐ 2026-11-01 恢复"无趋势快速补发"（设计意图见 L1258 注释与 _wait_trend_deadline 设置，
+            #   旧代码重构时丢失该分支 → 所有单击都干等满 0.38s 窗才发出，单击延迟大、双击窗口内
+            #   被假段消耗时间后真第二击超窗配对失败（首击40仅7配对）：
+            #   · 无趋势 + 已过 TREND_WAIT_SEC(0.10s) → 立即补发单击（单击快速反应）
+            #   · 有趋势（_wait_trend_seen）→ 继续等完整第二击至 DOUBLE_TAP_WINDOW_SEC(0.50s) 截止
+            #   先检查总截止时间，再接受第二击。这样超过窗口后即使出现新的下弯，
+            #   也只能作为下一次独立动作，不能再配对成双击。
             if _now > self._wait_deadline:
                 _fire_reason = f"双击窗口{DOUBLE_TAP_WINDOW_SEC:.2f}s超时→补发单击"
             elif down_trigger:
+                # ⭐ down_trigger 必须优先于快发检查：第二击起弯常发生在趋势观察窗（0.18s）之后，
+                #   若快发在前会把刚起步的真第二击误杀成单击（模拟实测复现）。
                 # 完整按下判据直接成立（趋势自然算已确认）→ 走常规 ARMED/HOLD，标记双击候选
                 self._wait_trend_seen = True
                 self.state = _S.BEND_ARMED
@@ -1052,10 +1073,21 @@ class FingerTapClickDetector:
                 self._arm_stats(self._armed_by_delta)
                 self._dbg_arm_t = _CLOCK()   # 第二击段耗时从第二击起弯算（click#1 延迟已在补发前记完）
                 self._dbg_none_in_tap = 0
+            elif not self._wait_trend_seen and _now > self._wait_trend_deadline:
+                # ⭐ 无趋势快速补发：观察窗内没有任何二次下弯迹象 → 这是单击，立即补发
+                #   （旧代码此分支缺失，所有单击都干等满窗口才发出）
+                _fire_reason = f"无二次下弯趋势({TREND_WAIT_SEC:.2f}s)→快速补发单击"
             elif not self._wait_trend_seen:
                 # ---- 趋势探测短窗：低门限差分 + 已离开伸直位 + 连续确认（不要求完整点击）----
                 _trend_thr = TREND_DI_FRAC * self._p["TAP_DOWN_DI_SUM"]
-                trend_down = (di_sum_down >= _trend_thr) and (bend_ratio <= TREND_MAX_RATIO)
+                # ⭐ 2026-11-02 趋势门加 raw 捏合证据（单击不灵敏元凶）：
+                #   旧门 di≥40%+ratio≤0.95 中 ratio 门形同虚设——回弹过冲/生理摆动
+                #   就能凑出差分 → 假趋势把真单击拖满 0.38s 窗才补发。
+                #   真第二击必重新捏合（真机 raw 谷底 0.41~0.63）；回弹过冲 raw 保持
+                #   高位（≥0.8）。加 raw ≤ TAP2_PINCH_ABS_MAX(0.70) 硬证据 →
+                #   假趋势消失，单击稳定在 0.18s 快发。
+                trend_down = (di_sum_down >= _trend_thr and float(bend) <= TAP2_PINCH_ABS_MAX
+                              and bend_ratio <= TREND_MAX_RATIO)
                 if trend_down:
                     self._wait_trend_frames += 1
                     if self._wait_trend_frames >= TREND_CONFIRM_FRAMES:
@@ -1169,8 +1201,17 @@ class FingerTapClickDetector:
                 # ⭐⭐ 2026-10-29 绝对捏合门（用户拍板：点击不能只看弯曲度，还要判断是否捏合在一起）：
                 #   段内 raw 谷底从未 ≤ PINCH_ABS_MAX = 指尖从头到尾没捏到一起
                 #   （只弯了捏合比，如仅食指卷曲/拇指扫过）→ 整段静默作废，不发任何点击
-                _no_pinch_tap = is_tap and (self._seg_min_raw is None
-                                            or self._seg_min_raw > PINCH_ABS_MAX)
+                # ⭐ 2026-11-01 第二击专用放宽门（真机日志 L10046-10057 铁证）：
+                #   第二击通常更快更随意，拇指常差一丝没贴实（ratio 谷底 0.17~0.27 深弯、
+                #   raw 0.41~0.63 过不了首击的 0.40）→ 真第二击被"未捏合取消"作废 → 回 WAIT 等
+                #   "真第二击"（其实唯一一击已消耗）→ 超窗补发单击 → 双击变两次独立单击
+                #   （统计：首击40 双击仅7）。第二击用放宽门 TAP2_PINCH_ABS_MAX(0.70)：
+                #   覆盖全部实测值、仍拦"完全没捏"假段；防误触另有首击已真捏合 + 0.38s 时序窗。
+                _tap2_pinch_max = (TAP2_PINCH_ABS_MAX if self._double_candidate
+                                   else PINCH_ABS_MAX)
+                _no_pinch_tap = (is_tap
+                                 and (self._seg_min_raw is None
+                                      or self._seg_min_raw > _tap2_pinch_max))
                 if _shallow_tap or _no_pinch_tap:
                     self._st["nopinch" if _no_pinch_tap else "shallow"] += 1
                     self._emit_seg("未捏合取消" if _no_pinch_tap else "浅弯取消", now, ratio=bend_ratio,
@@ -1281,14 +1322,25 @@ class FingerTapClickDetector:
                     self._enter_cooldown()
                 return self.event_this_frame
 
-            # 长按入口：必须已经真实捏合；达到0.733s后立即锁定，不读取任何3D角度/姿态门。
+            # 长按入口：达到0.733s后立即锁定，不读取任何3D角度/姿态门。
             self._hold_sec += dt
 
             # ---------------- 判断 LONG_PRESS ----------------
+            # ⭐ 2026-11-01 长按门修复（真机日志铁证 L10046-10057）：
+            #   旧门 = seg_min_raw ≤ PINCH_ABS_MAX(0.40)（指尖真捏到一起的【距离】门，2026-10-29 为点击防误触加）。
+            #   但用户长按手势是「蜷握式按住」：食指弯很深（ratio 谷底 0.17~0.27）而拇指指尖
+            #   没贴到食指（raw 0.41~0.63）→ 旧门几乎必失败（hardness 0.5 起弯轻松、手势回归自然
+            #   蜷握后长按从"偶发成立"变"必然失败"；0.7 档只是被迫捏实才侥幸过门）。
+            #   且与 L308 设计矛盾："长按转换只由持续时间决定"。
+            #   新门 = 段内 ratio 谷底 ≤ LONG_PRESS_BEND_MAX（弯曲度口径）：
+            #     · 真长按（蜷握）ratio 谷底 0.17~0.27 ✓
+            #     · 移动假段 ratio 谷底 0.46+（浅弯门 0.66 在点击路径继续拦截）✗
+            #   点击路径的捏合距离门（raw≤0.40）原样保留——点击是瞬时确认需防误触；
+            #   长按是 0.73s 持续强意图确认，只需证明"真的深弯按住"。
             _long_ripe = _t_ge(self._hold_sec, self._p["LONG_PRESS_SEC"])
-            _pinch_seen = (self._seg_min_raw is not None
-                           and self._seg_min_raw <= PINCH_ABS_MAX)
-            if _long_ripe and _pinch_seen:
+            _press_seen = (self._seg_min_ratio is not None
+                           and self._seg_min_ratio <= LONG_PRESS_BEND_MAX)
+            if _long_ripe and _press_seen:
                 self.state = _S.PRESSED
                 self.event_this_frame = E.LONG_DOWN
                 self.long_count += 1
@@ -1400,8 +1452,11 @@ class FingerTapClickDetector:
 
 
 # ⭐ 2026-10-30 拇指 TIP + 中指 TIP 右键：独立的单次捏合回弹检测器。
-#   输入是 thumb(4)-middle(12) TIP 距离/掌宽：高=张开，低=接触；只用差分起势，
-#   回升到相对松开线后只产生一次 RIGHT_TAP；不使用左键的双击、长按、拖拽语义。
+#   输入是 thumb(4)-middle(12) TIP 距离 / dist(MCP2拇指根, MCP9中指根)（2026-11-02 换分母：
+#   旧掌宽分母在手掌侧转时塌缩 2 倍+，真机 base 从 1.6 漂到 3.9，触碰门 0.60 的绝对
+#   尺度跟着漂 → 大量真捏合未生效；MCP2/MCP9 是对捏两条手指的根部 → 视角稳定）：
+#   高=张开，低=接触；只用差分起势，回升到相对松开线后只产生一次 RIGHT_TAP；
+#   不使用左键的双击、长按、拖拽语义。
 THUMB_MIDDLE_TOUCH_MAX = 0.60
 THUMB_MIDDLE_RELEASE_RATIO = PINCH_RELEASE_ABS
 
