@@ -1399,10 +1399,10 @@ class FingerTapClickDetector:
         }
 
 
-# ⭐ 2026-10-30 拇指 TIP + 中指 TIP 右键：与左键捏合使用同一套差分状态机。
+# ⭐ 2026-10-30 拇指 TIP + 中指 TIP 右键：独立的单次捏合回弹检测器。
 #   输入是 thumb(4)-middle(12) TIP 距离/掌宽：高=张开，低=接触；只用差分起势，
-#   回升到相对松开线才结算，避免静态姿势或单帧尖峰抢占左键。
-THUMB_MIDDLE_TOUCH_MAX = 0.45
+#   回升到相对松开线后只产生一次 RIGHT_TAP；不使用左键的双击、长按、拖拽语义。
+THUMB_MIDDLE_TOUCH_MAX = 0.60
 THUMB_MIDDLE_RELEASE_RATIO = PINCH_RELEASE_ABS
 
 
@@ -1436,7 +1436,7 @@ class ThumbMiddleRightClickDetector:
 
     @property
     def is_active(self) -> bool:
-        return self.state in (_S.BEND_ARMED, _S.BEND_HOLD, _S.PRESSED)
+        return self.state in (_S.BEND_ARMED, _S.BEND_HOLD)
 
     @property
     def freeze_left(self) -> bool:
@@ -1469,9 +1469,7 @@ class ThumbMiddleRightClickDetector:
         self.event_this_frame = E.NONE
         now = _CLOCK()
         if thumb_middle_tip_distance is None:
-            if self.state == _S.PRESSED:
-                self._to_idle()
-            elif self.state != _S.IDLE:
+            if self.state != _S.IDLE:
                 self._hist.clear()
                 self._di_down = 0.0
                 self._last_t = None
@@ -1516,14 +1514,8 @@ class ThumbMiddleRightClickDetector:
             self._min_raw = min(self._min_raw, raw)
             released = ratio >= THUMB_MIDDLE_RELEASE_RATIO
             if released:
-                if self._min_raw <= THUMB_MIDDLE_TOUCH_MAX and _t_lt(self._hold_sec, self._p["LONG_PRESS_SEC"]):
+                if self._min_raw <= THUMB_MIDDLE_TOUCH_MAX:
                     self.event_this_frame = E.RIGHT_TAP
-                self._to_idle()
-            elif _t_ge(self._hold_sec, self._p["LONG_PRESS_SEC"]):
-                self.state = _S.PRESSED
-                self._pressed = True
-        elif self.state == _S.PRESSED:
-            if ratio >= THUMB_MIDDLE_RELEASE_RATIO:
                 self._to_idle()
         return self.event_this_frame
 

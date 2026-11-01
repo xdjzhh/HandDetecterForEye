@@ -68,30 +68,28 @@ ROI_OFFSET_Y_MAX = +1.0
 # 1) 滑动中值窗口
 MEDIAN_WINDOW = 5
 # 2) 静止方差锁：近 N 帧屏幕像素位移的协方差 (px^2) 低于此值 → 锁死光标不动
-# ⭐ 2026-08-24 用户反馈「难以稳定」：
-#   LOCK_WINDOW 8→10（取更多帧算方差，统计更稳，不会因为 2-3 帧抖就判在动）
-#   LOCK_THRESH_BROWSE 3.0→4.5（OPEN 浏览更宽松 = 4.5px² ≈ 2.1px 单维抖动就允许锁死，之前要 1.7px=更难锁）
-#   LOCK_THRESH_HOVER 0.80→1.20（POINT 悬停也适当放宽，1.1px 单维就能锁）
-LOCK_WINDOW = 10
+#   smooth 模式允许更长观察窗：用更多帧确认是生理性微动，而不是短暂的真实移动。
+LOCK_WINDOW = 12
 #  不同模式下的锁死阈值 (px^2)，越大=越容易锁死=越稳
-LOCK_THRESH_HOVER  = 1.20       # POINT 悬停：放宽到 1.2px²≈1.1px单维
-LOCK_THRESH_BROWSE = 4.50       # OPEN 浏览：放宽到 4.5px²≈2.1px单维
-LOCK_THRESH_DRAG   = 99999.0    # （保留兼容定义，但 FIST 不再用于拖拽）
+LOCK_THRESH_HOVER  = 5.0       # POINT 悬停：约 2px 级二维微动仍视为静止
+LOCK_THRESH_BROWSE = 6.0       # OPEN 浏览：抑制小幅生理抖动，同时保留真实移动解锁空间
+LOCK_THRESH_DRAG   = 99999.0   # （保留兼容定义，但 FIST 不再用于拖拽）
 # 3) 1€ Filter 核心参数（不同模式下 fc_min / beta 组合）
 #    fc_min = 最小截止频率(Hz)，越小→慢动时越平滑
 #    beta   = 速度自适应强度，越大→快动时越跟手
 MODE_PARAMS = {
     # 手势名    (fc_min_Hz, beta,  deadzone_px, response_k)
-    "POINT":  (0.30,  0.0040, 2.8, 3.0),   # 悬停：最强平滑+最大死区+柔响应
-    "OPEN":   (0.80,  0.0100, 1.2, 1.6),   # 浏览：平衡
+    # response_k 降低后，3~8px 的微动不会快速获得接近 1 的增益；大范围移动仍会逐步放行。
+    "POINT":  (0.30,  0.0040, 3.5, 0.35),  # 悬停：允许延迟，优先抑制生理性微动
+    "OPEN":   (0.80,  0.0100, 2.0, 0.45),  # 浏览：比悬停灵敏，但仍抑制小幅抖动
     # ✨ 用户要求：FIST = 取消所有指令（不再用于拖拽），因此参数用 OTHER 中性（实际 FIST 分支不触发任何动作，参数只是占位避免 KeyError）
-    "FIST":   (1.00,  0.0150, 1.5, 1.4),
-    "OTHER":  (1.00,  0.0150, 1.5, 1.4),   # 兜底：同浏览略强
-    "PEACE":  (1.20,  0.0150, 1.0, 1.4),   # 点击前手势（中等）
-    "PINCH":  (1.20,  0.0150, 1.0, 1.4),   # 同上
-    "ROCK":   (1.20,  0.0150, 1.0, 1.4),
-    "THUMB":  (1.20,  0.0150, 1.0, 1.4),
-    "OK":     (1.00,  0.0150, 1.5, 1.4),   # OK手势：鼠标锁定右下角，参数占位避免 KeyError
+    "FIST":   (1.00,  0.0150, 2.0, 0.50),
+    "OTHER":  (1.00,  0.0150, 2.0, 0.50),   # 兜底：同浏览略强
+    "PEACE":  (1.20,  0.0150, 1.5, 0.50),   # 点击前手势（中等）
+    "PINCH":  (1.20,  0.0150, 1.5, 0.50),   # 同上
+    "ROCK":   (1.20,  0.0150, 1.5, 0.50),
+    "THUMB":  (1.20,  0.0150, 1.5, 0.50),
+    "OK":     (1.00,  0.0150, 2.0, 0.50),   # OK手势：鼠标锁定右下角，参数占位避免 KeyError
 }
 DEFAULT_PARAMS = MODE_PARAMS["OTHER"]
 # 4) Sigmoid 响应：已通过 response_k (上) 控制，见 ARSmoother._sigmoid_gain
@@ -100,7 +98,7 @@ CLICK_FREEZE_SEC = 0.10
 
 # cursor 模式
 CURSOR_MODE_SMOOTH   = "smooth"    # 当前 AR 5 层平滑（悬停稳、但有滞后）
-CURSOR_MODE_ABSOLUTE = "absolute"  # ✨ 掌心绝对坐标（方案A 3层：中值杀尖峰 + Sigmoid微移阻尼 + 静止方差锁，兼顾稳+跟手）
+CURSOR_MODE_ABSOLUTE = "absolute"  # ✨ 掌心绝对坐标（方案A 4层：中值杀尖峰 + EMA稳微动 + Sigmoid微移阻尼 + 静止方差锁，兼顾稳+跟手）
 CURSOR_MODE_DIRECT   = "direct"    # ⭐ 2026-08-22 新增：严格跟随 UI 掌心绿圈——只保留 3 帧中值杀 1-2 帧飞点，无 Sigmoid 阻尼、无静止锁，无论手掌如何翻转都 1:1 跟手不卡顿
 
 # absolute 模式下为了避免 MediaPipe 1~2 帧偶发尖峰跳到屏幕角落，保留一个轻量中值滤波
@@ -109,6 +107,10 @@ CURSOR_MODE_DIRECT   = "direct"    # ⭐ 2026-08-22 新增：严格跟随 UI 掌
 #   direct 保持 3 帧（严格跟手指向，延迟零增加）
 ABS_MEDIAN_WINDOW = 5
 DIRECT_MEDIAN_WINDOW = 3
+
+# absolute 模式允许一定延迟，优先保证指针稳定；5 帧中值先过滤短暂飞点，
+# 再用较慢 EMA 平滑连续的生理性微动，真实大范围移动仍由后续增益逐步放行。
+ABS_EMA_ALPHA = 0.38
 
 # ✨✨ 方案 A 新增：absolute 模式「大范围跟手 + 小范围不晃」的 3 层流水线参数（只作用在 absolute 模式，不影响 smooth）
 #   Layer 2 Sigmoid：微移阻尼增益（响应曲线拐点，k 越大=拐点越陡=越严格压制小抖动）
@@ -255,9 +257,12 @@ class ARSmoother:
         self._freeze_until: float = 0.0
         self._last_out_x = None
         self._last_out_y = None
-        # absolute 模式 Layer 1：3 帧中值杀尖峰
+        # absolute 模式 Layer 1：5 帧中值杀尖峰
         self._abs_buf_x: deque[float] = deque(maxlen=max(ABS_MEDIAN_WINDOW, DIRECT_MEDIAN_WINDOW))
         self._abs_buf_y: deque[float] = deque(maxlen=max(ABS_MEDIAN_WINDOW, DIRECT_MEDIAN_WINDOW))
+        # absolute 模式 Layer 2 前置 EMA：把连续的生理性微动变成稳定的输入
+        self._abs_ema_x: float | None = None
+        self._abs_ema_y: float | None = None
         # ✨✨ absolute 模式 Layer 3：静止方差锁（样本缓冲 + 锁位置）
         self._abs_lock_buf_x: deque[float] = deque(maxlen=ABS_LOCK_WINDOW)
         self._abs_lock_buf_y: deque[float] = deque(maxlen=ABS_LOCK_WINDOW)
@@ -365,6 +370,8 @@ class ARSmoother:
                   self._abs_buf_x,    self._abs_buf_y,
                   self._abs_lock_buf_x, self._abs_lock_buf_y):
             b.clear()
+        self._abs_ema_x = None
+        self._abs_ema_y = None
         self._euro.reset()
         self._locked_x = None
         self._locked_y = None
@@ -459,25 +466,31 @@ class ARSmoother:
             return float(mx), float(my)
 
         # ============================================================
-        # ✨✨ CURSOR_MODE_ABSOLUTE（方案 A 3 层流水线：大范围跟手 + 小范围不晃）
+        # ✨✨ CURSOR_MODE_ABSOLUTE（方案 A 4 层流水线：大范围跟手 + 小范围不晃）
         # ============================================================
         if self._mode == CURSOR_MODE_ABSOLUTE:
             # ============================================================
             # Layer 1：中值滤波（5 帧，杀 MediaPipe 1~2 帧偶发尖峰）
             #   作用：过滤 ±30~80px 的 1~2 帧"飞点"（识别错位/跟踪换手跳到角落）
-            #   热身 3 帧起即对已收集样本取中值，窗口随后渐扩到 5
+            #   热身期间也对已收集样本取中值，窗口随后渐扩到 5
             # ============================================================
             self._abs_buf_x.append(float(raw_x))
             self._abs_buf_y.append(float(raw_y))
-            if len(self._abs_buf_x) >= DIRECT_MEDIAN_WINDOW and len(self._abs_buf_y) >= DIRECT_MEDIAN_WINDOW:
-                ax = float(np.median(self._abs_buf_x))
-                ay = float(np.median(self._abs_buf_y))
+            ax = float(np.median(self._abs_buf_x))
+            ay = float(np.median(self._abs_buf_y))
+
+            # Layer 2：轻量 EMA，吸收连续的生理性微动；大范围移动仍会连续跟随。
+            if self._abs_ema_x is None or self._abs_ema_y is None:
+                self._abs_ema_x, self._abs_ema_y = ax, ay
             else:
-                ax = float(raw_x)
-                ay = float(raw_y)
+                self._abs_ema_x = (ABS_EMA_ALPHA * ax
+                                   + (1.0 - ABS_EMA_ALPHA) * self._abs_ema_x)
+                self._abs_ema_y = (ABS_EMA_ALPHA * ay
+                                   + (1.0 - ABS_EMA_ALPHA) * self._abs_ema_y)
+            ax, ay = self._abs_ema_x, self._abs_ema_y
 
             # ============================================================
-            # Layer 2：Sigmoid 非线性微移增益压缩（抑制小抖动，但大位移完全不衰减=跟手）
+            # Layer 3：Sigmoid 非线性微移增益压缩（抑制小抖动，但大位移完全不衰减=跟手）
             #   ⚠️ 2026-08-22 放宽：Δ≤2px 阻尼 1.7 倍；Δ=5px 增益≈0.87；Δ>9px 增益→1.0
             #   核心：鼠标端阻尼必须匹配 UI 绿圈（EMA 0.85）的响应速度，不能再叠加强阻尼导致视觉脱节
             # ============================================================
@@ -495,7 +508,7 @@ class ARSmoother:
                 sy = float(self._last_out_y) + dy * g
 
             # ============================================================
-            # Layer 3：静止方差锁（对准小按钮的核心杀招 → 光标"钉住"完全不动）
+            # Layer 4：静止方差锁（对准小按钮的核心杀招 → 光标“钉住”完全不动）
             # ⭐⭐ 2026-10-02 迟滞重写（MOUSE-STAT 基线实锤旧逻辑"进得去留不住"）：
             #   旧：解锁 = 单点 dist>8.96 或缓冲 L1 累计 cum_disp>13.4。
             #       cum_disp 把零均值抖动全累加（σ≈1.5px 时 10 帧×2维≈24px），
